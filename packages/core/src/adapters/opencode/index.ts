@@ -62,6 +62,20 @@ function resolveDbPath(root?: string): string | null {
   return join(xdg, 'opencode', 'opencode.db');
 }
 
+function shouldUseDb(dbPath: string | null, rootExplicit: boolean): boolean {
+  if (!dbPath) return false;
+  if (dbPath === ':memory:') return true;
+  // Explicit temp root that has never held a real opencode.db should stay
+  // hermetic (mirror) rather than auto-creating an empty DB file.
+  if (rootExplicit) {
+    // explicit file path: if caller gave ".../something.db" and it exists, use it
+    // explicit dir: dbPath is "<dir>/opencode.db" — only use DB if that file already exists
+    return existsSync(dbPath);
+  }
+  // default location: use DB only if the file is present
+  return existsSync(dbPath);
+}
+
 function xdgDataDir(): string | null {
   const testHome = process.env.OPENCODE_TEST_HOME;
   const home = testHome && testHome.trim() ? testHome.trim() : (process.env.HOME || (process.env.USERPROFILE ?? null));
@@ -71,24 +85,52 @@ function xdgDataDir(): string | null {
   return join(home, '.local', 'share');
 }
 
-function openDb(dbPath: string): DbHandle | null {
-  // Prefer node:sqlite (Node 22+) via dynamic require to avoid type resolution issues.
+let __sqliteCtor: (new (p: string, opts?: unknown) => DbHandle) | null | undefined;
+async function getSqliteCtor(): Promise<(new (p: string, opts?: unknown) => DbHandle) | null> {
+  if (__sqliteCtor !== undefined) return __sqliteCtor;
   try {
-    const sqliteMod: unknown = eval("require('node:sqlite')") as unknown;
-    const Ctor = (sqliteMod as Record<string, unknown>).DatabaseSync as (new (p: string) => DbHandle) | undefined;
+    const mod = await import('node:sqlite') as unknown as Record<string, unknown>;
+    const Ctor = mod.DatabaseSync as (new (p: string, opts?: unknown) => DbHandle) | undefined;
+    if (typeof Ctor === 'function') { __sqliteCtor = Ctor as unknown as new (p: string, opts?: unknown) => DbHandle; return __sqliteCtor; }
+  } catch { /* no node:sqlite */ }
+  __sqliteCtor = null;
+  return null;
+}
+
+function openDbSync(dbPath: string, opts?: { readOnly?: boolean }): DbHandle | null {
+  if (__sqliteCtor) {
+    try { return new (__sqliteCtor as new (p: string, opts?: unknown) => DbHandle)(dbPath, opts as unknown); } catch { /* fall through */ }
+  }
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const { createRequire } = require('node:module') as unknown as { createRequire(p: string): (id: string) => unknown };
+    const req = createRequire(import.meta.url);
+    const mod = req('node:sqlite') as Record<string, unknown>;
+    const Ctor = mod.DatabaseSync as (new (p: string, opts?: unknown) => DbHandle) | undefined;
     if (typeof Ctor === 'function') {
-      const instance = new (Ctor as new (p: string) => DbHandle)(dbPath);
-      return instance as DbHandle;
+      __sqliteCtor = Ctor as unknown as new (p: string, opts?: unknown) => DbHandle;
+      return new (__sqliteCtor as new (p: string, opts?: unknown) => DbHandle)(dbPath, opts as unknown);
     }
-  } catch { /* fallback */ }
+  } catch { /* not available sync */ }
   try {
-    const Better = eval("require('better-sqlite3')") as (new (p: string) => unknown) | undefined;
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const { createRequire } = require('node:module') as unknown as { createRequire(p: string): (id: string) => unknown };
+    const req2 = createRequire(import.meta.url);
+    const Better = req2('better-sqlite3') as (new (p: string, opts?: unknown) => unknown) | undefined;
     if (typeof Better === 'function') {
-      const raw = new (Better as new (p: string) => DbHandle)(dbPath) as unknown as { exec(s: string): void; prepare(s: string): { all(...a: unknown[]): OpRow[]; get(...a: unknown[]): OpRow | undefined; run(...a: unknown[]): unknown }; close(): void };
-      return raw as DbHandle;
+      const raw = new (Better as new (p: string, opts?: unknown) => DbHandle)(dbPath, opts as unknown) as unknown as DbHandle;
+      return raw;
     }
   } catch { /* no driver */ }
   return null;
+}
+
+async function openDb(dbPath: string, opts?: { readOnly?: boolean }): Promise<DbHandle | null> {
+  const Ctor = await getSqliteCtor();
+  if (Ctor) {
+    try { return new (Ctor as new (p: string, opts?: unknown) => DbHandle)(dbPath, opts as unknown); } catch { /* busy/locked */ }
+  }
+  return openDbSync(dbPath, opts);
 }
 
 function mirrorDirFor(root: string | undefined): string | null {
@@ -102,17 +144,23 @@ export class OpenCodeAdapter implements Adapter {
 
   async parse(sessionId: string, root?: string): Promise<MigratedSession> {
     const dbPath = resolveDbPath(root);
-    const db = dbPath ? openDb(dbPath) : null;
-    if (db) {
-      try {
-        return parseFromDb(db, sessionId);
-      } finally {
-        try { db.close(); } catch { /* ignore */ }
+    const rootExplicit = !!(root && root.trim());
+    // Only touch the real DB when the file is actually present at the resolved
+    // path. Without this, explicit temp roots would auto-create an empty DB.
+    if (shouldUseDb(dbPath, rootExplicit)) {
+      const db = await openDb(dbPath!, { readOnly: true });
+      if (db) {
+        try {
+          return parseFromDb(db, sessionId);
+        } finally {
+          try { db.close(); } catch { /* ignore */ }
+        }
       }
     }
-    // fallback: mirror JSONL
+    // No DB driver or DB absent: fallback to mirror.
+    if (!rootExplicit && !dbPath) throw new Error('OpenCode: cannot resolve opencode.db (no HOME/USERPROFILE and no --src-root)');
     const mirrorDir = root ? join(root.endsWith('.db') ? dirname(root) : root, 'opencode-mirror') : null;
-    if (!mirrorDir) throw new Error('OpenCode: cannot resolve opencode.db and no mirror root given');
+    if (!mirrorDir) throw new Error(`OpenCode: cannot open opencode.db at ${dbPath ?? '<noresolve>'} (is the DB locked or missing sqlite driver?) and no mirror root is available`);
     const mirrorPath = join(mirrorDir, `${sessionId}.jsonl`);
     try {
       await fs.access(mirrorPath);
@@ -125,12 +173,15 @@ export class OpenCodeAdapter implements Adapter {
   async write(ir: MigratedSession, opts?: WriteOptions): Promise<WriteResult> {
     validateSession(ir);
     const root = opts?.root;
+    const rootExplicit = !!(root && root.trim());
     const targetCwd = opts?.targetCwd ?? ir.cwd ?? '';
     const newId = opts?.sessionId ?? `sess_${randomUUID().replace(/-/g, '').slice(0, 16)}`;
     const flatten = opts?.flatten ?? true;
 
     const dbPath = resolveDbPath(root);
-    const db = dbPath ? openDb(dbPath) : null;
+    // Don't enter DB mode for explicit temp roots that have never had a DB
+    const useDb = shouldUseDb(dbPath, rootExplicit);
+    const db = useDb ? await openDb(dbPath!) : null;
     if (db) {
       try {
         const written = writeToDb(db, ir, newId, targetCwd, flatten);
@@ -140,9 +191,15 @@ export class OpenCodeAdapter implements Adapter {
       }
     }
 
-    // fallback mirror for hermetic tests
-    const mirrorDir = root ? join(root.endsWith('.db') ? dirname(root) : root, 'opencode-mirror') : null;
-    if (!mirrorDir) throw new Error('OpenCode: cannot resolve write target (no db driver and no mirror root)');
+    // No driver / DB not yet created: if an explicit root was given, use the
+    // hermetic mirror (tests). Otherwise, when no explicit root, failure to
+    // open the default DB is a real error — don't silently write to a mirror.
+    if (!rootExplicit) {
+      const hint = dbPath ? `OpenCode: cannot open ${dbPath}` : 'OpenCode: cannot resolve opencode.db';
+      const busy = dbPath?.includes('opencode.db') ? '（若 OpenCode 正在运行，请先关闭它再迁移；或加 --dst-root <dir> 迁到临时目录验证）' : '';
+      throw new Error(`${hint}：未找到可用的 sqlite 驱动或数据库被占用/不存在${busy}。可用 --dst-root <tmpDir> 迁到临时 mirror 验证，或检查 Node 版本是否 ≥22 且 sqlite 驱动可用。`);
+    }
+    const mirrorDir = join(root!.endsWith('.db') ? dirname(root!) : root!, 'opencode-mirror');
     await fs.mkdir(mirrorDir, { recursive: true });
     const mirrorPath = join(mirrorDir, `${newId}.jsonl`);
     await writeToMirror(mirrorPath, ir, newId, targetCwd, flatten);
@@ -151,22 +208,25 @@ export class OpenCodeAdapter implements Adapter {
 
   async listSessions(root?: string): Promise<SessionMeta[]> {
     const dbPath = resolveDbPath(root);
-    const db = dbPath ? openDb(dbPath) : null;
-    if (db) {
-      try {
-        const rows = db.prepare('SELECT id, title, time_created, directory FROM session ORDER BY time_created DESC').all() as OpRow[];
-        return rows.map((r) => ({
-          tool: 'opencode' as const,
-          sessionId: String(r.id ?? ''),
-          title: r.title ? String(r.title) : undefined,
-          createdAt: typeof r.time_created === 'number' ? r.time_created : undefined,
-          cwd: r.directory ? String(r.directory) : undefined,
-          sourcePath: dbPath ?? undefined,
-        }));
-      } catch {
-        return [];
-      } finally {
-        try { db.close(); } catch { /* ignore */ }
+    const rootExplicit = !!(root && root.trim());
+    if (shouldUseDb(dbPath, rootExplicit)) {
+      const db = await openDb(dbPath!, { readOnly: true });
+      if (db) {
+        try {
+          const rows = db.prepare('SELECT id, title, time_created, directory FROM session ORDER BY time_created DESC').all() as OpRow[];
+          return rows.map((r) => ({
+            tool: 'opencode' as const,
+            sessionId: String(r.id ?? ''),
+            title: r.title ? String(r.title) : undefined,
+            createdAt: typeof r.time_created === 'number' ? r.time_created : undefined,
+            cwd: r.directory ? String(r.directory) : undefined,
+            sourcePath: dbPath ?? undefined,
+          }));
+        } catch {
+          return [];
+        } finally {
+          try { db.close(); } catch { /* ignore */ }
+        }
       }
     }
     const mirrorDir = root ? join(root.endsWith('.db') ? dirname(root) : root, 'opencode-mirror') : null;
