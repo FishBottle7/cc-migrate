@@ -314,7 +314,12 @@ export async function runWizard(io: WizardIO, deps: WizardDeps, pre?: Partial<Wi
 
   const ir = (cachedIr as unknown) ?? await deps.readSource(registry, srcTool!, sessionId!, srcRoot);
   const dstAdapter = registry.get(dstTool!);
-  const res = await deps.writeTarget(dstAdapter, ir, { root: dstRoot, targetCwd: targetCwd ?? (ir as { cwd?: string }).cwd, flatten });
+  // DSH self-migration titles collide (export filename is title-sanitized).
+  // Opt into the adapter's disambiguation suffix so the migrated filename
+  // is visibly distinct (e.g. "foo (migrated).md") without breaking the
+  // lossless round-trip tests (which call write without this flag).
+  const disambiguateTitle = srcTool === 'dsh' && dstTool === 'dsh';
+  const res = await deps.writeTarget(dstAdapter, ir, { root: dstRoot, targetCwd: targetCwd ?? (ir as { cwd?: string }).cwd, flatten, ...(disambiguateTitle ? { disambiguateTitle: true } : {}) });
   io.print(`\n已迁移 ${srcTool}:${sessionId} → ${dstTool}:${res.sessionId}`);
   for (const p of res.paths) io.print(`  ${p}`);
   return res;

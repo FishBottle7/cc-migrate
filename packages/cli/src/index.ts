@@ -80,10 +80,12 @@ async function main(argv: string[]) {
       }
       const ir = await readSource(registry, a, b, flags.root ?? flags.srcRoot);
       const adapter = registry.get(c as never);
+      const disambiguateTitle = a === 'dsh' && c === 'dsh';
       const res = await writeTarget(adapter, ir, {
         root: flags.dstRoot,
         targetCwd: flags.targetCwd ?? ir.cwd,
         flatten: flags.flatten,
+        ...(disambiguateTitle ? { disambiguateTitle: true } : {}),
       });
       console.log(`migrated ${a}:${b} -> ${c}:${res.sessionId}`);
       for (const p of res.paths) console.log(`  ${p}`);

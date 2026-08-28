@@ -190,7 +190,18 @@ export class DshAdapter implements Adapter {
     if (!sessionsRoot) throw new Error('DSH: cannot resolve ~/.dsh/sessions');
     const cwd = opts?.targetCwd ?? ir.cwd ?? '';
     const newId = opts?.sessionId ?? `session-${randomUUID()}`;
+    // Keep original wall-clock for fidelity. Sorting as "newest" is handled
+    // by the (migrated) title suffix + header id ordering; don't bump
+    // createdAt — that would break irToEvents time ordering and make
+    // DSH→DSH look like a fresh session rather than a faithful copy.
     const createdAt = ir.createdAt ?? Date.now();
+    // Opt-in disambiguation for DSH→DSH self-migrations: suffix title so the
+    // export filename is visibly distinct from the source. Off by default to
+    // keep `write->parse` lossless (see dsh.test "v3 write->parse ...").
+    const migratedTitle =
+      opts?.disambiguateTitle && ir.originTool === 'dsh' && ir.title && !ir.title.endsWith('(migrated)')
+        ? `${ir.title} (migrated)`
+        : undefined;
 
     // header frame — build object conditionally so no empty `cwd` leaks in
     const headerObj: Record<string, unknown> = {
@@ -204,8 +215,22 @@ export class DshAdapter implements Adapter {
     if (cwd) headerObj.cwd = cwd;
     const header = JSON.stringify(headerObj);
 
-    // event rows -> surface messages
-    const events = irToEvents(ir, createdAt);
+    // event rows -> surface messages (suffix title when migrating so export filename distinguishes).
+    // Also patch the lossless unmapped session/title event so the written artifact
+    // and the subsequent export filename both carry the suffix (otherwise
+    // irToEvents would see an existing session/title and skip synthesizing).
+    let irForWrite: import('../../ir.js').MigratedSession = ir;
+    if (migratedTitle) {
+      const patchedUnmapped = (ir.unmappedEvents ?? []).map((ev) =>
+        ev.type === 'session/title' || ev.type.startsWith('session/title')
+          ? { ...ev, data: { ...(ev.data as Record<string, unknown>), title: migratedTitle } as unknown as typeof ev.data }
+          : ev,
+      );
+      // If there was no unmapped title, keep synthesized path (irForWrite.title handles it)
+      // otherwise use the patched array.
+      irForWrite = { ...ir, title: migratedTitle, ...(patchedUnmapped.length ? { unmappedEvents: patchedUnmapped } : {}) };
+    }
+    const events = irToEvents(irForWrite, createdAt);
     const frame1 = buildSessionFrame(header);
     const frame2 = buildEventsFrame(events);
 

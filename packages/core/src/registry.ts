@@ -33,6 +33,12 @@ export interface WriteOptions {
   sessionId?: string;
   /** Cross-tool flattening: when true, hidden subagent transcripts become top-level messages. */
   flatten?: boolean;
+  /**
+   * When `true`, DSH self-migrations get a disambiguating title suffix
+   * (`" (migrated)"`) so the export filename is visibly distinct from the
+   * source. Default `false` — keeps `write` faithful / round-trip lossless.
+   */
+  disambiguateTitle?: boolean;
 }
 
 export interface WriteResult {
