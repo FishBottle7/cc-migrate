@@ -7,6 +7,7 @@
  *   session-migrate preview <tool> <sessionId> [--root <dir>]
  *   session-migrate migrate <srcTool> <srcSessionId> <dstTool>
  *                    [--src-root <dir>] [--dst-root <dir>] [--target-cwd <path>]
+ *   session-migrate wizard [--src-root <dir>] [--dst-root <dir>]  # interactive
  *   session-migrate demo      # dsh->dsh self round-trip
  *   session-migrate demo2     # claude<->dsh round-trip in a temp dir
  */
@@ -88,6 +89,37 @@ async function main(argv: string[]) {
       for (const p of res.paths) console.log(`  ${p}`);
       return;
     }
+    case 'wizard':
+    case 'interactive':
+    case 'wiz': {
+      const { runWizard } = await import('./wizard.js');
+      const { createInterface } = await import('node:readline');
+      const rl = createInterface({ input: process.stdin, output: process.stdout });
+      const io = {
+        print: (line: string) => console.log(line),
+        question: (prompt: string) => new Promise<string>((resolve) => rl.question(prompt, resolve)),
+        close: () => rl.close(),
+      };
+      // allow preseed via flags for non-TTY callers: e.g. wizard --src-root X uses flags.srcRoot
+      const pre: Record<string, unknown> = {};
+      if (flags.srcRoot ?? flags.root) pre.srcRoot = flags.srcRoot ?? flags.root;
+      if (flags.dstRoot) pre.dstRoot = flags.dstRoot;
+      if (flags.targetCwd) pre.targetCwd = flags.targetCwd;
+      if (flags.flatten !== undefined) pre.flatten = flags.flatten;
+      try {
+        const res = await runWizard(io, {
+          builtinRegistry,
+          previewSession: (await import('@session-migrate/core')).previewSession as never,
+          readSource: (await import('@session-migrate/core')).readSource as never,
+          writeTarget: (await import('@session-migrate/core')).writeTarget as never,
+          listSessions: (await import('@session-migrate/core')).listSessions as never,
+        }, pre as never);
+        if (!res) process.exit(1);
+      } finally {
+        io.close();
+      }
+      return;
+    }
     case 'demo': {
       await runDemo(registry);
       return;
@@ -97,7 +129,7 @@ async function main(argv: string[]) {
       return;
     }
     default:
-      console.error('usage: session-migrate <list|preview|migrate|demo|demo2> [...]');
+      console.error('usage: session-migrate <list|preview|migrate|wizard|demo|demo2> [...]');
       process.exit(1);
   }
 }
