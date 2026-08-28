@@ -480,19 +480,20 @@ export function buildIrFromEvents(header: { cwd?: string; createdAt?: number; id
 function eventToMessage(type: string, data: DshEvent['data']): MigratedMessage | null {
   switch (type) {
     case 'user/message': {
-      // Plain user: {role:'user', content:[...]}
-      // Tool-bridged user: {role:'user', source:{kind:'tool',callId}, content:[{type:'tool-result',...}]}
-      // Distinguish by inner block type; tool-bridged goes to role:'tool'.
+      // DSH user/message shape: data IS the message {id, role:"user", source:{kind,...}, content:[]}
+      // Tool-bridged form also has source:{kind:"tool"} but still data-level.
       const maybe = data as unknown as Record<string, unknown>;
       const content = (maybe.content as unknown[]) ?? [];
-      const isToolBridged = Array.isArray(content) && content.some((b) => typeof b === 'object' && b !== null && ((b as Record<string, unknown>).type === 'tool-result' || (b as Record<string, unknown>).type === 'tool_result'));
+      const source = maybe.source as Record<string, unknown> | undefined;
+      const isToolBridged = source?.kind === 'tool' || (Array.isArray(content) && content.some((b) => typeof b === 'object' && b !== null && ((b as Record<string, unknown>).type === 'tool-result' || (b as Record<string, unknown>).type === 'tool_result')));
       const msg = normalizeMessageLike(data);
       if (!msg) return null;
       if (isToolBridged) return { ...msg, role: 'tool' as const };
       return msg;
     }
     case 'assistant/message': {
-      const m = data.message as { content?: unknown } | undefined;
+      // DSH assistant/message shape: {turn,step,message:{id, role:"assistant", source:{kind:"model",...}, content:[]}}
+      const m = (data as unknown as Record<string, unknown>).message as { content?: unknown } | undefined;
       if (!m || !Array.isArray(m.content) || m.content.length === 0) return null;
       return normalizeMessageLike(m);
     }
@@ -515,10 +516,10 @@ function normalizeMessageLike(v: unknown): MigratedMessage | null {
   if (typeof v !== 'object' || v === null || Array.isArray(v)) return null;
   const o = v as Record<string, unknown>;
   const role = (o.role as MessageRole) ?? 'assistant';
-  const content = Array.isArray(o.content) ? o.content : [];
-  // DSH tool-result interior is [{"type":"tool-result","toolCallId",content:[{type:"text",text}]}]
-  // Our ContentBlock expects tool_result with content:string, so unwrap the inner text array.
-  const normalizedForIR: unknown[] = content.map((b) => {
+  const rawContent = Array.isArray(o.content) ? o.content : [];
+  // DSH stores blocks as {type:"text"|"reasoning"|"tool-call"|"tool-result", ...}.
+  // Normalize into the generic ContentBlock vocabulary consumed by IR.
+  const normalizedForIR: unknown[] = rawContent.map((b: unknown) => {
     if (typeof b !== 'object' || b === null) return b;
     const rec = b as Record<string, unknown>;
     if ((rec.type === 'tool-result' || rec.type === 'tool_result') && Array.isArray(rec.content)) {
@@ -526,10 +527,35 @@ function normalizeMessageLike(v: unknown): MigratedMessage | null {
       const text = inner.map((c) => typeof c === 'object' && c !== null && typeof (c as Record<string, unknown>).text === 'string' ? String((c as Record<string, unknown>).text) : '').join('');
       return { type: 'tool_result', toolUseId: String(rec.toolCallId ?? rec.toolUseId ?? rec.id ?? ''), content: text, isError: Boolean(rec.isError) };
     }
+    if (rec.type === 'reasoning' && typeof rec.text === 'string') {
+      return { type: 'thinking', thinking: rec.text };
+    }
+    if (rec.type === 'tool-call' && typeof rec.id === 'string') {
+      return { type: 'tool_use', id: rec.id, name: String(rec.name ?? 'tool'), input: tryParseJson(rec.arguments) ?? rec.arguments };
+    }
     return b;
   });
   const blocks: ContentBlock[] = normalizeContent(normalizedForIR);
-  return { role, content: blocks };
+  // Preserve LLM identity for faithful write-back (provider/model used to build source:{kind:"model"}).
+  const source = o.source as Record<string, unknown> | undefined;
+  const provider = typeof source?.provider === 'string' ? source.provider : undefined;
+  const model = typeof source?.model === 'string' ? source.model : undefined;
+  const msg: MigratedMessage = { role, content: blocks };
+  if (blocks.length === 0) return null;
+  if (provider || model) {
+    msg.provider = provider;
+    msg.model = model;
+  }
+  return msg;
+}
+
+function tryParseJson(v: unknown): unknown {
+  if (typeof v !== 'string') return v;
+  try {
+    return JSON.parse(v);
+  } catch {
+    return v;
+  }
 }
 
 /**
@@ -563,23 +589,44 @@ export function irToEvents(ir: MigratedSession, baseTime: number): DshEvent[] {
         step: 1,
         message: {
           role: 'user',
-          source: { kind: 'tool', callId: (toolBlocks[0] as { toolUseId?: string })?.toolUseId ?? `call_${Math.random().toString(36).slice(2,10)}` },
+          source: { kind: 'tool', callId: (toolBlocks[0] as { toolUseId?: string })?.toolUseId ?? `call_${randomUUID()}` },
           content: msg.content.map((b) => {
             if (b.type === 'tool_result') return { type: 'tool-result', toolCallId: b.toolUseId, content: [{ type: 'text', text: b.content }], isError: !!b.isError };
             if (b.type === 'text') return { type: 'text', text: b.text };
             return { type: 'text', text: (b as { thinking?: string }).thinking ?? '' };
           }),
-          id: `msg_${Math.random().toString(36).slice(2,10)}`,
+          id: `msg_${randomUUID()}`,
         },
       };
       raw.push({ time, type: 'tool/result', surfaceOp: 'append', data: toolData as unknown as DshEvent['data'], _msg: msg });
       continue;
     }
-    const data = messageToDshData(msg);
     if (msg.role === 'user' || msg.role === 'system') {
+      // DSH validates user/message data IS the message: must have {id, role:"user", source:{kind}, content:[]}
+      // See assertMessageEventShape in dsh-session (≈ line 1252). Plain {role,content} fails with
+      // "lacks an identified message".
+      const data = {
+        id: `msg_${randomUUID()}`,
+        role: 'user' as const,
+        source: { kind: 'user', rpcId: randomUUID(), clientTimeZone: 'Asia/Shanghai' },
+        content: dshContentFromBlocks(msg.content),
+      } as unknown as DshEvent['data'];
       raw.push({ time, type: 'user/message', surfaceOp: 'append', data, _msg: msg });
     } else {
-      raw.push({ time, type: 'assistant/message', surfaceOp: 'append', data: { message: data }, _msg: msg });
+      // DSH validates assistant/message data as {turn,step,message:{id, role:"assistant", source:{kind:"model",provider,model}, content:[]}}
+      const provider = (ir.model?.provider as string) ?? 'abrdns';
+      const model = (ir.model?.id as string) ?? 'GLM-5.3-Flash';
+      const data = {
+        turn: 1,
+        step: 1,
+        message: {
+          id: `msg_${randomUUID()}`,
+          role: 'assistant' as const,
+          source: { kind: 'model', provider, model },
+          content: dshContentFromBlocks(msg.content),
+        },
+      } as unknown as DshEvent['data'];
+      raw.push({ time, type: 'assistant/message', surfaceOp: 'append', data, _msg: msg });
     }
   }
   for (const g of ir.goals ?? []) {
@@ -716,8 +763,29 @@ export function irToEvents(ir: MigratedSession, baseTime: number): DshEvent[] {
   return out as unknown as DshEvent[];
 }
 
-function messageToDshData(msg: MigratedMessage): DshEvent['data'] {
-  return { role: msg.role, content: blocksToNative(msg.content) };
+function messageToDshData(_msg: MigratedMessage): DshEvent['data'] {
+  // Legacy plain {role,content} — not used for DSH write anymore; kept for
+  // non-DSH adapters via blocksToNative shape. DSH write uses dshContentFromBlocks.
+  return { role: _msg.role, content: blocksToNative(_msg.content) };
+}
+
+function dshContentFromBlocks(blocks: ContentBlock[]): unknown[] {
+  return blocks.map((b) => {
+    switch (b.type) {
+      case 'text':
+        return { type: 'text', text: b.text };
+      case 'thinking':
+        // DSH stores reasoning as {type:"reasoning", text}
+        return { type: 'reasoning', text: b.thinking };
+      case 'tool_use':
+        // DSH tool-call block inside assistant content
+        return { type: 'tool-call', id: b.id, name: b.name, arguments: typeof b.input === 'string' ? b.input : JSON.stringify(b.input ?? {}) };
+      case 'tool_result':
+        // Should not appear inside user/assistant content — tool/result is its own event type.
+        // Fall back to a text wrapper so the block is not silently dropped.
+        return { type: 'text', text: b.content };
+    }
+  });
 }
 
 function buildSessionFrame(headerJson: string): Buffer {
