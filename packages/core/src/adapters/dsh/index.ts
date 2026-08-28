@@ -52,6 +52,7 @@ interface DshEvent {
 }
 
 const SURFACE_TYPES = new Set(['user/message', 'assistant/message', 'tool/result']);
+const PACKED_CHUNK_TYPES = new Set(['reasoning-chunks', 'text-chunks', 'tool-call-chunks']);
 
 function stripEncrypted(obj: unknown): unknown {
   if (obj === null || typeof obj !== 'object') return obj;
@@ -353,6 +354,22 @@ export function buildIrFromEvents(header: { cwd?: string; createdAt?: number; id
   let title: string | undefined;
 
   for (const ev of events) {
+    // Packed chunk rows carry seq0/time0 (not seq/time); treat them as
+    // lossless unmapped rather than tripping the surface fold. Their seq0
+    // range is provenance for DSH's packChunks decoder.
+    if (PACKED_CHUNK_TYPES.has(ev.type)) {
+      const raw = ev as unknown as Record<string, unknown>;
+      const cleanData = stripEncrypted(ev.data) as DshEvent['data'];
+      const seq0 = typeof raw.seq0 === 'number' ? (raw.seq0 as number) : ev.seq;
+      const time0 = typeof raw.time0 === 'number' ? (raw.time0 as number) : (ev.time ?? 0);
+      unmappedEvents.push({
+        seq: seq0,
+        time: time0,
+        type: ev.type,
+        data: cleanData,
+      } as NonNullable<MigratedSession['unmappedEvents']>[number]);
+      continue;
+    }
     if (hasEncrypted(ev.data)) {
       // encrypted_content is the only allowed drop — keep placeholder for audit
     }
@@ -414,18 +431,32 @@ export function buildIrFromEvents(header: { cwd?: string; createdAt?: number; id
 
 function eventToMessage(type: string, data: DshEvent['data']): MigratedMessage | null {
   switch (type) {
-    case 'user/message':
-      // data IS the message (has role/content)
-      return normalizeMessageLike(data);
+    case 'user/message': {
+      // Plain user: {role:'user', content:[...]}
+      // Tool-bridged user: {role:'user', source:{kind:'tool',callId}, content:[{type:'tool-result',...}]}
+      // Distinguish by inner block type; tool-bridged goes to role:'tool'.
+      const maybe = data as unknown as Record<string, unknown>;
+      const content = (maybe.content as unknown[]) ?? [];
+      const isToolBridged = Array.isArray(content) && content.some((b) => typeof b === 'object' && b !== null && ((b as Record<string, unknown>).type === 'tool-result' || (b as Record<string, unknown>).type === 'tool_result'));
+      const msg = normalizeMessageLike(data);
+      if (!msg) return null;
+      if (isToolBridged) return { ...msg, role: 'tool' as const };
+      return msg;
+    }
     case 'assistant/message': {
       const m = data.message as { content?: unknown } | undefined;
       if (!m || !Array.isArray(m.content) || m.content.length === 0) return null;
       return normalizeMessageLike(m);
     }
     case 'tool/result': {
-      const m = data.message as { content?: unknown } | undefined;
+      // Canonical DSH tool/result: {turn,step,message:{role,content,source:{kind:tool}}}
+      // Preserve as role:'tool' so round-trip knows to emit tool/result.
+      const m = (data as Record<string, unknown>).message as { content?: unknown } | undefined;
       if (!m || !Array.isArray(m.content)) return null;
-      return normalizeMessageLike(m);
+      const msg = normalizeMessageLike(m);
+      if (!msg) return null;
+      // normalize to tool role
+      return { ...msg, role: 'tool' as const };
     }
     default:
       return null;
@@ -437,7 +468,19 @@ function normalizeMessageLike(v: unknown): MigratedMessage | null {
   const o = v as Record<string, unknown>;
   const role = (o.role as MessageRole) ?? 'assistant';
   const content = Array.isArray(o.content) ? o.content : [];
-  const blocks: ContentBlock[] = normalizeContent(content);
+  // DSH tool-result interior is [{"type":"tool-result","toolCallId",content:[{type:"text",text}]}]
+  // Our ContentBlock expects tool_result with content:string, so unwrap the inner text array.
+  const normalizedForIR: unknown[] = content.map((b) => {
+    if (typeof b !== 'object' || b === null) return b;
+    const rec = b as Record<string, unknown>;
+    if ((rec.type === 'tool-result' || rec.type === 'tool_result') && Array.isArray(rec.content)) {
+      const inner = rec.content as unknown[];
+      const text = inner.map((c) => typeof c === 'object' && c !== null && typeof (c as Record<string, unknown>).text === 'string' ? String((c as Record<string, unknown>).text) : '').join('');
+      return { type: 'tool_result', toolUseId: String(rec.toolCallId ?? rec.toolUseId ?? rec.id ?? ''), content: text, isError: Boolean(rec.isError) };
+    }
+    return b;
+  });
+  const blocks: ContentBlock[] = normalizeContent(normalizedForIR);
   return { role, content: blocks };
 }
 
@@ -463,6 +506,27 @@ export function irToEvents(ir: MigratedSession, baseTime: number): DshEvent[] {
   for (const msg of ir.messages) {
     const t = msg.timestamp;
     const time = typeof t === 'number' && Number.isFinite(t) ? t : msgFallback++;
+    if (msg.role === 'tool') {
+      // Rebuild DSH tool/result shape: {turn,step,message:{source,role,content}}
+      // preserve the nested tool-result interior expected by DSH surface.
+      const toolBlocks = msg.content.filter((b) => b.type === 'tool_result');
+      const toolData: Record<string, unknown> = {
+        turn: 1,
+        step: 1,
+        message: {
+          role: 'user',
+          source: { kind: 'tool', callId: (toolBlocks[0] as { toolUseId?: string })?.toolUseId ?? `call_${Math.random().toString(36).slice(2,10)}` },
+          content: msg.content.map((b) => {
+            if (b.type === 'tool_result') return { type: 'tool-result', toolCallId: b.toolUseId, content: [{ type: 'text', text: b.content }], isError: !!b.isError };
+            if (b.type === 'text') return { type: 'text', text: b.text };
+            return { type: 'text', text: (b as { thinking?: string }).thinking ?? '' };
+          }),
+          id: `msg_${Math.random().toString(36).slice(2,10)}`,
+        },
+      };
+      raw.push({ time, type: 'tool/result', surfaceOp: 'append', data: toolData as unknown as DshEvent['data'], _msg: msg });
+      continue;
+    }
     const data = messageToDshData(msg);
     if (msg.role === 'user' || msg.role === 'system') {
       raw.push({ time, type: 'user/message', surfaceOp: 'append', data, _msg: msg });
@@ -524,8 +588,8 @@ export function irToEvents(ir: MigratedSession, baseTime: number): DshEvent[] {
     const ev: DshEvent = { seq: idx, time: r.time, type: r.type, data: r.data };
     if (r.surfaceOp !== undefined) (ev as unknown as Record<string, unknown>).surfaceOp = r.surfaceOp;
     if (r.sourceEventSeqs !== undefined) (ev as unknown as Record<string, unknown>).sourceEventSeqs = r.sourceEventSeqs;
-    // surface messages carry append; domain/title events omit surfaceOp
-    if (r.type === 'user/message' || r.type === 'assistant/message') {
+    // surface messages carry append; tool/result is also a surface type
+    if (r.type === 'user/message' || r.type === 'assistant/message' || r.type === 'tool/result') {
       ev.surfaceOp = 'append';
     }
     return ev;
