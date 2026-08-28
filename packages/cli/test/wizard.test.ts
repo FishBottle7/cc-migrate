@@ -133,3 +133,97 @@ test('runWizard cancel at preview returns null', async () => {
   const res = await runWizard(io, deps, { srcRoot });
   assert.equal(res, null);
 });
+
+test('runWizard dsh->opencode without sidechain does not ask flatten', async () => {
+  const { mkdtemp } = await import('node:fs/promises');
+  const { join } = await import('node:path');
+  const { tmpdir } = await import('node:os');
+  const srcRoot = await mkdtemp(join(tmpdir(), 'wiz-dsh-op-1-'));
+  const dstRoot = await mkdtemp(join(tmpdir(), 'wiz-dsh-op-2-'));
+  const registry = builtinRegistry();
+  const dsh = registry.get('dsh');
+  const { writeTarget, previewSession, readSource, listSessions } = await import('@session-migrate/core');
+  await writeTarget(dsh, fallbackIr(), { root: srcRoot, targetCwd: 'D:\\proj' });
+
+  const answers = [
+    'dsh', '', '1', '',     // src pick + preview accept
+    'opencode', '', '',     // dst tool + dstRoot + targetCwd
+    '',                     // confirm
+  ];
+  const io = makeFakeIO(answers);
+  const deps = {
+    builtinRegistry: () => registry,
+    previewSession: previewSession as never,
+    readSource: readSource as never,
+    writeTarget: writeTarget as never,
+    listSessions: listSessions as never,
+  };
+  const res = await runWizard(io, deps, { srcRoot, dstRoot });
+  assert.ok(res, 'dsh->opencode without sidechain should succeed without flatten prompt');
+  assert.ok(!io.out.some((l) => l.includes('hidden task') || l.includes('展平') || l.includes('旁链')), 'should not have asked flatten');
+});
+
+test('runWizard dsh->opencode with sidechain DOES ask flatten (target opencode wording)', async () => {
+  const { mkdtemp } = await import('node:fs/promises');
+  const { join } = await import('node:path');
+  const { tmpdir } = await import('node:os');
+  const srcRoot = await mkdtemp(join(tmpdir(), 'wiz-dsh-op-sc1-'));
+  const dstRoot = await mkdtemp(join(tmpdir(), 'wiz-dsh-op-sc2-'));
+  const registry = builtinRegistry();
+  const dsh = registry.get('dsh');
+  const { writeTarget, previewSession, readSource, listSessions } = await import('@session-migrate/core');
+  const ir = {
+    ...fallbackIr(),
+    sidechains: [{ agentId: 'sc-1', kind: 'subagent' as const, messages: [{ role: 'user' as const, content: [{ type: 'text' as const, text: 'hi side' }] }] }],
+  };
+  await writeTarget(dsh, ir, { root: srcRoot, targetCwd: 'D:\\proj' });
+
+  const answers = [
+    'dsh', '', '1', '',     // src pick + preview accept
+    'opencode', '', '',     // dst tool
+    '',                     // flatten answer (default Y)
+    '',                     // confirm
+  ];
+  const io = makeFakeIO(answers);
+  const deps = {
+    builtinRegistry: () => registry,
+    previewSession: previewSession as never,
+    readSource: readSource as never,
+    writeTarget: writeTarget as never,
+    listSessions: listSessions as never,
+  };
+  const res = await runWizard(io, deps, { srcRoot, dstRoot });
+  assert.ok(res, 'dsh->opencode with sidechain should succeed');
+  assert.ok(io.out.some((l) => l.includes('目标为 OpenCode')), 'should have asked target-opencode wording');
+});
+
+test('runWizard opencode->dsh always asks flatten (source wording)', async () => {
+  const { mkdtemp } = await import('node:fs/promises');
+  const { join } = await import('node:path');
+  const { tmpdir } = await import('node:os');
+  // Seed an opencode mirror with one session (no sidechain)
+  const srcRoot = await mkdtemp(join(tmpdir(), 'wiz-oc-src-'));
+  const dstRoot = await mkdtemp(join(tmpdir(), 'wiz-oc-dst-'));
+  const registry = builtinRegistry();
+  const oc = registry.get('opencode');
+  const { writeTarget, previewSession, readSource, listSessions } = await import('@session-migrate/core');
+  await writeTarget(oc, fallbackIr(), { root: srcRoot, targetCwd: '/tmp/p' });
+
+  const answers = [
+    'opencode', '', '1', '', // src pick + preview accept
+    'dsh', '', '',           // dst
+    '',                      // flatten answer
+    '',                      // confirm
+  ];
+  const io = makeFakeIO(answers);
+  const deps = {
+    builtinRegistry: () => registry,
+    previewSession: previewSession as never,
+    readSource: readSource as never,
+    writeTarget: writeTarget as never,
+    listSessions: listSessions as never,
+  };
+  const res = await runWizard(io, deps, { srcRoot, dstRoot });
+  assert.ok(res);
+  assert.ok(io.out.some((l) => l.includes('OpenCode hidden task')), 'should have asked source-opencode wording');
+});

@@ -106,6 +106,48 @@ export interface WizardDeps {
   listSessions(adapter: unknown, root?: string): Promise<SessionMeta[]>;
 }
 
+async function tryFilterDshTopLevel(metas: SessionMeta[]): Promise<SessionMeta[]> {
+  const topLevel: SessionMeta[] = [];
+  for (const m of metas) {
+    const p = m.sourcePath;
+    if (!p) { topLevel.push(m); continue; }
+    try {
+      const { readFile } = await import('node:fs/promises');
+      const buf = (await readFile(p)) as unknown as Buffer;
+      let plain: string;
+      try {
+        const { zstdDecompressSync } = await import('node:zlib') as unknown as { zstdDecompressSync(b: Buffer): Buffer };
+        // replicate scanZstdFrameRanges heuristic from dsh/format.ts
+        const magic = Buffer.from([0x28, 0xb5, 0x2f, 0xfd]);
+        const anchors: number[] = [];
+        let pos = 0;
+        for (;;) {
+          const found = (buf as Buffer).indexOf(magic, pos);
+          if (found === -1) break;
+          anchors.push(found);
+          pos = found + 4;
+        }
+        let acc = Buffer.alloc(0);
+        for (let i = 0; i < anchors.length; i++) {
+          const start = anchors[i];
+          const end = i + 1 < anchors.length ? anchors[i + 1] : (buf as Buffer).length;
+          acc = Buffer.concat([acc, zstdDecompressSync((buf as Buffer).subarray(start, end))]);
+        }
+        plain = acc.toString('utf8');
+      } catch {
+        plain = (buf as Buffer).toString('utf8');
+      }
+      const first = plain.split('\n').find((l: string) => l.trim());
+      if (!first) { topLevel.push(m); continue; }
+      const hdr = JSON.parse(first) as Record<string, unknown>;
+      if (!hdr.parentSession) topLevel.push(m);
+    } catch {
+      topLevel.push(m);
+    }
+  }
+  return topLevel;
+}
+
 /**
  * Run the wizard with given IO + deps. The outer `wizard` CLI command wires
  * this to a real readline IO and real core deps.
@@ -143,6 +185,14 @@ export async function runWizard(io: WizardIO, deps: WizardDeps, pre?: Partial<Wi
     io.print(`\n正在扫描 ${srcTool}${srcRoot ? ` @ ${srcRoot}` : ''} ...`);
     let metas = await deps.listSessions(adapter, srcRoot);
     metas = sortMetas(metas);
+    // DSH: hide subagent children (header.parentSession) from the top-level picker
+    if (srcTool === 'dsh' && metas.length > 1) {
+      const topLevel = await tryFilterDshTopLevel(metas);
+      if (topLevel.length > 0 && topLevel.length < metas.length) {
+        io.print(`（已隐藏 ${metas.length - topLevel.length} 个子代理会话，仅显示顶层会话）`);
+        metas = topLevel;
+      }
+    }
     if (metas.length === 0) {
       io.print('未找到任何会话。可用 --src-root 指定目录，或先用 `list` 检查。');
       return null;
@@ -219,23 +269,50 @@ export async function runWizard(io: WizardIO, deps: WizardDeps, pre?: Partial<Wi
     if (ans) targetCwd = ans;
   }
 
-  // flatten hint for OpenCode
+  // We need the IR once to decide whether flatten is relevant. Reuse preview
+  // IR when possible; otherwise read once here before confirm.
+  let cachedIr: unknown | null = null;
+  // preview already read it — keep a handle if we captured it
+  // (capture is done by stashing after preview; simplest: re-read once now)
+  // Only prompt about flatten when it actually matters: at least one side is
+  // opencode AND the session carries sidechains/hidden tasks.
   let flatten: boolean | undefined = pre?.flatten;
   if (flatten === undefined && (srcTool === 'opencode' || dstTool === 'opencode')) {
-    const ans = (await io.question('OpenCode hidden task 展平为可对话消息？ [Y/n] > ')).trim().toLowerCase();
-    flatten = !(ans === 'n' || ans === 'no');
+    try {
+      cachedIr = await deps.readSource(registry, srcTool!, sessionId!, srcRoot);
+    } catch {
+      cachedIr = null;
+    }
+    const hasSidechains = !!(cachedIr && typeof cachedIr === 'object' && Array.isArray((cachedIr as { sidechains?: unknown[] }).sidechains) && ((cachedIr as { sidechains?: unknown[] }).sidechains!.length > 0));
+    // opencode source always deserves the question even if parse didn't emit
+    // sidechains — the hidden-task extraction might still be relevant. For
+    // non-opencode sources, only ask when there is actually a sidechain to
+    // decide about.
+    const shouldAsk = srcTool === 'opencode' ? true : hasSidechains;
+    if (shouldAsk) {
+      let prompt: string;
+      if (srcTool === 'opencode' && dstTool !== 'opencode') {
+        prompt = '检测到 OpenCode hidden task，是否展平为目标工具的独立旁链（Y=可直接续聊）？ [Y/n] > ';
+      } else if (srcTool !== 'opencode' && dstTool === 'opencode') {
+        prompt = '目标为 OpenCode，是否将旁链展平为顶层消息（Y）还是压回 task 工具块（N，保留隐藏语义）？ [Y/n，默认 Y] > ';
+      } else {
+        prompt = 'OpenCode 间迁移，是否保持展平（Y）还是保留 hidden task 嵌套（N）？ [Y/n，默认 Y] > ';
+      }
+      const ans = (await io.question(prompt)).trim().toLowerCase();
+      flatten = !(ans === 'n' || ans === 'no');
+    }
   }
 
   // 4) confirm
   io.print('\n—— 即将执行 ——');
-  io.print(`  ${srcTool}:${sessionId}  →  ${dstTool}${dstRoot ? ` @ ${dstRoot}` : ''}${targetCwd ? ` (cwd=${targetCwd})` : ''}`);
+  io.print(`  ${srcTool}:${sessionId}  →  ${dstTool}${dstRoot ? ` @ ${dstRoot}` : ''}${targetCwd ? ` (cwd=${targetCwd})` : ''}${flatten !== undefined ? `  [flatten=${flatten}]` : ''}`);
   const confirm = (await io.question('确认迁移？ [Y/n] > ')).trim().toLowerCase();
   if (confirm === 'n' || confirm === 'no') {
     io.print('已取消。');
     return null;
   }
 
-  const ir = await deps.readSource(registry, srcTool!, sessionId!, srcRoot);
+  const ir = (cachedIr as unknown) ?? await deps.readSource(registry, srcTool!, sessionId!, srcRoot);
   const dstAdapter = registry.get(dstTool!);
   const res = await deps.writeTarget(dstAdapter, ir, { root: dstRoot, targetCwd: targetCwd ?? (ir as { cwd?: string }).cwd, flatten });
   io.print(`\n已迁移 ${srcTool}:${sessionId} → ${dstTool}:${res.sessionId}`);
