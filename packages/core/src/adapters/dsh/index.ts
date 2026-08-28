@@ -596,6 +596,30 @@ export function irToEvents(ir: MigratedSession, baseTime: number): DshEvent[] {
   }
   for (const ev of ir.unmappedEvents ?? []) {
     const time = typeof ev.time === 'number' && Number.isFinite(ev.time) ? ev.time : baseTime;
+    // Packed chunk rows (seq0/time0) are stored with seq==seq0 and time==time0
+    // in buildIrFromEvents (source had seq0/time0, seq was undefined — seq got
+    // back-filled to seq0 in the catch-all). irToEvents must re-emit them as
+    // storage rows {seq0,time0}, never as {seq,time} — the latter fails
+    // decodeStorageRecord's exact-key check.
+    if (PACKED_CHUNK_TYPES.has(ev.type)) {
+      // Preserve seq0/time0 exactly; DSH seq contiguity is NOT enforced via
+      // these rows — seq0 is validated as safe integer and the overall seq
+      // accounting uses the existing events' seq coverage. Don't remap them
+      // through the contiguous reassignment below.
+      raw.push({
+        time,
+        // Use a negative sentinel so the contiguous reassignment skips them
+        // (they keep their original seq0). The final map handles this.
+        type: ev.type,
+        data: ev.data as unknown as DshEvent['data'],
+      } as unknown as Raw & { __packed: true; __seq0: number; __time0: number });
+      // Stash seq0/time0 via side-channel on raw entry for the final map.
+      // We piggy-back on the Raw object without polluting the type.
+      (raw[raw.length - 1] as any).__packed = true;
+      (raw[raw.length - 1] as any).__seq0 = ev.seq;
+      (raw[raw.length - 1] as any).__time0 = time;
+      continue;
+    }
     raw.push({
       time,
       type: ev.type,
@@ -631,17 +655,65 @@ export function irToEvents(ir: MigratedSession, baseTime: number): DshEvent[] {
     return 0;
   });
 
-  // Reassign contiguous seq; strip helper
-  return raw.map((r, idx) => {
-    const ev: DshEvent = { seq: idx, time: r.time, type: r.type, data: r.data };
-    if (r.surfaceOp !== undefined) (ev as unknown as Record<string, unknown>).surfaceOp = r.surfaceOp;
-    if (r.sourceEventSeqs !== undefined) (ev as unknown as Record<string, unknown>).sourceEventSeqs = r.sourceEventSeqs;
-    // surface messages carry append; tool/result is also a surface type
-    if (r.type === 'user/message' || r.type === 'assistant/message' || r.type === 'tool/result') {
-      ev.surfaceOp = 'append';
+  // Separate packed storage rows (seq0/time0) from seq-assigned events.
+  // Packed rows must keep exactly {type, seq0, time0, data} — the decoder
+  // expands them into multiple sequential events (seq0 + k). The overall
+  // decoded seq must be contiguous 0..N-1, so seq0 must align with the dense
+  // assignment, not the sparse source seq0.
+  const packedRaw = (raw as Array<Raw & { __packed?: boolean; __seq0?: number; __time0?: number }>).filter((r) => r.__packed);
+  const normal = (raw as Array<Raw & { __packed?: boolean }>).filter((r) => !r.__packed);
+
+  // Build packed rows sorted by time0 (their wall-clock; dt reconstructs times).
+  // We keep their data verbatim (turn/step/index/dt/texts|args) but will
+  // recompute seq0 to produce a contiguous decoded stream.
+  // Sort normal events already done above (by time); keep that order.
+  // Merge by wall-clock: normal by `time`, packed by `__time0`.
+  const merged: Array<(Raw & { __packed?: boolean; __seq0?: number; __time0?: number }) | Raw> = [];
+  let pi = 0;
+  packedRaw.sort((a, b) => (a.__time0 ?? 0) - (b.__time0 ?? 0));
+  let ni = 0;
+  while (ni < normal.length || pi < packedRaw.length) {
+    const nTime = ni < normal.length ? normal[ni].time : Infinity;
+    const pTime = pi < packedRaw.length ? (packedRaw[pi].__time0 ?? 0) : Infinity;
+    if (nTime <= pTime) {
+      merged.push(normal[ni++]);
+    } else {
+      merged.push(packedRaw[pi++]);
     }
-    return ev;
-  });
+  }
+
+  // Now assign seq contiguously over the *expanded* event stream.
+  // Walk merged; normal events consume 1 seq, packed rows consume
+  // payload length (texts/args) seqs starting at current cursor.
+  let cursor = 0;
+  const out: Array<Record<string, unknown>> = [];
+  for (const entry of merged) {
+    if ((entry as { __packed?: boolean }).__packed) {
+      const packed = entry as Raw & { __packed: boolean; __seq0: number; __time0: number };
+      const data = packed.data as unknown as Record<string, unknown>;
+      const payloadLen = Array.isArray((data as any).texts) ? (data as any).texts.length : Array.isArray((data as any).args) ? (data as any).args.length : 0;
+      // Rewrite seq0 to be contiguous.
+      out.push({
+        type: packed.type,
+        seq0: cursor,
+        time0: packed.__time0,
+        data: packed.data,
+      });
+      cursor += Math.max(1, payloadLen);
+    } else {
+      const r = entry as Raw;
+      const ev: Record<string, unknown> = { seq: cursor, time: r.time, type: r.type, data: r.data };
+      if (r.surfaceOp !== undefined) ev.surfaceOp = r.surfaceOp;
+      if (r.sourceEventSeqs !== undefined) ev.sourceEventSeqs = r.sourceEventSeqs;
+      if (r.type === 'user/message' || r.type === 'assistant/message' || r.type === 'tool/result') {
+        ev.surfaceOp = 'append';
+      }
+      out.push(ev);
+      cursor++;
+    }
+  }
+
+  return out as unknown as DshEvent[];
 }
 
 function messageToDshData(msg: MigratedMessage): DshEvent['data'] {
