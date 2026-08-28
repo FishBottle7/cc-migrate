@@ -91,6 +91,20 @@ async function main(argv: string[]) {
       for (const p of res.paths) console.log(`  ${p}`);
       return;
     }
+    case 'reconcile': {
+      if (a === 'dsh' || !a) {
+        const { reconcileWorkspaces } = await import('@session-migrate/core/workspace');
+        const { defaultDshRoot } = await import('@session-migrate/core');
+        const root = (flags.root ?? flags.dstRoot ?? (defaultDshRoot as unknown as () => string | null)()) as string;
+        if (!root) { console.error('cannot resolve DSH sessions root'); process.exit(1); }
+        const res = await (reconcileWorkspaces as any)(root);
+        console.log(`reconciled ${res.scanned} sessions, registered ${res.registered} orphan(s)`);
+        if (res.errors?.length) for (const e of res.errors) console.error('  ' + e);
+        return;
+      }
+      console.error('usage: session-migrate reconcile [dsh] [--root <dir>]');
+      process.exit(1);
+    }
     case 'wizard':
     case 'interactive':
     case 'wiz': {

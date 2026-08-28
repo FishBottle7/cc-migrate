@@ -243,6 +243,21 @@ export class DshAdapter implements Adapter {
 
     const paths: string[] = [finalPath];
 
+    // Strong refresh: register in workspace.json so the GUI shows the session
+    // on next refresh without restarting the harness. Best-effort — never
+    // fail the migration if the workspace file is unavailable (sandbox, etc.).
+    // Hermetic tmp roots (explicit --dst-root) must NOT mutate the real home.
+    const isDefaultRoot = opts?.root === undefined;
+    if (isDefaultRoot && cwd) {
+      try {
+        const { ensureWorkspaceRegistration } = await import('./workspace.js');
+        await ensureWorkspaceRegistration(sessionsRoot, cwd, newId, { isDefaultRoot });
+        // Child sessions are registered to the same cwd as well.
+      } catch {
+        // best-effort
+      }
+    }
+
     // subagent sidechains -> independent child sessions
     const subagents = (ir.sidechains ?? []).filter((s) => s.kind === 'subagent');
     const now = Date.now();
@@ -282,6 +297,14 @@ export class DshAdapter implements Adapter {
       const cPath = join(cDir, 'session.jsonl.zstd');
       await fs.writeFile(cPath, cPayload);
       paths.push(cPath);
+      if (isDefaultRoot && cwd) {
+        try {
+          const { ensureWorkspaceRegistration } = await import('./workspace.js');
+          await ensureWorkspaceRegistration(sessionsRoot, cwd, childId, { isDefaultRoot });
+        } catch {
+          // best-effort
+        }
+      }
     }
 
     return { tool: 'dsh', sessionId: newId, paths };

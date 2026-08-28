@@ -10,6 +10,10 @@
     ".": {
       "types": "./dist/src/index.d.ts",
       "import": "./dist/src/index.js"
+    },
+    "./workspace": {
+      "types": "./dist/src/adapters/dsh/workspace.d.ts",
+      "import": "./dist/src/adapters/dsh/workspace.js"
     }
   },
   "main": "./dist/src/index.js",
