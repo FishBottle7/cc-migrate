@@ -1,0 +1,69 @@
+/**
+ * Adapter contract + registry.
+ *
+ * Every tool ships one Adapter exposing the 5 capabilities that the CLI, the
+ * DSH plugin and the standalone desktop app all consume from a single shared
+ * core — so the format logic lives exactly once.
+ */
+
+import type { MigratedSession, SessionMeta, ToolId } from './ir.js';
+
+export interface Adapter {
+  readonly tool: ToolId;
+
+  /** List available sessions in a given root/dir (or default). Lightweight. */
+  listSessions(root?: string): Promise<SessionMeta[]>;
+
+  /** Read one session fully into IR. */
+  parse(sessionId: string, root?: string): Promise<MigratedSession>;
+
+  /** Write IR back into the target tool's native, resumable storage. */
+  write(ir: MigratedSession, opts?: WriteOptions): Promise<WriteResult>;
+
+  /** Human-readable offline preview of a session (no LLM). */
+  preview(session: MigratedSession): string;
+}
+
+export interface WriteOptions {
+  /** Root directory where to write (defaults to this tool's standard dir). */
+  root?: string;
+  /** Map the IR source cwd to a target working directory (defaults to IR.cwd). */
+  targetCwd?: string;
+  /** Override the target session id (DSH generates a new one unless provided). */
+  sessionId?: string;
+}
+
+export interface WriteResult {
+  tool: ToolId;
+  sessionId: string;
+  /** Absolute path(s) written. */
+  paths: string[];
+}
+
+export interface AdapterRegistry {
+  get(tool: ToolId): Adapter;
+  has(tool: ToolId): boolean;
+  tools(): ToolId[];
+}
+
+class MapRegistry implements AdapterRegistry {
+  #map = new Map<ToolId, Adapter>();
+  register(adapter: Adapter): void {
+    this.#map.set(adapter.tool, adapter);
+  }
+  get(tool: ToolId): Adapter {
+    const a = this.#map.get(tool);
+    if (!a) throw new Error(`no adapter registered for tool "${tool}"`);
+    return a;
+  }
+  has(tool: ToolId): boolean {
+    return this.#map.has(tool);
+  }
+  tools(): ToolId[] {
+    return [...this.#map.keys()];
+  }
+}
+
+export function createRegistry(): AdapterRegistry & { register(adapter: Adapter): void } {
+  return new MapRegistry();
+}

@@ -1,0 +1,14 @@
+{
+  "name": "session-migrate-workspace",
+  "private": true,
+  "packageManager": "pnpm@11.7.0",
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "build": "pnpm -r build",
+    "test": "pnpm -r test",
+    "typecheck": "pnpm -r typecheck"
+  }
+}
