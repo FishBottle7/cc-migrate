@@ -179,24 +179,67 @@ export class OpenCodeAdapter implements Adapter {
     const flatten = opts?.flatten ?? true;
 
     const dbPath = resolveDbPath(root);
-    // Don't enter DB mode for explicit temp roots that have never had a DB
     const useDb = shouldUseDb(dbPath, rootExplicit);
-    const db = useDb ? await openDb(dbPath!) : null;
-    if (db) {
+    if (useDb && dbPath) {
+      // Detect sandbox / permission before attempting SQLite write.
+      // In DSH the workspace-write sandbox EPERM-surfaces as sqlite
+      // "attempt to write a readonly database" (r+ open is denied).
       try {
-        const written = writeToDb(db, ir, newId, targetCwd, flatten);
-        return { tool: 'opencode', sessionId: written, paths: [dbPath ?? '<db>'] };
-      } finally {
-        try { db.close(); } catch { /* ignore */ }
+        const { openSync, closeSync } = await import('node:fs') as unknown as { openSync(p: string, f: string): number; closeSync(fd: number): void };
+        const fd = openSync(dbPath, 'r+');
+        closeSync(fd);
+      } catch (e) {
+        const code = (e as { code?: string })?.code ?? '';
+        if (code === 'EPERM' || code === 'EACCES') {
+          throw new Error(
+            `OpenCode: default DB is not writable in this sandbox (EPERM on r+ open of ${dbPath}). ` +
+            `This is NOT an OpenCode lock — the DSH GUI sandbox blocked the write. ` +
+            `Run the migration CLI outside the GUI sandbox (e.g. in a normal terminal: node packages/cli/dist/src/index.js migrate dsh <id> opencode --dst-root <tmp>) or add --dst-root <tmpDir> to write to a hermetic mirror for verification. ` +
+            `If you need to write the real opencode.db, launch the CLI from a non-sandboxed shell.`,
+          );
+        }
+        // other fs errors fall through to sqlite attempt for better diagnostics
+      }
+      const db = await openDb(dbPath);
+      if (db) {
+        try {
+          // Probe write inside the opened DB — if sandbox still blocks, we
+          // surface the EPERM hint rather than the opaque sqlite error.
+          let probeFailed: Error | null = null;
+          try {
+            db.exec('SAVEPOINT _sm_probe');
+            const now = Date.now();
+            db.prepare('INSERT OR IGNORE INTO project (id, worktree, time_created, time_updated) VALUES (?, ?, ?, ?)').run(`_sm_probe_${now}`, '/tmp/_sm_probe', now, now);
+            db.exec('ROLLBACK TO SAVEPOINT _sm_probe');
+            db.exec('RELEASE SAVEPOINT _sm_probe');
+          } catch (e) {
+            try { db.exec('ROLLBACK TO SAVEPOINT _sm_probe'); } catch {}
+            try { db.exec('RELEASE SAVEPOINT _sm_probe'); } catch {}
+            const msg = String((e as Error)?.message ?? e);
+            if (msg.includes('readonly database') || msg.includes('EPERM')) probeFailed = e as Error;
+            else throw e;
+          }
+          if (probeFailed) {
+            throw new Error(
+              `OpenCode: default DB is not writable (sqlite: ${probeFailed.message}). ` +
+              `In the DSH GUI sandbox this surfaces as EPERM on r+ and sqlite readonly. ` +
+              `Run the migration CLI outside the sandbox or use --dst-root <tmpDir> for a hermetic mirror. ` +
+              `WP DB helpers are not applicable here (different sandbox domain).`,
+            );
+          }
+          const written = writeToDb(db, ir, newId, targetCwd, flatten);
+          return { tool: 'opencode', sessionId: written, paths: [dbPath ?? '<db>'] };
+        } finally {
+          try { db.close(); } catch { /* ignore */ }
+        }
       }
     }
 
-    // No driver / DB not yet created: if an explicit root was given, use the
-    // hermetic mirror (tests). Otherwise, when no explicit root, failure to
-    // open the default DB is a real error — don't silently write to a mirror.
+    // Non-DB path: explicit root -> hermetic mirror; otherwise real-DB write
+    // was required but unavailable — explain rather than silently mirroring.
     if (!rootExplicit) {
       const hint = dbPath ? `OpenCode: cannot open ${dbPath}` : 'OpenCode: cannot resolve opencode.db';
-      const busy = dbPath?.includes('opencode.db') ? '（若 OpenCode 正在运行，请先关闭它再迁移；或加 --dst-root <dir> 迁到临时目录验证）' : '';
+      const busy = dbPath?.includes('opencode.db') ? '（若在 DSH 沙箱内运行，会因 EPERM 被拦；请在普通终端运行 CLI，或加 --dst-root <dir> 迁到临时目录验证）' : '';
       throw new Error(`${hint}：未找到可用的 sqlite 驱动或数据库被占用/不存在${busy}。可用 --dst-root <tmpDir> 迁到临时 mirror 验证，或检查 Node 版本是否 ≥22 且 sqlite 驱动可用。`);
     }
     const mirrorDir = join(root!.endsWith('.db') ? dirname(root!) : root!, 'opencode-mirror');
