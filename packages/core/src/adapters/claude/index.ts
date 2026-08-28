@@ -247,7 +247,7 @@ export async function parseClaudeFile(path: string): Promise<MigratedSession> {
     }
   }
 
-  const ir: MigratedSession = { schemaVersion: 1, originTool: 'claude', originSessionId: sessionId, cwd, messages };
+  const ir: MigratedSession = { schemaVersion: 2, originTool: 'claude', originSessionId: sessionId, cwd, messages };
   if (createdAt !== undefined) ir.createdAt = createdAt;
 
   // Sidechains: <dirPath>/<sessionId>/subagents/agent-<id>.jsonl + inline teammate mirrors

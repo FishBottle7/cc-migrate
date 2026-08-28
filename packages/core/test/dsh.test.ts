@@ -127,3 +127,91 @@ test('irToEvents emits surfaceOp append + contiguous seq', () => {
   assert.ok(events.every((e) => e.surfaceOp === 'append'));
   events.forEach((e, i) => assert.equal(e.seq, i));
 });
+
+test('buildIrFromEvents is zero-loss: goals/planModes/todos/unmappedEvents', () => {
+  const raw = [
+    { type: 'user/message', seq: 0, time: 10, surfaceOp: 'append', data: { role: 'user', content: [{ type: 'text', text: 'hi' }] } },
+    { type: 'goal/change', seq: 1, time: 11, data: { kind: 'goal/change', version: 1, operation: 'create', goal: { title: 'g' } } },
+    { type: 'plan/mode', seq: 2, time: 12, data: { enabled: true } },
+    { type: 'todo/write', seq: 3, time: 13, data: { items: [{ text: 'a', status: 'pending' }] } },
+    { type: 'approval/asked', seq: 4, time: 14, data: { id: 'ask-1' } },
+    { type: 'session/title', seq: 5, time: 15, data: { title: 'my-title' } },
+    // encrypted bucket — must be sanitized to [encrypted omitted]
+    { type: 'assistant/message', seq: 6, time: 16, surfaceOp: 'append', data: { message: { role: 'assistant', content: [{ type: 'text', text: 'ok' }] } } },
+  ];
+  const ir = buildIrFromEvents({ id: 's1', createdAt: 10 }, raw as any);
+  assert.equal(ir.messages.length, 2);
+  assert.equal(ir.goals?.length, 1);
+  assert.equal(ir.planModes?.length, 1);
+  assert.equal(ir.todos?.length, 1);
+  assert.equal(ir.title, 'my-title');
+  // approval is in unmapped, title is captured as unmapped + promoted to title
+  assert.ok((ir.unmappedEvents ?? []).some((e) => e.type === 'approval/asked'));
+  assert.ok((ir.unmappedEvents ?? []).some((e) => e.type === 'session/title'));
+});
+
+test('encrypted_content is stripped to placeholder', () => {
+  const raw = [
+    { type: 'goal/change', seq: 0, time: 1, data: { kind: 'goal/change', version: 1, operation: 'create', encrypted_content: 'secret', goal: { title: 'g' } } },
+  ];
+  const ir = buildIrFromEvents({ id: 's1', createdAt: 1 }, raw as any);
+  assert.equal((ir.goals![0].data as Record<string, unknown>).encrypted_content, '[encrypted omitted]');
+});
+
+test('v3 write -> parse round-trip preserves domain buckets (DSH lossless)', async () => {
+  const adapter = new DshAdapter();
+  const root = await tempRoot();
+  const base = fallbackIr();
+  base.title = 'my-title';
+  base.goals = [{ seq: 99, time: 1001, data: { kind: 'goal/change', version: 1, operation: 'create', goal: { title: 'g' } } as Record<string, unknown> }];
+  base.planModes = [{ seq: 98, time: 1002, data: { enabled: true } }];
+  base.todos = [{ seq: 97, time: 1003, data: { items: [{ text: 't', status: 'pending' }] } }];
+  base.unmappedEvents = [{ seq: 96, time: 1000, type: 'approval/asked', data: { id: 'ask-1' } }, { seq: 95, time: 1004, type: 'session/title', data: { title: 'my-title' } }];
+  const res = await adapter.write(base, { root, targetCwd: 'D:\\proj-v3' });
+  const back = await adapter.parse(res.sessionId, root);
+  assert.equal(back.title, 'my-title');
+  assert.equal(back.goals?.length, 1);
+  assert.equal(back.planModes?.length, 1);
+  assert.equal(back.todos?.length, 1);
+  assert.ok((back.unmappedEvents ?? []).some((e) => e.type === 'approval/asked'));
+  assert.equal(back.messages.length, base.messages.length);
+
+  // physical contract: seq contiguous + title event present
+  const buf = await fs.readFile(res.paths[0]);
+  const plain = decompressSessionBuffer(buf);
+  const lines = plain.split('\n').filter((l) => l.trim());
+  const events = lines.slice(1).map((l) => JSON.parse(l));
+  events.forEach((e: DshEventLike, i: number) => assert.equal(e.seq, i, `seq[${i}] should be contiguous`));
+  assert.ok(events.some((e: DshEventLike) => e.type === 'goal/change'));
+  assert.ok(events.some((e: DshEventLike) => e.type === 'session/title'));
+});
+
+test('pure translator: irToEvents merges buckets by time and reassigns seq', () => {
+  const ir = {
+    schemaVersion: 2 as const,
+    originTool: 'dsh' as const,
+    messages: [
+      { role: 'user' as const, content: [{ type: 'text' as const, text: 'hi' }], timestamp: 2000 },
+    ],
+    goals: [{ seq: 10, time: 1000, data: { kind: 'goal/change', version: 1 } as Record<string, unknown> }],
+    unmappedEvents: [{ seq: 11, time: 1001, type: 'turn/start', data: { turn: 1 } }],
+  };
+  const events = irToEvents(ir as never, 999);
+  // domain bucket (1000) should sort before message (2000)
+  assert.equal(events[0].type, 'goal/change');
+  assert.equal(events[1].type, 'turn/start');
+  assert.equal(events[2].type, 'user/message');
+  events.forEach((e, i) => assert.equal(e.seq, i));
+});
+
+test('irToEvents synthesizes session/title from ir.title when no title event exists', () => {
+  const ir = {
+    schemaVersion: 2 as const,
+    originTool: 'dsh' as const,
+    title: 'my-title',
+    messages: [{ role: 'user' as const, content: [{ type: 'text' as const, text: 'hi' }], timestamp: 2000 }],
+  };
+  const events = irToEvents(ir as never, 999);
+  assert.ok(events.some((e) => e.type === 'session/title' && (e.data as Record<string, unknown>).title === 'my-title'));
+  events.forEach((e, i) => assert.equal(e.seq, i));
+});

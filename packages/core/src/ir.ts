@@ -1,18 +1,17 @@
 /**
- * Unified Intermediate Representation (IR) v2 — breaking rewrite.
+ * Unified Intermediate Representation (IR) v3 — 100% lossless (except encrypted).
  *
  * Pivot of the engine: every tool adapter reads its native storage into an IR
  * session and writes an IR session back. This is the sole N-adapter pivot
  * (not N² pairwise converters).
  *
- * v2 breaking changes vs v1:
- *  - ToolId gains 'pi' | 'opencode'
- *  - ContentBlock gains {type:'thinking'}
- *  - MigratedMessage loses toolCalls/toolResults convenience fields; provider/model/stopReason added
- *  - MigratedSidechain gains kind: SidechainKind + parentMessageId
- *  - MigratedSession: model is now {provider?, id, variant?}, schemaVersion required,
- *    plus thinkingLevel / systemPrompt / compaction / branchSummaries / extensions
- *  - validateSession / isMigratedMessage / messageToText / inferTitle updated accordingly
+ * v3 breaking changes vs v2:
+ *  - schemaVersion: 1 -> 2
+ *  - Adds typed lossless buckets: goals / planModes / todos / unmappedEvents
+ *    so DSH agent->IR is zero-loss (non-encrypted) and IR->agent discards
+ *    only on the write side per target capability.
+ *  - validateSession / messageToText updated; thinking preserved via
+ *    ContentBlock.thinking; encrypted_content is the ONLY allowed drop.
  */
 
 export type ToolId = 'dsh' | 'claude' | 'codex' | 'opencode' | 'pi' | 'unknown';
@@ -56,8 +55,35 @@ export interface SessionMeta {
   cwd?: string;
 }
 
+export interface MigratedGoal {
+  seq: number;
+  time: number;
+  data: Record<string, unknown> & { kind?: string; version?: number };
+}
+
+export interface MigratedPlanMode {
+  seq: number;
+  time: number;
+  data: unknown;
+}
+
+export interface MigratedTodo {
+  seq: number;
+  time: number;
+  data: unknown;
+}
+
+export interface MigratedUnmappedEvent {
+  seq: number;
+  time: number;
+  type: string;
+  data: unknown;
+  surfaceOp?: string;
+  sourceEventSeqs?: number[];
+}
+
 export interface MigratedSession {
-  schemaVersion: 1;
+  schemaVersion: 2;
   originTool: ToolId;
   originSessionId?: string;
   title?: string;
@@ -70,6 +96,14 @@ export interface MigratedSession {
   sidechains?: MigratedSidechain[];
   compaction?: Array<{ summary: string; tokensBefore?: number; retainedTail?: unknown[]; firstKeptId?: string }>;
   branchSummaries?: Array<{ fromId: string; summary: string }>;
+  /** Typed lossless domain state from DSH (goal/change). */
+  goals?: MigratedGoal[];
+  /** Typed lossless domain state from DSH (plan/mode). */
+  planModes?: MigratedPlanMode[];
+  /** Typed lossless domain state from DSH (todo/write). */
+  todos?: MigratedTodo[];
+  /** Catch-all for remaining non-encrypted DSH events. */
+  unmappedEvents?: MigratedUnmappedEvent[];
   extensions?: Record<string, unknown>;
   raw?: unknown;
 }
@@ -102,9 +136,9 @@ export function validateSession(ir: MigratedSession): MigratedSession {
   if (!ir || typeof ir !== 'object') throw new Error('validateSession: ir is not an object');
   if (
     (ir as unknown as Record<string, unknown>).schemaVersion !== undefined &&
-    (ir as unknown as Record<string, unknown>).schemaVersion !== 1
+    (ir as unknown as Record<string, unknown>).schemaVersion !== 2
   ) {
-    throw new Error('validateSession: schemaVersion must be 1');
+    throw new Error('validateSession: schemaVersion must be 2');
   }
   if (!Array.isArray(ir.messages)) throw new Error('validateSession: messages must be an array');
   for (const [i, msg] of ir.messages.entries()) {

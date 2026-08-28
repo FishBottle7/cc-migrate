@@ -343,7 +343,7 @@ export async function parsePiFile(path: string): Promise<MigratedSession> {
   }
 
   const ir: MigratedSession = {
-    schemaVersion: 1,
+    schemaVersion: 2,
     originTool: 'pi',
     originSessionId,
     cwd,

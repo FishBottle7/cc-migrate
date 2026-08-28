@@ -111,43 +111,53 @@ opencode-<channel>.db / $OPENCODE_DB / $OPENCODE_TEST_HOME  # channel 隔离与�
 
 ## 3. 统一中间表示（IR）设计
 
-要让 `任意 ⇄ 任意` 只用 N 个适配器（而非 N² 个写死转换），必须有中立 IR。基于对 DSH surface 的验证，IR 为「**无损对话流水线**」——只保留 resume 语义所需信息，丢弃各家内部 trace 噪音：
+要让 `任意 ⇄ 任意` 只用 N 个适配器（而非 N² 个写死转换），必须有中立 IR。基于对 DSH surface 的验证，IR 为「**无损对话流水线**」—— 核心是跨工具可续的流水线，DSH 侧 v3 做到除加密外 100% 无损（`docs/plans/ir-v3-lossless-100.md`）：
 
 ```ts
-// ir.ts
+// ir.ts  (v3 — schemaVersion: 2，见源码 ir.ts)
 type ContentBlock =
   | { type: 'text'; text: string }
   | { type: 'tool_use'; id: string; name: string; input: unknown }
-  | { type: 'tool_result'; toolUseId: string; content: string; isError?: boolean };
+  | { type: 'tool_result'; toolUseId: string; content: string; isError?: boolean }
+  | { type: 'thinking'; thinking: string };
 
 interface MigratedMessage {
   role: 'user' | 'assistant' | 'tool' | 'system';
   content: ContentBlock[];
-  toolCalls?: { id: string; name: string; input: unknown }[];   // tool_use 便捷视图
-  toolResults?: { toolUseId: string; content: string; isError?: boolean }[];
   timestamp?: number;
+  provider?: string; model?: string; stopReason?: string;
 }
 
 interface MigratedSidechain {
   agentId: string;          // 目标工具侧的 agent 文件名 key（如 Claude agent-<id>.jsonl）
+  kind: 'subagent' | 'teammate';
   agentType?: string;       // 原始 sub-agent 类型/preset，按需透传
+  parentMessageId?: string;
   messages: MigratedMessage[];  // 分支内单调对话，新到旧
 }
 
 interface MigratedSession {
-  originTool: ToolId;       // 'codex'|'claude'|'opencode'|'dsh'|'pi'|...
+  schemaVersion: 2;
+  originTool: ToolId;       // 'codex'|'claude'|'opencode'|'dsh'|'pi'|'unknown'
   originSessionId?: string;
-  title?: string;
+  title?: string;           // DSH session/title | Pi session_info.name
   createdAt?: number;
   cwd?: string;             // 原工作目录 → 目标适配器重映射
-  model?: string;           // 尽力提示
+  model?: { provider?: string; id: string; variant?: string };
+  thinkingLevel?: string; systemPrompt?: string;
   messages: MigratedMessage[];   // 按序，主链
   sidechains?: MigratedSidechain[]; // 旁链/子代理分支（完整搬运文件，非折叠文本）
-  raw?: unknown;            // 原始完整记录，回退/无损贬损
+  compaction?: Array<{ summary: string; tokensBefore?: number; retainedTail?: unknown[]; firstKeptId?: string }>;
+  branchSummaries?: Array<{ fromId: string; summary: string }>;
+  goals?: MigratedGoal[]; planModes?: MigratedPlanMode[]; todos?: MigratedTodo[]; // typed lossless (DSH)
+  unmappedEvents?: MigratedUnmappedEvent[]; // catch-all lossless (DSH)
+  extensions?: Record<string, unknown>; raw?: unknown;
 }
 ```
 
-**设计要点**：IR 是「对话流水线」而非「事件日志」。不同工具内部状态机各异（DSH turn/step/compaction、Claude parentUuid 链、Codex Responses 流、Pi 树+compaction、OpenCode seq 序），**无损上限为消息级**，无法逐事件复刻对方执行（如重跑 tool）。这是诚实边界：B 级 = 消息上下文 + 工具调用历史完整保留，目标工具能接着对话继续思考、继续调工具。
+> v3 语义：`agent→IR` 零丢弃（除 `encrypted_content/encrypted` 占位 `[encrypted omitted]`），`goal/change→goals`、`plan/mode→planModes`、`todo/write→todos`、`session/title→title`，其余 `~40` 类 `known-event-type` 进 `unmappedEvents`（含 `surfaceOp/sourceEventSeqs`）；`IR→DSH` 按 `time` 合并重排 `seq 0..N-1` 全量保留，`IR→Claude/Codex/OpenCode/Pi` 按目标能力丢弃领域桶（见 `docs/plans/ir-v3-lossless-100.md §2.4`）。
+
+**设计要点**：IR 是「对话流水线」而非「事件日志」。不同工具内部状态机各异（DSH turn/step/compaction、Claude parentUuid 链、Codex Responses 流、Pi 树+compaction、OpenCode seq 序），跨工具**无损上限为消息级**，DSH↔DSH 额外做到领域状态 100% 无损。这是诚实边界：B 级 = 消息上下文 + 工具调用历史完整保留，目标工具能接着对话继续思考、继续调工具。
 
 **子代理/旁链约定**（用户已选“完整搬运旁链子代理文件”）：
 

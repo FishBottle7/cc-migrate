@@ -274,7 +274,7 @@ function parseFromDb(db: DbHandle, sessionId: string): MigratedSession {
   }
 
   const ir: MigratedSession = {
-    schemaVersion: 1,
+    schemaVersion: 2,
     originTool: 'opencode',
     originSessionId: String(sessionRow.id ?? sessionId),
     title,
@@ -439,7 +439,7 @@ async function parseFromMirror(mirrorPath: string): Promise<MigratedSession> {
     : undefined;
 
   const ir: MigratedSession = {
-    schemaVersion: 1,
+    schemaVersion: 2,
     originTool: 'opencode',
     originSessionId: header?.id,
     cwd: header?.cwd,

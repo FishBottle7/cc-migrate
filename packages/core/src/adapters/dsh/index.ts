@@ -53,6 +53,29 @@ interface DshEvent {
 
 const SURFACE_TYPES = new Set(['user/message', 'assistant/message', 'tool/result']);
 
+function stripEncrypted(obj: unknown): unknown {
+  if (obj === null || typeof obj !== 'object') return obj;
+  if (Array.isArray(obj)) return obj.map(stripEncrypted);
+  const rec = obj as Record<string, unknown>;
+  const out: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(rec)) {
+    if (k === 'encrypted_content' || k === 'encrypted') {
+      out[k] = '[encrypted omitted]';
+      continue;
+    }
+    out[k] = stripEncrypted(v);
+  }
+  return out;
+}
+
+function hasEncrypted(obj: unknown): boolean {
+  if (obj === null || typeof obj !== 'object') return false;
+  if (Array.isArray(obj)) return obj.some(hasEncrypted);
+  const rec = obj as Record<string, unknown>;
+  if ('encrypted_content' in rec || 'encrypted' in rec) return true;
+  return Object.values(rec).some(hasEncrypted);
+}
+
 export class DshAdapter implements Adapter {
   readonly tool = 'dsh' as const;
 
@@ -223,7 +246,7 @@ export class DshAdapter implements Adapter {
       };
       if (cwd) childHeaderObj.cwd = cwd;
       const childHeader = JSON.stringify(childHeaderObj);
-      const childIr: MigratedSession = { schemaVersion: 1 as const, originTool: 'dsh', messages: sc.messages };
+      const childIr: MigratedSession = { schemaVersion: 2 as const, originTool: 'dsh', messages: sc.messages };
       const childEvents = irToEvents(childIr, childCreatedAt);
       const cFrame1 = buildSessionFrame(childHeader);
       const cFrame2 = buildEventsFrame(childEvents);
@@ -320,21 +343,73 @@ export class DshAdapter implements Adapter {
  * Translators (kept pure for testability)
  * ------------------------------------------------------------------ */
 
-/** Turn header + parsed events into a MigratedSession using the surface fold. */
+/** Turn header + parsed events into a MigratedSession. agent->IR is zero-loss (except encrypted). */
 export function buildIrFromEvents(header: { cwd?: string; createdAt?: number; id?: string }, events: DshEvent[]): MigratedSession {
   const messages: MigratedMessage[] = [];
-  const surfaceSeqs: number[] = []; // model-visible order (append-only fold)
+  const goals: NonNullable<MigratedSession['goals']> = [];
+  const planModes: NonNullable<MigratedSession['planModes']> = [];
+  const todos: NonNullable<MigratedSession['todos']> = [];
+  const unmappedEvents: NonNullable<MigratedSession['unmappedEvents']> = [];
+  let title: string | undefined;
 
   for (const ev of events) {
-    if (!SURFACE_TYPES.has(ev.type)) continue;
-    if (ev.surfaceOp !== 'append') continue; // replacement copies stay model-only
-    const msg = eventToMessage(ev.type, ev.data);
-    if (!msg) continue;
-    messages.push(msg);
-    surfaceSeqs.push(ev.seq);
+    if (hasEncrypted(ev.data)) {
+      // encrypted_content is the only allowed drop — keep placeholder for audit
+    }
+    const cleanData = stripEncrypted(ev.data) as DshEvent['data'];
+    // session/title is the DSH lossless title bucket (may appear with suffix variant)
+    if (ev.type === 'session/title' || ev.type.startsWith('session/title')) {
+      const t = (cleanData as Record<string, unknown>).title;
+      if (typeof t === 'string' && t) title = t;
+      // also keep the raw event in unmapped so a non-title consumer can see it,
+      // but canonical title is promoted to ir.title
+      unmappedEvents.push({
+        seq: ev.seq,
+        time: ev.time ?? 0,
+        type: ev.type,
+        data: cleanData,
+        ...(ev.surfaceOp !== undefined ? { surfaceOp: ev.surfaceOp } : {}),
+        ...(ev.surfaceOp !== undefined && (ev as { sourceEventSeqs?: number[] }).sourceEventSeqs ? { sourceEventSeqs: (ev as { sourceEventSeqs?: number[] }).sourceEventSeqs } : {}),
+      } as NonNullable<MigratedSession['unmappedEvents']>[number]);
+      continue;
+    }
+    if (SURFACE_TYPES.has(ev.type) && ev.surfaceOp === 'append') {
+      const msg = eventToMessage(ev.type, cleanData);
+      if (msg) messages.push(msg);
+      continue;
+    }
+    if (ev.type === 'goal/change') {
+      goals.push({ seq: ev.seq, time: ev.time ?? 0, data: cleanData as unknown as Record<string, unknown> });
+      continue;
+    }
+    if (ev.type === 'plan/mode') {
+      planModes.push({ seq: ev.seq, time: ev.time ?? 0, data: cleanData });
+      continue;
+    }
+    if (ev.type === 'todo/write') {
+      todos.push({ seq: ev.seq, time: ev.time ?? 0, data: cleanData });
+      continue;
+    }
+    // catch-all lossless bucket (except encrypted)
+    unmappedEvents.push({
+      seq: ev.seq,
+      time: ev.time ?? 0,
+      type: ev.type,
+      data: cleanData,
+      ...(ev.surfaceOp !== undefined ? { surfaceOp: ev.surfaceOp } : {}),
+      ...(ev.surfaceOp !== undefined && (ev as { sourceEventSeqs?: number[] }).sourceEventSeqs ? { sourceEventSeqs: (ev as { sourceEventSeqs?: number[] }).sourceEventSeqs } : {}),
+    } as NonNullable<MigratedSession['unmappedEvents']>[number]);
   }
 
-  return { schemaVersion: 1 as const, originTool: 'dsh', messages };
+  const ir: MigratedSession = { schemaVersion: 2 as const, originTool: 'dsh', messages };
+  if (title) ir.title = title;
+  if (goals.length) ir.goals = goals;
+  if (planModes.length) ir.planModes = planModes;
+  if (todos.length) ir.todos = todos;
+  if (unmappedEvents.length) ir.unmappedEvents = unmappedEvents;
+  // preserve header for lossless same-tool round-trip
+  ir.extensions = { 'dsh.headerRaw': { ...header } };
+  return ir;
 }
 
 function eventToMessage(type: string, data: DshEvent['data']): MigratedMessage | null {
@@ -366,22 +441,95 @@ function normalizeMessageLike(v: unknown): MigratedMessage | null {
   return { role, content: blocks };
 }
 
-/** Build IR messages back into DSH event rows (with seq + surfaceOp). */
+/**
+ * Build IR back into DSH event rows (with seq + surfaceOp).
+ *
+ * v3: merges messages + goals + planModes + todos + unmappedEvents into a
+ * single time-ordered stream, then reassigns contiguous seq 0..N-1. This is
+ * the only path that makes `agent->IR->agent` lossless for DSH (see
+ * docs/plans/ir-v3-lossless-100.md §3). Domain buckets are merged by time so
+ * the original wall-clock ordering survives. `session/title` is synthesized
+ * from `ir.title` when no matching unmapped event already carries it.
+ */
 export function irToEvents(ir: MigratedSession, baseTime: number): DshEvent[] {
-  const events: DshEvent[] = [];
-  let seq = 0;
-  let time = baseTime;
+  type Raw = { time: number; type: string; data: DshEvent['data']; surfaceOp?: string; sourceEventSeqs?: number[]; _msg?: MigratedMessage };
+  const raw: Raw[] = [];
+
+  // Preserve wall-clock time faithfully — each bucket uses its own stored time
+  // verbatim; only missing timestamps fall back to baseTime with a per-bucket
+  // counter. This keeps cross-bucket ordering true to the original event stream
+  // (goal@1000 before message@2000) and lets the final sort restore it.
+  let msgFallback = baseTime;
   for (const msg of ir.messages) {
-    const t = (msg.timestamp ?? time) || time;
-    time = t + (t === time ? 1 : 0); // avoid duplicated timestamps breaking ordering hints
+    const t = msg.timestamp;
+    const time = typeof t === 'number' && Number.isFinite(t) ? t : msgFallback++;
     const data = messageToDshData(msg);
     if (msg.role === 'user' || msg.role === 'system') {
-      events.push({ seq: seq++, time, type: 'user/message', surfaceOp: 'append', data });
+      raw.push({ time, type: 'user/message', surfaceOp: 'append', data, _msg: msg });
     } else {
-      events.push({ seq: seq++, time, type: 'assistant/message', surfaceOp: 'append', data: { message: data } });
+      raw.push({ time, type: 'assistant/message', surfaceOp: 'append', data: { message: data }, _msg: msg });
     }
   }
-  return events;
+  for (const g of ir.goals ?? []) {
+    const time = typeof g.time === 'number' && Number.isFinite(g.time) ? g.time : baseTime;
+    raw.push({ time, type: 'goal/change', data: g.data as unknown as DshEvent['data'] });
+  }
+  for (const p of ir.planModes ?? []) {
+    const time = typeof p.time === 'number' && Number.isFinite(p.time) ? p.time : baseTime;
+    raw.push({ time, type: 'plan/mode', data: p.data as unknown as DshEvent['data'] });
+  }
+  for (const td of ir.todos ?? []) {
+    const time = typeof td.time === 'number' && Number.isFinite(td.time) ? td.time : baseTime;
+    raw.push({ time, type: 'todo/write', data: td.data as unknown as DshEvent['data'] });
+  }
+  for (const ev of ir.unmappedEvents ?? []) {
+    const time = typeof ev.time === 'number' && Number.isFinite(ev.time) ? ev.time : baseTime;
+    raw.push({
+      time,
+      type: ev.type,
+      data: ev.data as unknown as DshEvent['data'],
+      ...(ev.surfaceOp !== undefined ? { surfaceOp: ev.surfaceOp } : {}),
+      ...(ev.sourceEventSeqs ? { sourceEventSeqs: ev.sourceEventSeqs } : {}),
+    });
+  }
+
+  // ir.title: if caller set a title and no session/title event already
+  // carries it, synthesize one (earliest time so it sorts first among
+  // title events). This keeps `ir.title -> session/title` lossless on
+  // DSH->IR->DSH when the original store held title only as header meta.
+  if (ir.title) {
+    const hasTitleEvent = raw.some((r) => r.type === 'session/title' || r.type.startsWith('session/title'));
+    if (!hasTitleEvent) {
+      // place at baseTime so it precedes conversation; matches DSH's early
+      // title emission. Use the smallest time among raw, or baseTime.
+      const titleTime = raw.length ? Math.min(baseTime, ...raw.map((r) => r.time)) : baseTime;
+      // if titleTime equals baseTime we still need it to be <= first raw time
+      raw.push({ time: titleTime, type: 'session/title', data: { title: ir.title } as unknown as DshEvent['data'] });
+    }
+  }
+
+  // Preserve original wall-clock ordering across buckets; stable sort keeps
+  // message order within same-time ties (messages were pushed first).
+  const order: Record<string, number> = { 'session/title': 0, 'goal/change': 1, 'plan/mode': 2, 'todo/write': 3 };
+  raw.sort((a, b) => {
+    if (a.time !== b.time) return a.time - b.time;
+    const ao = order[a.type] ?? 10;
+    const bo = order[b.type] ?? 10;
+    if (ao !== bo) return ao - bo;
+    return 0;
+  });
+
+  // Reassign contiguous seq; strip helper
+  return raw.map((r, idx) => {
+    const ev: DshEvent = { seq: idx, time: r.time, type: r.type, data: r.data };
+    if (r.surfaceOp !== undefined) (ev as unknown as Record<string, unknown>).surfaceOp = r.surfaceOp;
+    if (r.sourceEventSeqs !== undefined) (ev as unknown as Record<string, unknown>).sourceEventSeqs = r.sourceEventSeqs;
+    // surface messages carry append; domain/title events omit surfaceOp
+    if (r.type === 'user/message' || r.type === 'assistant/message') {
+      ev.surfaceOp = 'append';
+    }
+    return ev;
+  });
 }
 
 function messageToDshData(msg: MigratedMessage): DshEvent['data'] {

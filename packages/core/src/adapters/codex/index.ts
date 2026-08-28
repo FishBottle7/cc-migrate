@@ -422,7 +422,7 @@ export function buildIrFromLines(records: RolloutLine[]): MigratedSession {
   }
 
   return {
-    schemaVersion: 1 as const,
+    schemaVersion: 2 as const,
     originTool: 'codex',
     originSessionId: sessionId,
     cwd,
