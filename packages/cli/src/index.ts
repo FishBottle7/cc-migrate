@@ -25,6 +25,7 @@ interface Flags {
   dstRoot?: string;
   targetCwd?: string;
   root?: string;
+  flatten?: boolean;
 }
 
 function parseFlags(argv: string[]): { flags: Flags; positionals: string[] } {
@@ -37,6 +38,8 @@ function parseFlags(argv: string[]): { flags: Flags; positionals: string[] } {
     else if (tok === '--src-root') f.srcRoot = value('src-root');
     else if (tok === '--dst-root') f.dstRoot = value('dst-root');
     else if (tok === '--target-cwd') f.targetCwd = value('target-cwd');
+    else if (tok === '--flatten') f.flatten = value('flatten') !== 'false';
+    else if (tok === '--no-flatten') f.flatten = false;
     else positionals.push(tok);
   }
   return { flags: f, positionals };
@@ -79,6 +82,7 @@ async function main(argv: string[]) {
       const res = await writeTarget(adapter, ir, {
         root: flags.dstRoot,
         targetCwd: flags.targetCwd ?? ir.cwd,
+        flatten: flags.flatten,
       });
       console.log(`migrated ${a}:${b} -> ${c}:${res.sessionId}`);
       for (const p of res.paths) console.log(`  ${p}`);

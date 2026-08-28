@@ -8,6 +8,7 @@ import type { MigratedSession } from './ir.js';
 export function fallbackIr(): MigratedSession {
   const now = Date.now();
   return {
+    schemaVersion: 1,
     originTool: 'dsh',
     createdAt: now,
     messages: [

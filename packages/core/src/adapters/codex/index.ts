@@ -115,9 +115,12 @@ export class CodexAdapter implements Adapter {
   }
 
   preview(session: MigratedSession): string {
-    return session.messages
-      .map((m) => `[${m.role}]\n${blocksToText(m.content)}`)
+    const main = session.messages.map((m) => `[${m.role}]\n${blocksToText(m.content)}`).join('\n\n');
+    if (!session.sidechains?.length) return main;
+    const branches = session.sidechains
+      .map((sc) => `[sidechain: ${sc.agentId} (${sc.kind})]\n${sc.messages.map((m) => blocksToText(m.content)).join('\n')}`)
       .join('\n\n');
+    return `${main}\n\n${branches}`;
   }
 }
 
@@ -232,7 +235,7 @@ export function buildRolloutLines(
     originator: 'codex_cli_rs',
     cli_version: '0.1.0',
     source: 'cli',
-    model_provider: ir.model,
+    model_provider: ir.model ? (ir.model.provider ? `${ir.model.provider}/${ir.model.id}` : ir.model.id) : undefined,
   };
   lines.push(JSON.stringify({ timestamp: meta.timestamp, type: 'session_meta', payload: meta }));
 
@@ -273,7 +276,15 @@ function messageToResponseItems(msg: MigratedMessage, baseTs: number): TimedItem
       case 'tool_result': {
         items.push({
           time,
-          item: { type: 'function_call_output', call_id: block.toolUseId || block.content, output: block.content },
+          item: { type: 'function_call_output', call_id: (block as { toolUseId: string; content: string }).toolUseId || (block as { content: string }).content, output: (block as { content: string }).content },
+        });
+        break;
+      }
+      case 'thinking': {
+        // Codex reasoning -> text tombstone; true reasoning preservation is via IR thinking block
+        items.push({
+          time,
+          item: { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: `[thinking] ${(block as { thinking: string }).thinking}` }] },
         });
         break;
       }
@@ -411,11 +422,12 @@ export function buildIrFromLines(records: RolloutLine[]): MigratedSession {
   }
 
   return {
+    schemaVersion: 1 as const,
     originTool: 'codex',
     originSessionId: sessionId,
     cwd,
     createdAt,
-    model,
+    model: model ? { id: model } : undefined,
     messages,
   };
 }

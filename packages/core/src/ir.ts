@@ -1,44 +1,47 @@
 /**
- * Unified Intermediate Representation (IR) for session migration.
+ * Unified Intermediate Representation (IR) v2 — breaking rewrite.
  *
- * This is the pivot of the whole engine: every tool adapter reads its native
- * storage into an IR session, and every tool adapter writes an IR session back
- * into its native store. There are only N adapters (not N² pairwise converters).
+ * Pivot of the engine: every tool adapter reads its native storage into an IR
+ * session and writes an IR session back. This is the sole N-adapter pivot
+ * (not N² pairwise converters).
  *
- * The IR intentionally keeps the *smallest* set of fields that preserves
- * resume semantics across tools:
- *  - role + content blocks (text, tool_use, tool_result)
- *  - tool calls / tool results (with rewritten ids per target tool)
- *  - cwd (remapped to the target tool's working directory on write)
- *  - model (best-effort, optional)
- *
- * It is a "conversation pipeline", NOT a tool-specific event log: the
- * internal state machines of each tool (turn/step/compaction, sidechains,
- * sqlite event sourcing) are NOT replicated. The honest ceiling of lossless
- * migration is message-level fidelity — the target tool can continue the
- * thread, re-call tools, and keep reasoning, but cannot replay the original
- * tool side effects.
+ * v2 breaking changes vs v1:
+ *  - ToolId gains 'pi' | 'opencode'
+ *  - ContentBlock gains {type:'thinking'}
+ *  - MigratedMessage loses toolCalls/toolResults convenience fields; provider/model/stopReason added
+ *  - MigratedSidechain gains kind: SidechainKind + parentMessageId
+ *  - MigratedSession: model is now {provider?, id, variant?}, schemaVersion required,
+ *    plus thinkingLevel / systemPrompt / compaction / branchSummaries / extensions
+ *  - validateSession / isMigratedMessage / messageToText / inferTitle updated accordingly
  */
 
-export type ToolId = 'dsh' | 'claude' | 'codex' | 'opencode' | 'unknown';
+export type ToolId = 'dsh' | 'claude' | 'codex' | 'opencode' | 'pi' | 'unknown';
 
 export type ContentBlock =
   | { type: 'text'; text: string }
   | { type: 'tool_use'; id: string; name: string; input: unknown }
-  | { type: 'tool_result'; toolUseId: string; content: string; isError?: boolean };
+  | { type: 'tool_result'; toolUseId: string; content: string; isError?: boolean }
+  | { type: 'thinking'; thinking: string };
 
 export type MessageRole = 'user' | 'assistant' | 'tool' | 'system';
 
 export interface MigratedMessage {
   role: MessageRole;
-  /** Normalized content blocks. Text lives here; tool interactions fold in too. */
   content: ContentBlock[];
-  /** Convenience extractor of tool_use blocks; kept for adapters that model them separately. */
-  toolCalls?: { id: string; name: string; input: unknown }[];
-  /** Convenience extractor of tool_result blocks. */
-  toolResults?: { toolUseId: string; content: string; isError?: boolean }[];
-  /** Epoch ms. Optional; used to preserve ordering hints across tools. */
   timestamp?: number;
+  provider?: string;
+  model?: string;
+  stopReason?: string;
+}
+
+export type SidechainKind = 'subagent' | 'teammate';
+
+export interface MigratedSidechain {
+  agentId: string;
+  kind: SidechainKind;
+  agentType?: string;
+  parentMessageId?: string;
+  messages: MigratedMessage[];
 }
 
 /** Light metadata for a listed session (for GUI pickers / CLI --list). */
@@ -53,38 +56,21 @@ export interface SessionMeta {
   cwd?: string;
 }
 
-/** A sub-agent / sidechain branch attached to a session.
- *
- * Different tools model this differently (Claude: `isSidechain` messages in a
- * sibling `subagents/agent-<id>.jsonl`; DSH: separate session files referenced
- * by `parentSession`/`agent/inbox/spliced`; Codex spawned agents: sibling
- * rollout sessions). The IR carries the branch's messages so an adapter can
- * byte-faithfully migrate it, together with enough id/metadata to preserve the
- * parent→sub-agent link.
- */
-export interface MigratedSidechain {
-  /** Agent identifier as stored by the target tool (e.g. Claude `agent-<id>.jsonl`). */
-  agentId: string;
-  /** Original provider/slug/type of the sub-agent, when known (best-effort). */
-  agentType?: string;
-  /** Monotonic conversation inside the sub-agent, newest last. */
-  messages: MigratedMessage[];
-}
-
 export interface MigratedSession {
+  schemaVersion: 1;
   originTool: ToolId;
   originSessionId?: string;
   title?: string;
   createdAt?: number;
-  /** Source working directory. Remapped to the target by the writer adapter. */
   cwd?: string;
-  /** Best-effort original model, carried for reference / optional mapping. */
-  model?: string;
-  /** Ordered conversation, newest last. */
+  model?: { provider?: string; id: string; variant?: string };
+  thinkingLevel?: string;
+  systemPrompt?: string;
   messages: MigratedMessage[];
-  /** Sub-agent / sidechain branches attached to this session. */
   sidechains?: MigratedSidechain[];
-  /** Source tool's original parsed record(s), kept for lossless fallback / audit. */
+  compaction?: Array<{ summary: string; tokensBefore?: number; retainedTail?: unknown[]; firstKeptId?: string }>;
+  branchSummaries?: Array<{ fromId: string; summary: string }>;
+  extensions?: Record<string, unknown>;
   raw?: unknown;
 }
 
@@ -100,11 +86,42 @@ export function isMigratedMessage(v: unknown): v is MigratedMessage {
   return true;
 }
 
+function isValidSidechain(v: unknown): boolean {
+  if (typeof v !== 'object' || v === null || Array.isArray(v)) return false;
+  const s = v as Record<string, unknown>;
+  if (typeof s.agentId !== 'string' || !s.agentId) return false;
+  if (s.kind !== 'subagent' && s.kind !== 'teammate') return false;
+  if (!Array.isArray(s.messages)) return false;
+  for (const msg of s.messages as unknown[]) {
+    if (!isMigratedMessage(msg)) return false;
+  }
+  return true;
+}
+
 export function validateSession(ir: MigratedSession): MigratedSession {
   if (!ir || typeof ir !== 'object') throw new Error('validateSession: ir is not an object');
+  if (
+    (ir as unknown as Record<string, unknown>).schemaVersion !== undefined &&
+    (ir as unknown as Record<string, unknown>).schemaVersion !== 1
+  ) {
+    throw new Error('validateSession: schemaVersion must be 1');
+  }
   if (!Array.isArray(ir.messages)) throw new Error('validateSession: messages must be an array');
   for (const [i, msg] of ir.messages.entries()) {
     if (!isMigratedMessage(msg)) throw new Error(`validateSession: message[${i}] is malformed`);
+  }
+  if (ir.sidechains !== undefined) {
+    if (!Array.isArray(ir.sidechains)) throw new Error('validateSession: sidechains must be an array');
+    for (const [i, sc] of ir.sidechains.entries()) {
+      if (!isValidSidechain(sc)) throw new Error(`validateSession: sidechains[${i}] is malformed`);
+    }
+  }
+  if (ir.model !== undefined) {
+    if (typeof ir.model !== 'object' || ir.model === null || Array.isArray(ir.model)) {
+      throw new Error('validateSession: model must be an object { id }');
+    }
+    const m = ir.model as Record<string, unknown>;
+    if (typeof m.id !== 'string' || !m.id) throw new Error('validateSession: model.id must be a non-empty string');
   }
   return ir;
 }
@@ -120,6 +137,8 @@ export function messageToText(msg: MigratedMessage): string {
           return `[tool_use: ${b.name}] ${safeJson(b.input)}`;
         case 'tool_result':
           return `[tool_result] ${b.content}`;
+        case 'thinking':
+          return `[thinking] ${b.thinking}`;
         default:
           return '';
       }
@@ -143,5 +162,5 @@ export function inferTitle(ir: MigratedSession): string {
   const firstUser = ir.messages.find((m) => m.role === 'user');
   if (!firstUser) return '(untitled)';
   const text = messageToText(firstUser).trim().replace(/\s+/g, ' ');
-  return text.length > 60 ? `${text.slice(0, 60)}…` : (text || '(untitled)');
+  return text.length > 60 ? `${text.slice(0, 60)}…` : text || '(untitled)';
 }

@@ -31,6 +31,8 @@ export interface WriteOptions {
   targetCwd?: string;
   /** Override the target session id (DSH generates a new one unless provided). */
   sessionId?: string;
+  /** Cross-tool flattening: when true, hidden subagent transcripts become top-level messages. */
+  flatten?: boolean;
 }
 
 export interface WriteResult {

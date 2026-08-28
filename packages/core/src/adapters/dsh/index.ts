@@ -77,7 +77,86 @@ export class DshAdapter implements Adapter {
     ir.originSessionId = header.id;
     ir.cwd = header.cwd;
     ir.createdAt = header.createdAt;
+
+    // Aggregate subagent sidechains: scan all project dirs for children whose header.parentSession === sessionId
+    try {
+      const sidechains = await this.collectSubagentSidechains(sessionsRoot, sessionId);
+      if (sidechains.length > 0) {
+        ir.sidechains = [...(ir.sidechains ?? []), ...sidechains];
+      }
+    } catch {
+      // scanning is best-effort; keep main IR on failure
+    }
     return validateSession(ir);
+  }
+
+  private async collectSubagentSidechains(root: string, parentId: string): Promise<import('../../ir.js').MigratedSidechain[]> {
+    const sidechains: Array<import('../../ir.js').MigratedSidechain & { _createdAt: number }> = [];
+    let projects: string[];
+    try {
+      projects = await fs.readdir(root);
+    } catch {
+      return [];
+    }
+    for (const proj of projects) {
+      const isProjectDir = proj === '_no-cwd' || (proj.startsWith('--') && proj.endsWith('--'));
+      if (!isProjectDir) continue;
+      const projDir = join(root, proj);
+      let sessionDirs: string[];
+      try {
+        sessionDirs = await fs.readdir(projDir);
+      } catch {
+        continue;
+      }
+      for (const sessDir of sessionDirs) {
+        const log = join(projDir, sessDir, 'session.jsonl.zstd');
+        let buf: Buffer;
+        try {
+          buf = await fs.readFile(log);
+        } catch {
+          continue;
+        }
+        let plaintext: string;
+        try {
+          plaintext = decompressSessionBuffer(buf);
+        } catch {
+          continue;
+        }
+        const nl = plaintext.indexOf('\n');
+        const firstLine = (nl === -1 ? plaintext : plaintext.slice(0, nl)).trim();
+        if (!firstLine) continue;
+        let header: Record<string, unknown>;
+        try {
+          header = JSON.parse(firstLine) as Record<string, unknown>;
+        } catch {
+          continue;
+        }
+        if (header.parentSession !== parentId) continue;
+        const childId = typeof header.id === 'string' && header.id ? header.id : sessDir;
+        const createdAt = typeof header.createdAt === 'number' && Number.isSafeInteger(header.createdAt) ? header.createdAt : 0;
+        const agentPreset = typeof header.agentPreset === 'string' ? header.agentPreset : undefined;
+        // decode full session for messages
+        const lines = plaintext.split('\n').filter((l) => l.trim().length > 0);
+        if (lines.length === 0) continue;
+        let events: DshEvent[];
+        try {
+          events = lines.slice(1).map((l) => JSON.parse(l) as DshEvent);
+        } catch {
+          continue;
+        }
+        events.sort((a, b) => (a.seq ?? 0) - (b.seq ?? 0));
+        const childIr = buildIrFromEvents(header as unknown as { cwd?: string; createdAt?: number; id?: string }, events);
+        sidechains.push({
+          agentId: childId,
+          kind: 'subagent',
+          agentType: agentPreset,
+          messages: childIr.messages,
+          _createdAt: createdAt,
+        } as import('../../ir.js').MigratedSidechain & { _createdAt: number });
+      }
+    }
+    sidechains.sort((a, b) => a._createdAt - b._createdAt);
+    return sidechains.map(({ _createdAt: _c, ...rest }) => rest);
   }
 
   /** Write an IR session into DSH's native resumable storage (new session id). */
@@ -113,7 +192,50 @@ export class DshAdapter implements Adapter {
     const finalPath = join(dir, 'session.jsonl.zstd');
     await fs.writeFile(finalPath, payload);
 
-    return { tool: 'dsh', sessionId: newId, paths: [finalPath] };
+    const paths: string[] = [finalPath];
+
+    // subagent sidechains -> independent child sessions
+    const subagents = (ir.sidechains ?? []).filter((s) => s.kind === 'subagent');
+    const now = Date.now();
+    for (let idx = 0; idx < subagents.length; idx++) {
+      const sc = subagents[idx];
+      const rawId = sc.agentId;
+      const childId =
+        typeof rawId === 'string' &&
+        rawId.trim().length > 0 &&
+        rawId !== '.' &&
+        rawId !== '..' &&
+        !rawId.includes('/') &&
+        !rawId.includes('\\') &&
+        !rawId.includes(':')
+          ? rawId
+          : `session-${randomUUID()}`;
+      const childCreatedAt = now + idx + 1;
+      const childHeaderObj: Record<string, unknown> = {
+        type: 'session',
+        version: 0,
+        id: childId,
+        createdAt: childCreatedAt,
+        delegationDepth: 1,
+        parentSession: newId,
+        origin: 'subagent',
+        agentPreset: sc.agentType ?? 'standard',
+      };
+      if (cwd) childHeaderObj.cwd = cwd;
+      const childHeader = JSON.stringify(childHeaderObj);
+      const childIr: MigratedSession = { schemaVersion: 1 as const, originTool: 'dsh', messages: sc.messages };
+      const childEvents = irToEvents(childIr, childCreatedAt);
+      const cFrame1 = buildSessionFrame(childHeader);
+      const cFrame2 = buildEventsFrame(childEvents);
+      const cDir = join(sessionsRoot, projectKey(cwd), encodeSegment(childId));
+      await fs.mkdir(cDir, { recursive: true });
+      const cPayload = Buffer.concat([cFrame1, cFrame2]);
+      const cPath = join(cDir, 'session.jsonl.zstd');
+      await fs.writeFile(cPath, cPayload);
+      paths.push(cPath);
+    }
+
+    return { tool: 'dsh', sessionId: newId, paths };
   }
 
   /** Lightweight session listing from the DSH sessions root. */
@@ -159,12 +281,14 @@ export class DshAdapter implements Adapter {
     return metas;
   }
 
-  /** Offline preview: fold messages to text. */
+  /** Offline preview: fold messages to text (includes sidechains). */
   preview(session: MigratedSession): string {
-    const lines = session.messages.map(
-      (m) => `[${m.role}]\n${blocksToText(m.content)}`,
+    const main = session.messages.map((m) => `[${m.role}]\n${blocksToText(m.content)}`);
+    if (!session.sidechains?.length) return main.join('\n\n');
+    const branches = session.sidechains.map(
+      (sc) => `[sidechain: ${sc.agentId} (${sc.kind})]\n${sc.messages.map((m) => blocksToText(m.content)).join('\n')}`,
     );
-    return lines.join('\n\n');
+    return [...main, ...branches].join('\n\n');
   }
 
   /** Locate the log file for a session id by scanning project dirs. */
@@ -210,7 +334,7 @@ export function buildIrFromEvents(header: { cwd?: string; createdAt?: number; id
     surfaceSeqs.push(ev.seq);
   }
 
-  return { originTool: 'dsh', messages };
+  return { schemaVersion: 1 as const, originTool: 'dsh', messages };
 }
 
 function eventToMessage(type: string, data: DshEvent['data']): MigratedMessage | null {

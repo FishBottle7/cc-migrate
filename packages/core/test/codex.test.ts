@@ -120,7 +120,7 @@ test('buildIrFromLines parses a real-shaped Codex rollout (message + function_ca
   const ir = buildIrFromLines(records);
   assert.equal(ir.originSessionId, sessionId);
   assert.equal(ir.cwd, cwd);
-  assert.equal(ir.model, 'cch');
+  assert.deepEqual(ir.model, { id: 'cch' });
 
   const blockText = (b: { type: string; text?: string; content?: unknown; name?: string; input?: unknown }): string =>
     b.type === 'text' ? (b.text ?? '') : b.type === 'tool_use' ? `[tool_use:${b.name}]` : `[tool_result] ${String(b.content ?? '')}`;
