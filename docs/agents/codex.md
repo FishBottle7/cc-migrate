@@ -151,10 +151,10 @@
 | `session_meta` 首行（匹配 id 的那条）整行 | `session.meta.codex.sessionMetaLine`（原生 payload + git）+ 结构化提升：`cwd`/`createdAt`(timestamp)/`originSessionId`(id)/`model{provider→model_provider}`/`systemPrompt`(base_instructions.text) + `session.meta.codex.baseInstructionsProvenance` | v3.1 `MigratedSession.meta`；结构化提升仅为列表/预览便利，**写回以 meta 原生为准** |
 | 后续继承的 session_meta 行 | `session.meta.codex.inheritedMetaLines[]`（按序） | 子代理 rollout 前缀 |
 | `response_item.message` | `messages[]`（role 保留，含 developer） | `meta.codex = {itemId, phase, passthrough, clientAuthored}` |
-| AGENTS.md 行（content_kind agents_md.instructions / world_state.agents_md） | user 消息 + `meta.codex = {contentKind:'agents_md'}` | 供写端识别/可选剥除 |
-| `<environment_context>`/`<permissions instructions>` 行 | user/developer 消息 + `meta.codex = {contentKind:'environment_context'|'permissions_instructions'}`，并标 `synthetic:true` | §7.2 规则 5 |
+| AGENTS.md 行 | user 消息 + `meta.codex = {contentKind:'agents_md.instructions'}` | 供写端识别/标题推断跳过；**非 synthetic**（随历史保真迁移） |
+| `<environment_context>` / `<permissions instructions>` / `<goal_context>` / `<codex_internal_context source=…>` 等注入行 | user/developer 消息 + `meta.codex = {contentKind:<官方点分 kind>}`；运行时再生成类标 `synthetic:true` | §7.2 规则 5 + §11 分类机制；`goal.internal_context` 等绝不投影为普通用户提示词 |
 | `agent_message` / IAC | assistant 消息 + `meta.codex = {kind:'agent_message'|'iac', author, recipient, otherRecipients?, triggerTurn?}` | 模型可见 |
-| `reasoning` | thinking 块（`signature` 无此概念不填；`meta.codex.reasoningShape='summary'|'content'`） | encrypted_content 丢弃（唯一例外） |
+| `reasoning` | thinking 块（`signature` 无此概念不填；`meta.codex = {reasoningEntryTypes[], reasoningSummaryCount}` 精确保留 summary/content 边界与每块 entry type） | encrypted_content 丢弃（唯一例外） |
 | function_call/custom_tool_call/local_shell_call/tool_search_call/web_search_call | tool_use 块（call_id→block.id） | arguments 保持源字符串→parse；encrypted_function_args 丢 |
 | *_output（含 content_items） | tool_result 块；input_image→`attachments` FileBlock | `success` 字段源端已不保真 |
 | `turn_context` | 该轮首条消息 `meta.codex.turnContext`（原生） | §v3.1 归属约定 |
@@ -188,3 +188,26 @@
 - EventMsg wire 名 `task_started`/`task_complete`（alias turn_*）。
 - `world_state.state` 里的 agents_md 全文 = 项目文档的权威快照，读端从中识别 AGENTS.md 内容。
 - codex 官方导入器（external-agent-migration）是"最小导入"参照：只带 text、丢 thinking/tool 详文、伪造 turn 事件、无 turn_context/world_state、用 ledger 防重导（`~/.codex/external_agent_session_imports.json`，key=path+sha256）。我们方向相反（导出方），但它的 rollout 构造路径验证了最小可 resume 集。
+
+## 11. 实现状态与偏差记录（2026-08-29 重写落地）
+
+`packages/core/src/adapters/codex/{parse,write,paths,index}.ts` 已按本文档重写完成：17 适配器测试 + round-trip 零丢失门（消息/compaction/unmappedEvents 深等 + 逐行 payload 审计）+ 真实 `~/.codex` 全量 1665 会话只读表征审计全绿。与文档正文的偏差/细化如下：
+
+### 11.1 harness 注入行分类（对 §7.2 规则 5 的落地机制）
+
+分类有**两级通道**，均已在 `parse.ts` 实现：
+
+1. **官方主通道**：`internal_chat_message_metadata_passthrough.content_item_kinds`（`ContentItemKind(String)` newtype，线上为裸点分字符串；`context-fragments/src/annotated_content.rs` 的 `to_annotated_content` 按位置与 content zip，缺失补 `"unknown"`）。逐条 verbatim 保真在 `meta.codex.contentItemKinds[]`（passthrough 本身也已保真），首个 item 的 kind 决定整行分类：`user.*`/`unknown`/`shell.user_command`/`multi_agent.inter_agent_message(-completion)` 视为真实内容，其余为 harness 注入 → `meta.codex.contentKind = <kind>`；其中运行时再生成类（`*.instructions`/`*.reminder`/`*.internal_context`/`*.environment_context`/token_budget/rollout_budget/images/audio/model_switch/permissions 前缀保存/turn_aborted/compaction.summary 等）加标 `synthetic:true`。
+2. **Legacy fallback**：无 kinds 的旧 rollout 用文本标记嗅探，词表 = codex 自家冻结判定 `thread-store/src/local/rollout_migration/rollback.rs` 的 `is_known_contextual_user_text` + developer 前缀清单（`<goal_context>`、`<codex_internal_context source="X">` → `X.internal_context`、`# AGENTS.md instructions`、`<user_shell_command>`、`<turn_aborted>`、`<subagent_notification>`、`<recommended_plugins>`、`<skill>`、`<environment_context>`、`<external_*>`、三条 Warning 前缀、`<permissions instructions>`/`<model_switch>`/`<token_budget>`/`<context_window(_guidance)>`/`<rollout_budget>`/`<personality_spec>`/`<tools>` 等 developer 注入）。
+
+真实数据分布（1665 会话实测，kind:条数）：`goal.internal_context:14696`、`generic.turn_aborted:8177`、`multi_agent.subagent_notification:6595`、`environments.environment_context:3451`、`permissions.instructions:3368`、`agents_md.instructions:2600`、`multi_agent.mode_instructions:693`、`apply_patch.legacy_exec_command_warning:598`、`collaboration_mode.instructions:575`、`model_switch.instructions:114`、`skills.instructions:62`、`personality.spec_instructions:3`。**goal resume / system reminder 从此不再出现在用户提示词里**。
+
+### 11.2 与正文的其他偏差
+
+- **写端强制 `history_mode:'legacy'`**（§9.1）：paginated 源转换为 legacy 会话；源行 ordinal 仍按原 ordinal 重发射在行上（信息不丢），但 session_meta 声明 legacy。paginated→paginated 保真转换待 codex 官方格式稳定后再做。
+- **`additional_tools` / `compaction_trigger` / `other`（§3 未持久变体）**：读端归档 `unmappedEvents[]`（`type:'response_item'`，`data.codexResponseItem` = 去加密原始 payload，`data.clientAuthored` 随行），写端按原位重放 response_item 行——比正文"归档不投影"更进一步，零丢弃。
+- **`meta.codex.sourceDir` / `sourceFile`**：读端记录源 rollout 所属文件夹（相对 CODEX_HOME，`sessions/YYYY/MM/DD` 或 `archived_sessions`）与文件名——列表/审计/溯源用；写回新文件路径由 `createdAt` 本地时间重建，不沿用该字段。
+- **session_index 标题推断**（§9.7）：codex 惯例 = **用户第一条真实 prompt 的前缀**。实现顺序：`ir.title` → 原生 `sessionIndex.thread_name` → 首条 `role=user && !synthetic && 无 contentKind && 无 kind` 消息首行文本（60 字符截断）→ `'(untitled)'`。注入行（goal/AGENTS.md/shell 命令/压缩摘要投影）全部跳过。
+- **turn_context / world_state verbatim 重放**：仅 `session_meta.cwd` 按 targetCwd 重映射；turn 行内嵌的 cwd 不改写（保留源轮次原貌）。
+- **client_authored 信封**：response_item 行的 `metadata.client_authored` 读端入 `meta.codex.clientAuthored`，写端逐行还原。
+- **§8 表格更新**：AGENTS.md 行 `contentKind:'agents_md.instructions'`（非 synthetic）；注入行 contentKind 一律用官方点分 kind 值。
