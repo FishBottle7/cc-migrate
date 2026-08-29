@@ -31,6 +31,8 @@ interface Flags {
   root?: string;
   flatten?: boolean;
   keepSynthetic?: boolean;
+  /** preview: 打印全文（默认仅前 120 行 —— 终端渲染 MB 级文本极慢） */
+  full?: boolean;
 }
 
 function parseFlags(argv: string[]): { flags: Flags; positionals: string[] } {
@@ -46,6 +48,7 @@ function parseFlags(argv: string[]): { flags: Flags; positionals: string[] } {
     else if (tok === '--flatten') f.flatten = value('flatten') !== 'false';
     else if (tok === '--no-flatten') f.flatten = false;
     else if (tok === '--keep-runtime-context') f.keepSynthetic = true;
+    else if (tok === '--full') f.full = true;
     else positionals.push(tok);
   }
   return { flags: f, positionals };
@@ -70,12 +73,20 @@ async function main(argv: string[]) {
     }
     case 'preview': {
       if (!a || !b) {
-        console.error('usage: session-migrate preview <tool> <sessionId>');
+        console.error('usage: session-migrate preview <tool> <sessionId> [--full]');
         process.exit(1);
       }
       const adapter = registry.get(a as never);
       const ir = await readSource(registry, a, b, flags.root ?? flags.srcRoot);
-      process.stdout.write(previewSession(adapter, ir));
+      const text = previewSession(adapter, ir);
+      const lines = text.split('\n');
+      const HEAD = 120;
+      if (flags.full || lines.length <= HEAD) {
+        process.stdout.write(text);
+        return;
+      }
+      for (const l of lines.slice(0, HEAD)) process.stdout.write(l + '\n');
+      console.error(`\n[preview] 共 ${lines.length} 行，已显示前 ${HEAD} 行 —— 加 --full 查看全文（大会话全文写入终端较慢）`);
       return;
     }
     case 'migrate': {
