@@ -3,3 +3,12 @@ packages:
   - 'packages/cli'
   - 'packages/ui'
   - 'apps/*'
+
+allowBuilds:
+  electron: true
+  esbuild: true
+
+# electron 的 postinstall 需要下载平台二进制；esbuild 校验其二进制
+onlyBuiltDependencies:
+  - electron
+  - esbuild
