@@ -794,8 +794,16 @@ test('zcode real db: interactive session with revert + subagents parses and vali
   assert.ok(ir.messages.every((m) => ['user', 'assistant', 'tool'].includes(m.role)));
   // model-only synthetic content must never leak into IR messages
   // (extensions['zcode.syntheticMessages'] intentionally keeps their raw data)
-  const msgDump = JSON.stringify(ir.messages);
-  assert.ok(!msgDump.includes('todo_reminder'), 'todo_reminder synthetic leaked into IR messages');
+  // Probe by the reminder's TEXT signature on user messages only — a bare
+  // `todo_reminder` substring false-positives on legitimate assistant
+  // tool_use inputs (e.g. docs that discuss the marker itself).
+  const REMINDER_SIG = 'The TodoWrite tool hasn' + "'t been used recently";
+  assert.ok(
+    !ir.messages.some((m) =>
+      m.role === 'user' && m.content.some((b) => b.type === 'text' && b.text.includes(REMINDER_SIG)),
+    ),
+    'todo_reminder synthetic leaked into IR messages',
+  );
   // the provider bucket must carry only id→name pairs, never credentials
   const ext = ir.extensions as Record<string, unknown>;
   const provDump = JSON.stringify(ext['zcode.providers'] ?? {});
