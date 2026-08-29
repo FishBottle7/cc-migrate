@@ -252,3 +252,31 @@ test('verifySessionLog accepts a written artifact and catches corruption', async
   assert.equal(bad2Result.ok, false);
   assert.ok(bad2Result.issues.some((i) => i.check === 'turn-tail' && i.message.includes('after its first update')));
 });
+
+test('irToEvents re-points replace surfaceOps and sourceEventSeqs at the renumbered stream', () => {
+  const msg = (id: string, text: string) => ({
+    turn: 1,
+    step: 1,
+    message: { id, role: 'assistant', source: { kind: 'model', provider: 'p', model: 'm' }, content: [{ type: 'text', text }] },
+  });
+  const raw = [
+    { type: 'user/message', seq: 0, time: 10, surfaceOp: 'append', data: { id: 'u1', role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: 'q' }] } },
+    { type: 'assistant/message', seq: 1, time: 11, surfaceOp: 'append', data: msg('a1', 'v1') },
+    // replace of assistant seq 1 with a regenerated answer
+    { type: 'assistant/message', seq: 2, time: 12, surfaceOp: { op: 'replace', start: 1, end: 1 }, sourceEventSeqs: [1], data: msg('a2', 'v2') },
+  ];
+  const ir = buildIrFromEvents({ id: 's', createdAt: 10 }, raw as never);
+  // the replaced message must land in unmapped (surfaceOp !== append)
+  assert.ok((ir.unmappedEvents ?? []).some((e) => (e.surfaceOp as unknown as Record<string, unknown>)?.op === 'replace'));
+
+  const events = irToEvents(ir, 10) as unknown as Array<Record<string, unknown>>;
+  assert.equal(events.length, 3);
+  const replaced = events[2];
+  assert.equal(replaced.type, 'assistant/message');
+  const rop = replaced.surfaceOp as Record<string, unknown>;
+  assert.equal(rop.op, 'replace');
+  // old seq 1 (assistant v1) is new seq 1 — remapped, valid, earlier than seq 2
+  assert.equal(rop.start, 1);
+  assert.equal(rop.end, 1);
+  assert.deepEqual(replaced.sourceEventSeqs, [1]);
+});

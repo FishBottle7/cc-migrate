@@ -774,13 +774,19 @@ export function irToEvents(ir: MigratedSession, baseTime: number): DshEvent[] {
   // Now assign seq contiguously over the *expanded* event stream.
   // Walk merged; normal events consume 1 seq, packed rows consume
   // payload length (texts/args) seqs starting at current cursor.
+  // While assigning, record oldSeq -> newSeq for every decoded event so
+  // preserved replace surfaceOps and sourceEventSeqs can be re-pointed at
+  // the renumbered stream (stale references are hard load failures).
   let cursor = 0;
   const out: Array<Record<string, unknown>> = [];
+  const seqMap = new Map<number, number>();
+  const isSourceSeq = (s: number | undefined): s is number => typeof s === 'number' && s >= 0 && s < FALLBACK_SEQ_BASE;
   for (const entry of merged) {
     if ((entry as { __packed?: boolean }).__packed) {
       const packed = entry as Raw & { __packed: boolean; __seq0: number; __time0: number };
       const data = packed.data as unknown as Record<string, unknown>;
       const payloadLen = Array.isArray((data as any).texts) ? (data as any).texts.length : Array.isArray((data as any).args) ? (data as any).args.length : 0;
+      const span = Math.max(1, payloadLen);
       // Rewrite seq0 to be contiguous.
       out.push({
         type: packed.type,
@@ -788,17 +794,47 @@ export function irToEvents(ir: MigratedSession, baseTime: number): DshEvent[] {
         time0: packed.__time0,
         data: packed.data,
       });
-      cursor += Math.max(1, payloadLen);
+      if (isSourceSeq(packed.__seq0)) for (let k = 0; k < span; k++) seqMap.set(packed.__seq0 + k, cursor + k);
+      cursor += span;
     } else {
       const r = entry as Raw;
       const ev: Record<string, unknown> = { seq: cursor, time: r.time, type: r.type, data: r.data };
-      if (r.surfaceOp !== undefined) ev.surfaceOp = r.surfaceOp;
-      if (r.sourceEventSeqs !== undefined) ev.sourceEventSeqs = r.sourceEventSeqs;
-      if (r.type === 'user/message' || r.type === 'assistant/message' || r.type === 'tool/result') {
-        ev.surfaceOp = 'append';
+      if (SURFACE_TYPES.has(r.type)) {
+        // Preserve a replace op when the source carried one; otherwise the
+        // surface marker is a plain append.
+        ev.surfaceOp = r.surfaceOp !== undefined && typeof r.surfaceOp === 'object' ? r.surfaceOp : 'append';
       }
+      // Non-surface types never carry surfaceOp (the loader rejects that).
+      if (r.sourceEventSeqs !== undefined) ev.sourceEventSeqs = r.sourceEventSeqs;
       out.push(ev);
+      if (isSourceSeq(r._seq)) seqMap.set(r._seq, cursor);
       cursor++;
+    }
+  }
+
+  // Re-point preserved replace ops + provenance refs at the new numbering.
+  for (const ev of out) {
+    const op = ev.surfaceOp;
+    if (op !== undefined && typeof op === 'object' && !Array.isArray(op)) {
+      const rop = op as { op: string; start: number; end: number };
+      const start = seqMap.get(rop.start);
+      const end = seqMap.get(rop.end);
+      if (rop.op === 'replace' && start !== undefined && end !== undefined && start <= end && end < (ev.seq as number)) {
+        ev.surfaceOp = { op: 'replace', start, end };
+      } else if (SURFACE_TYPES.has(ev.type as string)) {
+        // Referenced events no longer exist — degrade to append so the
+        // artifact stays loadable (the replacing content is still present).
+        ev.surfaceOp = 'append';
+        delete ev.sourceEventSeqs;
+      } else {
+        delete ev.surfaceOp;
+        delete ev.sourceEventSeqs;
+      }
+    }
+    if (Array.isArray(ev.sourceEventSeqs)) {
+      const remapped = [...new Set((ev.sourceEventSeqs as number[]).map((s) => seqMap.get(s)).filter((s): s is number => s !== undefined && s < (ev.seq as number)))].sort((a, b) => a - b);
+      if (remapped.length > 0) ev.sourceEventSeqs = remapped;
+      else delete ev.sourceEventSeqs;
     }
   }
 
