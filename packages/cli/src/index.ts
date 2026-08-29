@@ -175,7 +175,7 @@ async function main(argv: string[]) {
       return;
     }
     default:
-      console.error('usage: session-migrate <list|preview|migrate|wizard|demo|demo2> [...]');
+      console.error('usage: session-migrate <list|preview|migrate|verify|reconcile|wizard|demo|demo2> [...]');
       process.exit(1);
   }
 }

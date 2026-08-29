@@ -98,8 +98,12 @@ async function getSqliteCtor(): Promise<(new (p: string, opts?: unknown) => DbHa
 }
 
 function openDbSync(dbPath: string, opts?: { readOnly?: boolean }): DbHandle | null {
+  // Node 24 node:sqlite rejects an explicitly-passed `undefined` options
+  // argument ("The options argument must be an object") — normalize to {} so
+  // open attempts never fail on argument shape.
+  const ctorOpts = opts ?? {};
   if (__sqliteCtor) {
-    try { return new (__sqliteCtor as new (p: string, opts?: unknown) => DbHandle)(dbPath, opts as unknown); } catch { /* fall through */ }
+    try { return new (__sqliteCtor as new (p: string, opts?: unknown) => DbHandle)(dbPath, ctorOpts); } catch { /* fall through */ }
   }
   try {
     // eslint-disable-next-line @typescript-eslint/no-require-imports
@@ -109,7 +113,7 @@ function openDbSync(dbPath: string, opts?: { readOnly?: boolean }): DbHandle | n
     const Ctor = mod.DatabaseSync as (new (p: string, opts?: unknown) => DbHandle) | undefined;
     if (typeof Ctor === 'function') {
       __sqliteCtor = Ctor as unknown as new (p: string, opts?: unknown) => DbHandle;
-      return new (__sqliteCtor as new (p: string, opts?: unknown) => DbHandle)(dbPath, opts as unknown);
+      return new (__sqliteCtor as new (p: string, opts?: unknown) => DbHandle)(dbPath, ctorOpts);
     }
   } catch { /* not available sync */ }
   try {
@@ -118,7 +122,7 @@ function openDbSync(dbPath: string, opts?: { readOnly?: boolean }): DbHandle | n
     const req2 = createRequire(import.meta.url);
     const Better = req2('better-sqlite3') as (new (p: string, opts?: unknown) => unknown) | undefined;
     if (typeof Better === 'function') {
-      const raw = new (Better as new (p: string, opts?: unknown) => DbHandle)(dbPath, opts as unknown) as unknown as DbHandle;
+      const raw = new (Better as new (p: string, opts?: unknown) => DbHandle)(dbPath, ctorOpts) as unknown as DbHandle;
       return raw;
     }
   } catch { /* no driver */ }
@@ -128,7 +132,7 @@ function openDbSync(dbPath: string, opts?: { readOnly?: boolean }): DbHandle | n
 async function openDb(dbPath: string, opts?: { readOnly?: boolean }): Promise<DbHandle | null> {
   const Ctor = await getSqliteCtor();
   if (Ctor) {
-    try { return new (Ctor as new (p: string, opts?: unknown) => DbHandle)(dbPath, opts as unknown); } catch { /* busy/locked */ }
+    try { return new (Ctor as new (p: string, opts?: unknown) => DbHandle)(dbPath, opts ?? {}); } catch { /* busy/locked */ }
   }
   return openDbSync(dbPath, opts);
 }
@@ -209,7 +213,8 @@ export class OpenCodeAdapter implements Adapter {
           try {
             db.exec('SAVEPOINT _sm_probe');
             const now = Date.now();
-            db.prepare('INSERT OR IGNORE INTO project (id, worktree, time_created, time_updated) VALUES (?, ?, ?, ?)').run(`_sm_probe_${now}`, '/tmp/_sm_probe', now, now);
+            // Full column list — the real project table has NOT NULL sandboxes.
+            db.prepare('INSERT OR IGNORE INTO project (id, worktree, vcs, name, icon_url, icon_url_override, icon_color, time_created, time_updated, time_initialized, sandboxes, commands) VALUES (?, ?, NULL, NULL, NULL, NULL, NULL, ?, ?, NULL, ?, NULL)').run(`_sm_probe_${now}`, '/tmp/_sm_probe', now, now, '[]');
             db.exec('ROLLBACK TO SAVEPOINT _sm_probe');
             db.exec('RELEASE SAVEPOINT _sm_probe');
           } catch (e) {
@@ -305,75 +310,144 @@ export class OpenCodeAdapter implements Adapter {
 /* DB mode helpers                                                     */
 /* ------------------------------------------------------------------ */
 
+/**
+ * DB row conventions — source-anchored from a REAL opencode v1.18.21 store:
+ *  - messages live in `message` (envelope) + `part` (content blocks);
+ *    `session_message` exists but is EMPTY in v1.18 stores.
+ *  - message data user:   {role:'user', time:{created}, agent:'build',
+ *                           model:{providerID, modelID}, summary:{diffs:[]}}
+ *  - message data assist: {parentID, role:'assistant', mode:'build', agent:'build',
+ *                           path:{cwd, root}, cost, tokens, modelID, providerID,
+ *                           time:{created, completed}, finish?}
+ *  - part data types: text{text} | reasoning{text} | tool{tool,callID,
+ *    state:{status,input,output,time}} | step-start | step-finish | patch | ...
+ *  - sessions attach to project_id='global' (worktree '/') in practice;
+ *    per-directory projects exist too (worktree forward-slashed, vcs 'git',
+ *    sandboxes '[]', id 40-hex).
+ *  - tool results are NOT separate rows: the output lives inside the tool
+ *    part's state.output.
+ */
+
+const OPENCODE_APP_VERSION = '1.18.21';
+
+function fwdSlash(p: string): string {
+  return p.replace(/\\/g, '/');
+}
+
+/**
+ * Find the project row a migrated session should attach to.
+ * 1. The app's own project for this worktree (the common real case — the
+ *    directory has been opened in OpenCode before, so the row exists).
+ * 2. Otherwise the app's 'global' project (worktree '/') — every production
+ *    session row we sampled attaches there. Never fabricate a hash-style
+ *    project id: the app's id derivation is opaque and a mismatched id would
+ *    be orphaned from the app's project resolution.
+ */
+function resolveProjectRow(db: DbHandle, cwd: string): string {
+  const worktree = fwdSlash(cwd || '/');
+  const found = db.prepare('SELECT id FROM project WHERE worktree = ? LIMIT 1').get(worktree) as OpRow | undefined;
+  if (found?.id) return String(found.id);
+  ensureGlobalProject(db);
+  return 'global';
+}
+
+function ensureGlobalProject(db: DbHandle): void {
+  const now = Date.now();
+  db.prepare(
+    "INSERT OR IGNORE INTO project (id, worktree, vcs, name, icon_url, icon_url_override, icon_color, time_created, time_updated, time_initialized, sandboxes, commands) VALUES ('global', '/', NULL, NULL, NULL, NULL, NULL, ?, ?, NULL, '[]', NULL)",
+  ).run(now, now);
+}
+
 function parseFromDb(db: DbHandle, sessionId: string): MigratedSession {
   let sessionRow: OpRow | undefined;
   try {
-    sessionRow = db.prepare('SELECT id, title, time_created, directory, model FROM session WHERE id=?').get(sessionId) as OpRow | undefined;
+    sessionRow = db.prepare('SELECT id, title, time_created, directory, version FROM session WHERE id=?').get(sessionId) as OpRow | undefined;
   } catch {
     sessionRow = undefined;
   }
   if (!sessionRow) throw new Error(`OpenCode: session "${sessionId}" not found in opencode.db`);
-  const cwd = (sessionRow.directory ? String(sessionRow.directory) : undefined);
+  const cwd = sessionRow.directory ? String(sessionRow.directory) : undefined;
   const createdAt = typeof sessionRow.time_created === 'number' ? sessionRow.time_created : undefined;
   const title = sessionRow.title ? String(sessionRow.title) : undefined;
-  let model: MigratedSession['model'];
-  if (sessionRow.model) {
-    try {
-      const m = typeof sessionRow.model === 'string' ? JSON.parse(sessionRow.model) : sessionRow.model as { id?: string; providerID?: string; variant?: string };
-      if (m?.id) model = { id: String(m.id), provider: m.providerID ? String(m.providerID) : undefined, variant: m.variant ? String(m.variant) : undefined };
-    } catch { /* ignore */ }
-  }
 
-  const rows = db.prepare('SELECT id, type, seq, data, time_created FROM session_message WHERE session_id=? ORDER BY seq ASC').all(sessionId) as OpRow[];
+  const msgRows = db.prepare('SELECT id, data, time_created, time_updated FROM message WHERE session_id=? ORDER BY time_created ASC, rowid ASC').all(sessionId) as OpRow[];
+  const partRows = db.prepare('SELECT message_id, data FROM part WHERE session_id=? ORDER BY rowid ASC').all(sessionId) as OpRow[];
+  const partsByMessage = new Map<string, Array<Record<string, unknown>>>();
+  for (const pr of partRows) {
+    let d: Record<string, unknown>;
+    try { d = typeof pr.data === 'string' ? JSON.parse(pr.data) : (pr.data as Record<string, unknown>) ?? {}; } catch { continue; }
+    const key = String(pr.message_id ?? '');
+    const list = partsByMessage.get(key) ?? [];
+    list.push(d);
+    partsByMessage.set(key, list);
+  }
 
   const messages: MigratedMessage[] = [];
   const sidechains: MigratedSidechain[] = [];
+  let model: MigratedSession['model'];
 
-  for (const r of rows) {
-    const type = String(r.type ?? '');
-    const rawData = r.data;
+  for (const r of msgRows) {
     let data: Record<string, unknown>;
-    try {
-      data = typeof rawData === 'string' ? JSON.parse(rawData) : (rawData as Record<string, unknown>) ?? {};
-    } catch {
-      data = {};
-    }
-    // data is Omit<Encoded,id/type> — rehydrate to content
+    try { data = typeof r.data === 'string' ? JSON.parse(r.data) : (r.data as Record<string, unknown>) ?? {}; } catch { data = {}; }
+    const role = String(data.role ?? 'assistant') as MigratedMessage['role'];
     const ts = typeof r.time_created === 'number' ? r.time_created : undefined;
+    const parts = partsByMessage.get(String(r.id ?? '')) ?? [];
 
-    // common: try to extract normalized content
-    const content = extractOpencodeContent(type, data, ts);
-
-    // Detect hidden task subagent: assistant content has tool==='task'
-    if (type === 'assistant' && isTaskTool(data)) {
-      const t = extractTask(data);
-      if (t) {
-        const scMessages: MigratedMessage[] = [];
-        scMessages.push({ role: 'user', content: [{ type: 'text', text: t.prompt }], timestamp: ts });
-        // output may be string or array of blocks
-        const outputMsgs = normalizeOutputToMessages(t.output);
-        scMessages.push(...outputMsgs);
-        sidechains.push({
-          agentId: t.id || `task-${randomUUID().slice(0, 8)}`,
-          kind: 'subagent',
-          agentType: t.subagentType,
-          parentMessageId: String(r.id ?? ''),
-          messages: scMessages,
-        });
-        // still emit the outer task call as a visible assistant tool_use + flattened note
-        messages.push({
-          role: 'assistant',
-          content: [{ type: 'tool_use', id: String(r.id ?? ''), name: 'task', input: { description: t.description, prompt: t.prompt, subagent_type: t.subagentType } }],
-          timestamp: ts,
-        });
-        continue;
+    if (role === 'user') {
+      const content: ContentBlock[] = [];
+      for (const p of parts) {
+        if (p.type === 'text' && typeof p.text === 'string') content.push({ type: 'text', text: p.text });
       }
+      if (content.length) messages.push({ role: 'user', content, timestamp: ts });
+      continue;
     }
 
-    const role: MigratedMessage['role'] =
-      type === 'user' ? 'user' : type === 'assistant' ? 'assistant' : type === 'system' ? 'system' : 'assistant';
-
-    messages.push({ role, content, timestamp: ts });
+    // assistant
+    if (!model && typeof data.modelID === 'string') {
+      model = { id: data.modelID, provider: typeof data.providerID === 'string' ? data.providerID : undefined };
+    }
+    const content: ContentBlock[] = [];
+    const toolResults: MigratedMessage[] = [];
+    for (const p of parts) {
+      if (p.type === 'text' && typeof p.text === 'string') {
+        content.push({ type: 'text', text: p.text });
+      } else if (p.type === 'reasoning' && typeof p.text === 'string') {
+        content.push({ type: 'thinking', thinking: p.text });
+      } else if (p.type === 'tool') {
+        const callID = String(p.callID ?? randomUUID());
+        const state = (p.state ?? {}) as Record<string, unknown>;
+        const input = (state.input ?? {}) as Record<string, unknown>;
+        content.push({ type: 'tool_use', id: callID, name: String(p.tool ?? 'tool'), input });
+        // opencode stores tool output inside the part — re-emit as IR tool_result
+        if (state.output !== undefined && state.output !== null) {
+          const outText = typeof state.output === 'string' ? state.output : JSON.stringify(state.output);
+          toolResults.push({ role: 'tool', content: [{ type: 'tool_result', toolUseId: callID, content: outText }], timestamp: ts });
+        }
+        // hidden task subagent: flatten the transcript into a sidechain
+        if (String(p.tool ?? '') === 'task') {
+          const taskInput = input as Record<string, unknown>;
+          const out = state.output;
+          if (out !== undefined && out !== null) {
+            const scMessages: MigratedMessage[] = [
+              { role: 'user', content: [{ type: 'text', text: String(taskInput.prompt ?? taskInput.description ?? '(task)') }], timestamp: ts },
+              ...normalizeOutputToMessages(out),
+            ];
+            sidechains.push({
+              agentId: callID,
+              kind: 'subagent',
+              agentType: typeof taskInput.subagent_type === 'string' ? taskInput.subagent_type : undefined,
+              parentMessageId: String(r.id ?? ''),
+              messages: scMessages,
+            });
+          }
+        }
+      }
+      // step-start / step-finish / patch / file / compaction: structural metadata, skipped
+    }
+    if (content.length) {
+      messages.push({ role: 'assistant', content, timestamp: ts, provider: typeof data.providerID === 'string' ? data.providerID : undefined, model: typeof data.modelID === 'string' ? data.modelID : undefined });
+      messages.push(...toolResults);
+    }
   }
 
   const ir: MigratedSession = {
@@ -390,52 +464,7 @@ function parseFromDb(db: DbHandle, sessionId: string): MigratedSession {
   return validateSession(ir);
 }
 
-function extractOpencodeContent(type: string, data: Record<string, unknown>, _ts?: number): ContentBlock[] {
-  // data contains the Encoded payload minus id/type. Common shapes:
-  //  - user: { text, files?, agents? }
-  //  - assistant: { agent, model, content: (text|reasoning|tool)[], ... }
-  //  - system/shell/compaction etc: { text / content / ... }
-  if (data.content !== undefined) {
-    const arr = Array.isArray(data.content) ? data.content : [data.content];
-    return normalizeContent(arr as unknown[]);
-  }
-  if (typeof data.text === 'string') return [{ type: 'text', text: data.text }];
-  if (Array.isArray((data as { parts?: unknown }).parts)) {
-    return normalizeContent((data as { parts: unknown[] }).parts);
-  }
-  // fallback: stringify
-  if (Object.keys(data).length === 0) return [];
-  return [{ type: 'text', text: JSON.stringify(data) }];
-}
-
-function isTaskTool(data: Record<string, unknown>): boolean {
-  const content = data.content;
-  if (!Array.isArray(content)) return false;
-  for (const c of content as Array<Record<string, unknown>>) {
-    if (c?.type === 'tool' && c.tool === 'task') return true;
-    if (c?.type === 'tool' && String(c.name ?? c.tool ?? '') === 'task') return true;
-  }
-  return false;
-}
-
-function extractTask(data: Record<string, unknown>): { id: string; description?: string; prompt: string; subagentType?: string; output: unknown } | null {
-  const arr = data.content as Array<Record<string, unknown>>;
-  for (const c of arr ?? []) {
-    if (c?.type !== 'tool') continue;
-    const isTask = c.tool === 'task' || String(c.name ?? '') === 'task';
-    if (!isTask) continue;
-    const id = String(c.id ?? c.toolCallId ?? '');
-    const state = (c.state ?? c) as Record<string, unknown>;
-    const input = (state.input ?? c.input ?? {}) as Record<string, unknown>;
-    const prompt = String(input.prompt ?? input.text ?? '');
-    const subagentType = input.subagent_type ? String(input.subagent_type) : undefined;
-    const description = input.description ? String(input.description) : undefined;
-    const output = state.output ?? c.output ?? '';
-    return { id, description, prompt: prompt || '(opencode task)', subagentType, output };
-  }
-  return null;
-}
-
+/** Convert an opencode task tool output into IR messages (for sidechains). */
 function normalizeOutputToMessages(output: unknown): MigratedMessage[] {
   if (typeof output === 'string') {
     return [{ role: 'assistant', content: [{ type: 'text', text: output }] }];
@@ -451,61 +480,143 @@ function normalizeOutputToMessages(output: unknown): MigratedMessage[] {
   return [];
 }
 
-function writeToDb(db: DbHandle, ir: MigratedSession, newId: string, _cwd: string, _flatten: boolean): string {
+/**
+ * Write an IR session into the REAL v1.18 schema: project + session +
+ * message + part. No silent error swallowing — a failed insert throws.
+ */
+function writeToDb(db: DbHandle, ir: MigratedSession, newId: string, cwd: string, _flatten: boolean): string {
   const now = Date.now();
-  // Ensure schema exists (best-effort) — create tables if missing so tests against :memory: work
-  try {
-    db.exec(`CREATE TABLE IF NOT EXISTS project (id TEXT PRIMARY KEY, worktree TEXT NOT NULL, time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL)`);
-    db.exec(`CREATE TABLE IF NOT EXISTS session (id TEXT PRIMARY KEY, project_id TEXT NOT NULL, slug TEXT NOT NULL, directory TEXT NOT NULL, title TEXT NOT NULL, version TEXT NOT NULL, time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL, model TEXT)`);
-    db.exec(`CREATE TABLE IF NOT EXISTS session_message (id TEXT PRIMARY KEY, session_id TEXT NOT NULL, type TEXT NOT NULL, seq INTEGER NOT NULL, data TEXT NOT NULL, time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL, UNIQUE(session_id, seq))`);
-  } catch { /* ignore */ }
+  const dir = fwdSlash(cwd || '/');
+  // Attach to the app's own project row when present, else 'global' (the
+  // convention every production session row uses), else create one.
+  ensureGlobalProject(db);
+  const projectId = resolveProjectRow(db, dir);
 
-  // Upsert project
-  const projectId = `proj_${randomUUID().replace(/-/g, '').slice(0, 8)}`;
-  try {
-    db.prepare('INSERT OR IGNORE INTO project (id, worktree, time_created, time_updated) VALUES (?, ?, ?, ?)').run(projectId, _cwd || '/', now, now);
-  } catch { /* ignore */ }
+  db.prepare(
+    'INSERT INTO session (id, project_id, workspace_id, parent_id, slug, directory, path, title, version, share_url, summary_additions, summary_deletions, summary_files, summary_diffs, metadata, cost, tokens_input, tokens_output, tokens_reasoning, tokens_cache_read, tokens_cache_write, revert, permission, agent, model, time_created, time_updated, time_compacting, time_archived) VALUES (?, ?, NULL, NULL, ?, ?, NULL, ?, ?, NULL, NULL, NULL, NULL, NULL, NULL, 0, 0, 0, 0, 0, 0, NULL, NULL, NULL, NULL, ?, ?, NULL, NULL)',
+  ).run(
+    newId,
+    projectId,
+    `migrated-${newId.replace(/[^a-z0-9]/gi, '').slice(-10).toLowerCase()}`,
+    dir,
+    ir.title ?? '(migrated)',
+    OPENCODE_APP_VERSION,
+    ir.createdAt ?? now,
+    now,
+  );
 
-  try {
-    db.prepare('INSERT INTO session (id, project_id, slug, directory, title, version, time_created, time_updated, model) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)').run(
-      newId,
-      projectId,
-      `sess-${newId.slice(0, 8)}`,
-      _cwd || '/',
-      ir.title ?? '(migrated)',
-      '0.0.0',
-      ir.createdAt ?? now,
-      now,
-      ir.model ? JSON.stringify(ir.model) : null,
-    );
-  } catch {
-    // if session exists, update
-    try {
-      db.prepare('UPDATE session SET title=?, time_updated=? WHERE id=?').run(ir.title ?? '(migrated)', now, newId);
-    } catch { /* ignore */ }
-  }
+  const modelID = ir.model?.id ?? 'glm-5.3-flash';
+  const providerID = ir.model?.provider ?? 'opencode';
+  const path = { cwd: dir, root: dir };
+  const zeroTokens = { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } };
 
-  let seq = 0;
-  for (const msg of ir.messages) {
-    const id = `msg_${randomUUID().replace(/-/g, '').slice(0, 12)}`;
-    const type = msg.role === 'user' ? 'user' : msg.role === 'assistant' ? 'assistant' : 'system';
-    const data = JSON.stringify({ content: msg.content });
-    try {
-      db.prepare('INSERT INTO session_message (id, session_id, type, seq, data, time_created, time_updated) VALUES (?, ?, ?, ?, ?, ?, ?)').run(id, newId, type, seq++, data, msg.timestamp ?? now, now);
-    } catch { /* skip dup */ }
-  }
-  // sidechains -> either flatten as additional messages or as task tool blocks
-  for (const sc of ir.sidechains ?? []) {
-    // flatten: extend session_message with the sidechain transcript
-    for (const m of sc.messages) {
-      const id = `msg_${randomUUID().replace(/-/g, '').slice(0, 12)}`;
-      const type = m.role === 'user' ? 'user' : 'assistant';
-      const data = JSON.stringify({ content: m.content, __sidechain: sc.agentId });
-      try {
-        db.prepare('INSERT INTO session_message (id, session_id, type, seq, data, time_created, time_updated) VALUES (?, ?, ?, ?, ?, ?, ?)').run(id, newId, type, seq++, data, m.timestamp ?? now, now);
-      } catch { /* ignore */ }
+  // Pair tool-role IR messages into the preceding assistant's tool parts
+  // (opencode stores tool output inside the part, not as separate rows).
+  const pendingToolOutput = new Map<string, string>();
+  const consumedToolMsgs = new Set<number>();
+  ir.messages.forEach((m, idx) => {
+    if (m.role !== 'tool') return;
+    for (const b of m.content) {
+      if (b.type === 'tool_result' && b.toolUseId) {
+        const prev = pendingToolOutput.get(b.toolUseId);
+        pendingToolOutput.set(b.toolUseId, prev ? `${prev}\n${b.content}` : b.content);
+        consumedToolMsgs.add(idx);
+      }
     }
-  }
+  });
+
+  let prevId: string | undefined;
+  let partSeq = 0;
+  const newMsgId = () => `msg_${randomUUID().replace(/-/g, '').slice(0, 24)}`;
+  const newPartId = () => `prt_${randomUUID().replace(/-/g, '').slice(0, 24)}`;
+  const insertPart = (messageId: string, data: Record<string, unknown>, time: number): void => {
+    db.prepare('INSERT INTO part (id, message_id, session_id, time_created, time_updated, data) VALUES (?, ?, ?, ?, ?, ?)').run(
+      newPartId(), messageId, newId, time, now, JSON.stringify(data),
+    );
+    partSeq++;
+  };
+
+  ir.messages.forEach((m, idx) => {
+    if (consumedToolMsgs.has(idx) && m.role === 'tool') return; // merged into tool part
+    if (m.role === 'system') return; // system prompts are opencode config, not chat rows
+    const id = newMsgId();
+    const time = m.timestamp ?? now;
+
+    if (m.role === 'user') {
+      const data: Record<string, unknown> = {
+        role: 'user',
+        time: { created: time },
+        agent: 'build',
+        model: { providerID, modelID },
+        summary: { diffs: [] },
+      };
+      db.prepare('INSERT INTO message (id, session_id, time_created, time_updated, data) VALUES (?, ?, ?, ?, ?)').run(
+        id, newId, time, now, JSON.stringify(data),
+      );
+      for (const b of m.content) {
+        if (b.type === 'text') insertPart(id, { type: 'text', text: b.text }, time);
+      }
+      prevId = id;
+      return;
+    }
+
+    if (m.role === 'tool') {
+      // Orphan tool result (no matching tool_use): emit as a user text row so
+      // the content is not lost.
+      const text = m.content.filter((b) => b.type === 'tool_result').map((b) => (b as { content: string }).content).join('\n');
+      if (!text) return;
+      const data: Record<string, unknown> = {
+        role: 'user',
+        time: { created: time },
+        agent: 'build',
+        model: { providerID, modelID },
+        summary: { diffs: [] },
+      };
+      db.prepare('INSERT INTO message (id, session_id, time_created, time_updated, data) VALUES (?, ?, ?, ?, ?)').run(
+        id, newId, time, now, JSON.stringify(data),
+      );
+      insertPart(id, { type: 'text', text: `[tool result] ${text}` }, time);
+      prevId = id;
+      return;
+    }
+
+    // assistant
+    const data: Record<string, unknown> = {
+      ...(prevId ? { parentID: prevId } : {}),
+      role: 'assistant',
+      mode: 'build',
+      agent: 'build',
+      path,
+      cost: 0,
+      tokens: zeroTokens,
+      modelID,
+      providerID,
+      time: { created: time, completed: time },
+    };
+    db.prepare('INSERT INTO message (id, session_id, time_created, time_updated, data) VALUES (?, ?, ?, ?, ?)').run(
+      id, newId, time, now, JSON.stringify(data),
+    );
+    for (const b of m.content) {
+      if (b.type === 'thinking') insertPart(id, { type: 'reasoning', text: b.thinking }, time);
+      else if (b.type === 'text') insertPart(id, { type: 'text', text: b.text }, time);
+      else if (b.type === 'tool_use') {
+        const output = pendingToolOutput.get(b.id);
+        insertPart(id, {
+          type: 'tool',
+          tool: b.name,
+          callID: b.id,
+          state: {
+            status: 'completed',
+            input: (b.input ?? {}) as Record<string, unknown>,
+            ...(output !== undefined ? { output } : {}),
+            time: { start: time, end: time },
+          },
+        }, time);
+      }
+    }
+    prevId = id;
+  });
+  void partSeq;
   return newId;
 }
 
