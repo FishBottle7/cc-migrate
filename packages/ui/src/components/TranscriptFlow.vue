@@ -1,29 +1,22 @@
 <script setup lang="ts">
 /**
- * TranscriptFlow — 会话流的递归渲染器（DSH 视觉语法）。
- *
- * 顶层渲染主会话 FlowItem；遇到 subagent 项渲染「子代理」披露行，
- * 展开体内用自身递归渲染旁链的内部会话流（左缘竖线标示嵌套层级）。
+ * TranscriptFlow — 会话流渲染器（DSH 视觉语法）。
  * 用户右对齐气泡、助手 markdown 流、思考/工具为 24px 披露行。
+ * 子代理不在流内渲染 —— 由 SessionPreview 头部的子代理切换器整区切换。
  */
 import type { FlowItem } from './flow.js';
 import { firstLine, fmtFull, toolIcon, toolSummary, toolTitle } from './flow.js';
 
-withDefaults(
-  defineProps<{
-    items: FlowItem[];
-    /** 嵌套模式（子代理内部）：左缘竖线 + 更紧的间距 */
-    nested?: boolean;
-  }>(),
-  { nested: false },
-);
+defineProps<{
+  items: FlowItem[];
+}>();
 </script>
 
 <template>
-  <div class="tf" :class="{ 'tf--nested': nested }">
+  <div class="tf">
     <template v-for="it in items" :key="it.key">
-      <!-- 用户：右对齐气泡（DSH User_Bubble） -->
-      <div v-if="it.kind === 'user'" class="user-row" :title="fmtFull(it.ts)">
+      <!-- 用户：右对齐气泡（data-key 供山峰定位条测量） -->
+      <div v-if="it.kind === 'user'" class="user-row" :title="fmtFull(it.ts)" :data-key="it.key">
         <div class="bubble">{{ it.text }}</div>
       </div>
 
@@ -44,8 +37,14 @@ withDefaults(
         <div class="think-body">{{ it.text }}</div>
       </details>
 
-      <!-- 工具调用：披露行 + IN/OUT 卡 -->
-      <details v-else-if="it.kind === 'tool'" class="drow tool-row" :class="{ 'is-err': it.isError }" :title="fmtFull(it.ts)">
+      <!-- 工具调用：披露行 + IN/OUT 卡（data-call 供子代理「定位召唤处」滚动锚定） -->
+      <details
+        v-else-if="it.kind === 'tool'"
+        class="drow tool-row"
+        :class="{ 'is-err': it.isError }"
+        :title="fmtFull(it.ts)"
+        :data-call="it.callId || undefined"
+      >
         <summary>
           <svg class="chev" viewBox="0 0 8 8" aria-hidden="true"><path d="M2 1l4 3-4 3" /></svg>
           <span class="row-icon" aria-hidden="true">
@@ -75,7 +74,7 @@ withDefaults(
       </details>
 
       <!-- 注入上下文：暗淡披露行 -->
-      <details v-else-if="it.kind === 'inject'" class="drow inject-row" :title="fmtFull(it.ts)">
+      <details v-else class="drow inject-row" :title="fmtFull(it.ts)">
         <summary>
           <svg class="chev" viewBox="0 0 8 8" aria-hidden="true"><path d="M2 1l4 3-4 3" /></svg>
           <span class="row-icon" aria-hidden="true">
@@ -86,25 +85,6 @@ withDefaults(
           <span class="row-sum">{{ firstLine(it.text) }}</span>
         </summary>
         <div class="think-body">{{ it.text }}</div>
-      </details>
-
-      <!-- 子代理旁链：披露行 + 递归嵌套会话流 -->
-      <details v-else class="drow subagent-row">
-        <summary>
-          <svg class="chev" viewBox="0 0 8 8" aria-hidden="true"><path d="M2 1l4 3-4 3" /></svg>
-          <span class="row-icon" aria-hidden="true">
-            <svg viewBox="0 0 14 14"><rect x="1.5" y="1.5" width="5" height="5" rx="1" /><rect x="7.5" y="7.5" width="5" height="5" rx="1" /><path d="M6.5 4h2.5a1 1 0 011 1v2.5" /></svg>
-          </span>
-          <span class="row-title">子代理</span>
-          <span class="row-sep" aria-hidden="true" />
-          <span class="row-sum">
-            {{ it.agentType ?? it.agentId }} · {{ it.items.length }} 条消息<template v-if="it.truncated">（已截断）</template>
-          </span>
-        </summary>
-        <div class="sc-body">
-          <TranscriptFlow :items="it.items" nested />
-          <p v-if="it.truncated" class="sc-note">子代理消息过长，仅投影前 {{ it.items.length }} 条（迁移本身无损）</p>
-        </div>
       </details>
     </template>
   </div>
@@ -117,9 +97,6 @@ withDefaults(
   gap: 12px;
   min-width: 0;
 }
-.tf--nested {
-  gap: 8px;
-}
 
 /* 用户气泡：右对齐（DSH User_Bubble：r22、10/16 padding、82%/525px 封顶） */
 .user-row {
@@ -129,7 +106,9 @@ withDefaults(
   min-width: 0;
 }
 .bubble {
-  max-width: min(82%, 525px);
+  /* DSH：气泡宽 = 内容轴的 70.2%，随区域等比伸缩，720px 封顶保阅读性 */
+  max-width: min(70.2%, 720px);
+  width: fit-content;
   background: var(--ink-3);
   border-radius: 22px;
   padding: 10px 16px;
@@ -369,18 +348,5 @@ withDefaults(
 }
 .io-text.is-err {
   color: var(--err);
-}
-
-/* 子代理：嵌套会话流带左缘竖线，标示这是另一个会话的内部视角 */
-.sc-body {
-  margin: 4px 0 4px 10px;
-  padding-left: 12px;
-  border-left: 2px solid var(--line-1);
-  min-width: 0;
-}
-.sc-note {
-  margin: 8px 0 0;
-  font-size: 12px;
-  color: var(--fg-2);
 }
 </style>

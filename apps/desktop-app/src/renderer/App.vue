@@ -58,4 +58,10 @@ body {
   z-index: 1;
   height: 100%;
 }
+/* 分栏拖拽中：全局列光标 + 禁止选中 */
+body.sv-resizing,
+body.sv-resizing * {
+  cursor: col-resize !important;
+  user-select: none !important;
+}
 </style>

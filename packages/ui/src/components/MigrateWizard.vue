@@ -233,6 +233,49 @@ function errMsg(e: unknown): string {
   const m = (e as Error)?.message ?? String(e);
   return m.length > 300 ? m.slice(0, 300) + '…' : m;
 }
+
+/* ── 会话/预览分栏拖拽 ─────────────────────────────────────── */
+
+const SPLIT_KEY = 'sm.split.left';
+
+function clampSplit(v: number): number {
+  return Math.min(Math.max(Number.isFinite(v) ? Math.round(v) : 288, 236), 560);
+}
+
+function readSplit(): number {
+  try {
+    const raw = localStorage.getItem(SPLIT_KEY);
+    return raw === null ? 288 : clampSplit(Number(raw));
+  } catch {
+    return 288;
+  }
+}
+
+const splitEl = ref<HTMLElement | null>(null);
+const splitLeft = ref(readSplit());
+
+function startDrag(e: MouseEvent) {
+  e.preventDefault();
+  const rect = splitEl.value?.getBoundingClientRect();
+  if (!rect) return;
+  const max = Math.max(rect.width - 430, 300);
+  const move = (ev: MouseEvent) => {
+    splitLeft.value = clampSplit(ev.clientX - rect.left);
+  };
+  const up = () => {
+    try {
+      localStorage.setItem(SPLIT_KEY, String(splitLeft.value));
+    } catch {
+      /* 无 localStorage 时仅会话内生效 */
+    }
+    document.body.classList.remove('sv-resizing');
+    window.removeEventListener('mousemove', move);
+    window.removeEventListener('mouseup', up);
+  };
+  document.body.classList.add('sv-resizing');
+  window.addEventListener('mousemove', move);
+  window.addEventListener('mouseup', up);
+}
 </script>
 
 <template>
@@ -310,9 +353,10 @@ function errMsg(e: unknown): string {
               <button class="sm-btn" type="button" :disabled="sessionsLoading" @click="rescan">扫描</button>
               <button class="sm-btn sm-btn--ghost" type="button" @click="backSource">← 换源工具</button>
             </div>
-            <div class="split">
+            <div ref="splitEl" class="split">
               <SessionPicker
                 class="split-left"
+                :style="{ width: splitLeft + 'px' }"
                 :sessions="sessions"
                 :loading="sessionsLoading"
                 :error="sessionsError"
@@ -320,25 +364,22 @@ function errMsg(e: unknown): string {
                 @select="pickSession"
                 @refresh="rescan"
               />
+              <div class="split-divider" title="拖动调节宽度" @mousedown="startDrag" />
               <SessionPreview
-                class="split-right sm-card"
+                class="split-right"
                 :payload="preview"
                 :loading="previewLoading"
                 :error="previewError"
               />
             </div>
-            <footer class="pane-foot">
-              <span class="foot-info">
-                {{
-                  selected
-                    ? `已选择：${selected.title || selected.sessionId}`
-                    : '选择会话查看离线预览（只读，不启动模型）'
-                }}
-              </span>
-              <button class="sm-btn sm-btn--primary" type="button" :disabled="!selected" @click="toTarget">
-                下一步 · 配置目标
-              </button>
-            </footer>
+            <button
+              class="sm-btn sm-btn--primary next-fab"
+              type="button"
+              :disabled="!selected"
+              @click="toTarget"
+            >
+              下一步 · 配置目标 →
+            </button>
           </div>
 
           <!-- 步骤 3：目标配置 -->
@@ -359,7 +400,7 @@ function errMsg(e: unknown): string {
                 @browse-cwd="browseCwd"
               />
 
-              <div class="confirm sm-card sm-stagger">
+              <div class="confirm sm-stagger">
                 <p class="sm-tag confirm-tag" :style="{ '--i': 0 }">迁移计划 · PLAN</p>
                 <div class="confirm-flow" :style="{ '--i': 1 }">
                   <span class="cf-tool">
@@ -429,7 +470,7 @@ function errMsg(e: unknown): string {
 
           <!-- 步骤 4：完成 -->
           <div v-else class="pane pane--center">
-            <div class="result sm-card">
+            <div class="result">
               <svg class="rv-check" viewBox="0 0 52 52" aria-hidden="true">
                 <circle cx="26" cy="26" r="24" />
                 <path d="M15 27l8 8 15-17" />
@@ -658,6 +699,7 @@ function errMsg(e: unknown): string {
   flex-direction: column;
   gap: 14px;
   padding: 24px 26px 20px;
+  position: relative;
 }
 .pane--center {
   justify-content: center;
@@ -713,19 +755,32 @@ function errMsg(e: unknown): string {
   flex: 1;
   min-height: 0;
   min-width: 0;
-  display: grid;
-  grid-template-columns: minmax(280px, 5fr) minmax(0, 7fr);
-  gap: 12px;
+  display: flex;
 }
-.split-left,
-.split-right {
+.split-left {
+  flex: none;
   min-height: 0;
   min-width: 0;
 }
+.split-divider {
+  flex: none;
+  width: 5px;
+  margin: 0 3px;
+  border-radius: 3px;
+  cursor: col-resize;
+  transition: background var(--t-fast) ease;
+}
+.split-divider:hover,
+body.sv-resizing .split-divider {
+  background: var(--acc-soft);
+}
 .split-right {
-  padding: 16px;
+  flex: 1 1 0;
+  min-width: 0;
+  min-height: 0;
   display: flex;
   flex-direction: column;
+  padding: 0 2px 0 12px;
 }
 
 /* 目标步骤布局 */
@@ -747,9 +802,10 @@ function errMsg(e: unknown): string {
   padding: 10px 14px;
 }
 
-/* 迁移计划 */
+/* 迁移计划（无卡片：一段悬于页面上的确认信息，仅以虚线与上文分隔） */
 .confirm {
-  padding: 16px 18px;
+  padding: 14px 2px 2px;
+  border-top: 1px dashed var(--line-1);
 }
 .confirm-tag {
   margin: 0 0 14px;
@@ -819,11 +875,11 @@ function errMsg(e: unknown): string {
   padding-top: 10px;
 }
 
-/* 结果 */
+/* 结果（无卡片，仪式感靠对勾动效本身） */
 .result {
   max-width: 640px;
   width: 100%;
-  padding: 30px 32px;
+  padding: 12px 4px;
   display: flex;
   flex-direction: column;
   align-items: flex-start;
@@ -915,6 +971,19 @@ function errMsg(e: unknown): string {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+  min-width: 0;
+}
+/* 会话步骤：右下角悬浮的下一步按钮（浮在预览内容区上方，不占行） */
+.next-fab {
+  position: absolute;
+  right: 22px;
+  bottom: 14px;
+  z-index: 6;
+  border-radius: 999px;
+  padding: 9px 18px;
+  box-shadow:
+    0 6px 18px rgba(118, 99, 224, 0.35),
+    0 2px 6px rgba(38, 32, 66, 0.2);
 }
 .run-btn {
   min-width: 132px;

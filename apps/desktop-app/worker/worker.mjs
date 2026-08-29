@@ -138,6 +138,7 @@ async function buildPreview({ tool, sessionId, root }) {
       return {
         agentId: sc.agentId,
         agentType: sc.agentType,
+        parentCallId: sc.parentMessageId,
         truncated: msgs.length > SC_MSG_CAP || undefined,
         messages: messagesToDto(capped),
       };

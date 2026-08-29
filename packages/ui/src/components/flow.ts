@@ -18,13 +18,10 @@ export type FlowItem =
       kind: 'tool'; key: string; ts?: number;
       name: string; input: string | null; inputTruncated?: boolean;
       output: string | null; outputTruncated?: boolean; isError: boolean;
+      /** tool_use 的调用 id（子代理「定位召唤处」按它滚动定位） */
+      callId?: string;
     }
-  | { kind: 'inject'; key: string; ts?: number; text: string }
-  /** 子代理旁链（DSH/ZCode 的 Task 子会话），items 为其内部会话流 */
-  | {
-      kind: 'subagent'; key: string;
-      agentId: string; agentType?: string; truncated?: boolean; items: FlowItem[];
-    };
+  | { kind: 'inject'; key: string; ts?: number; text: string };
 
 export function firstLine(text: string): string {
   const nl = text.indexOf('\n');
@@ -113,6 +110,7 @@ export function computeFlow(messages: PreviewMessageDTO[], prefix = 'm'): FlowIt
           input: b.text ?? null, inputTruncated: b.truncated,
           output: result?.text ?? null, outputTruncated: result?.truncated,
           isError: result?.isError ?? false,
+          callId: b.callId,
         });
       } else if (b.t === 'tool_result') {
         if (b.callId && consumed.has(b.callId)) return; // 已融合进调用行

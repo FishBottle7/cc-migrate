@@ -312,7 +312,6 @@ function toggleGroup(key: string) {
   flex-direction: column;
   gap: 8px;
   padding: 12px 14px;
-  border: 1px solid var(--line-0);
   border-radius: 8px;
 }
 .sp-sk-title {
@@ -326,30 +325,27 @@ function toggleGroup(key: string) {
   width: 100%;
   display: flex;
   flex-direction: column;
-  gap: 6px;
+  gap: 5px;
   text-align: left;
-  padding: 11px 14px;
-  background: var(--ink-1);
-  border: 1px solid var(--line-0);
+  padding: 9px 12px;
+  background: transparent;
+  border: none;
   border-radius: 8px;
   cursor: pointer;
   font: inherit;
   color: var(--fg-0);
   transition:
-    border-color var(--t-fast) ease,
     background var(--t-fast) ease,
     transform var(--t-fast) var(--ease-out);
 }
 .sp-item:hover {
   background: var(--ink-2);
-  border-color: var(--line-1);
 }
 .sp-item:active {
   transform: scale(0.995);
 }
 .sp-item.is-active {
-  background: var(--ink-2);
-  border-color: var(--acc-0);
+  background: var(--ink-3);
 }
 .sp-bar {
   position: absolute;

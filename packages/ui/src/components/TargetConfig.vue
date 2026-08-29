@@ -27,7 +27,7 @@ const emit = defineEmits<{
 
 <template>
   <section class="target-config sm-stagger">
-    <div class="tc-block sm-card" :style="{ '--i': 0 }">
+    <div class="tc-block" :style="{ '--i': 0 }">
       <p class="sm-tag tc-tag">目标工具 · TARGET</p>
       <div class="tc-tools" role="radiogroup" aria-label="目标工具">
         <button
@@ -45,7 +45,7 @@ const emit = defineEmits<{
       </div>
     </div>
 
-    <div class="tc-block sm-card" :style="{ '--i': 1 }">
+    <div class="tc-block" :style="{ '--i': 1 }">
       <p class="sm-tag tc-tag">目标存储目录 · ROOT</p>
       <div class="tc-row">
         <input
@@ -60,7 +60,7 @@ const emit = defineEmits<{
       <p class="tc-hint">留空写入默认位置。写入的是<strong>全新会话</strong>，不会覆盖已有会话。</p>
     </div>
 
-    <div class="tc-block sm-card" :style="{ '--i': 2 }">
+    <div class="tc-block" :style="{ '--i': 2 }">
       <p class="sm-tag tc-tag">目标工作目录 · CWD</p>
       <div class="tc-row">
         <input
@@ -74,7 +74,7 @@ const emit = defineEmits<{
       </div>
     </div>
 
-    <div v-if="props.showFlatten || props.showKeepSynthetic" class="tc-block sm-card" :style="{ '--i': 3 }">
+    <div v-if="props.showFlatten || props.showKeepSynthetic" class="tc-block" :style="{ '--i': 3 }">
       <p class="sm-tag tc-tag">高级选项 · OPTIONS</p>
       <label v-if="props.showFlatten" class="tc-opt sm-switch">
         <input
@@ -107,8 +107,12 @@ const emit = defineEmits<{
 .tc-tag {
   margin: 0 0 12px;
 }
+/* 无卡片分节：细分隔线，不做盒子 */
 .tc-block {
-  padding: 16px 18px;
+  padding: 12px 2px;
+}
+.tc-block + .tc-block {
+  border-top: 1px solid var(--line-0);
 }
 .tc-tools {
   display: flex;

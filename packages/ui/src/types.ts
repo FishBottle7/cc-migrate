@@ -42,6 +42,8 @@ export interface PreviewMessageDTO {
 export interface PreviewSidechainDTO {
   agentId: string;
   agentType?: string;
+  /** 派发该子代理的 tool_use 调用 id（渲染层据此把旁链挂到调用点下方） */
+  parentCallId?: string;
   /** 超过投影上限时为 true（仅展示前 N 条） */
   truncated?: boolean;
   messages: PreviewMessageDTO[];

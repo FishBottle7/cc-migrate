@@ -43,6 +43,8 @@ export interface PreviewMessageDTO {
 export interface PreviewSidechainDTO {
   agentId: string;
   agentType?: string;
+  /** 派发该子代理的 tool_use 调用 id */
+  parentCallId?: string;
   truncated?: boolean;
   messages: PreviewMessageDTO[];
 }
