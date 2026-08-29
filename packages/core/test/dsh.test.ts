@@ -18,6 +18,7 @@ import {
 import { normalizeContent } from '../src/content.js';
 import { fallbackIr } from '../src/demo.js';
 import { decompressSessionBuffer } from '../src/adapters/dsh/format.js';
+import { verifySessionLog } from '../src/adapters/dsh/verify.js';
 
 /** Minimal loose shape for test fixture events. */
 interface DshEventLike {
@@ -214,4 +215,40 @@ test('irToEvents synthesizes session/title from ir.title when no title event exi
   const events = irToEvents(ir as never, 999);
   assert.ok(events.some((e) => e.type === 'session/title' && (e.data as Record<string, unknown>).title === 'my-title'));
   events.forEach((e, i) => assert.equal(e.seq, i));
+});
+
+test('verifySessionLog accepts a written artifact and catches corruption', async () => {
+  const adapter = new DshAdapter();
+  const root = await tempRoot();
+  const res = await adapter.write(fallbackIr(), { root, targetCwd: 'D:\\proj-verify' });
+
+  // written artifact must pass all layers
+  const buf = await fs.readFile(res.paths[0]);
+  const plain = decompressSessionBuffer(buf);
+  const good = verifySessionLog(plain, res.sessionId, res.paths[0]);
+  assert.equal(good.ok, true, `expected OK, issues: ${JSON.stringify(good.issues)}`);
+  assert.ok(good.stats.events > 0);
+
+  // corrupt the row envelope: packed row written as {seq,time} must be caught
+  const lines = plain.split('\n').filter((l) => l.trim());
+  const bad = [...lines];
+  bad[1] = JSON.stringify({ seq: 0, time: 1, type: 'reasoning-chunks', data: { texts: ['x'] } });
+  const badPlain = bad.join('\n');
+  const badResult = verifySessionLog(badPlain, res.sessionId, res.paths[0]);
+  assert.equal(badResult.ok, false);
+  assert.ok(badResult.issues.some((i) => i.check === 'envelope' && i.message.includes('seq0')));
+
+  // corrupt turn-tail: turn/start arriving AFTER an update of the same turn
+  // must be caught (the hard GUI load failure)
+  const bad2 = [...lines];
+  bad2.splice(1, 0, JSON.stringify({ seq: 0, time: 1, type: 'tool/call', data: { turn: 1, step: 1, callId: 'c1', name: 't', arguments: '{}' } }));
+  bad2.splice(2, 0, JSON.stringify({ seq: 1, time: 2, type: 'turn/start', data: { turn: 1 } }));
+  for (let i = 3; i < bad2.length; i++) {
+    const ev = JSON.parse(bad2[i]);
+    if (ev.seq !== undefined) ev.seq = i;
+    bad2[i] = JSON.stringify(ev);
+  }
+  const bad2Result = verifySessionLog(bad2.join('\n'), res.sessionId, res.paths[0]);
+  assert.equal(bad2Result.ok, false);
+  assert.ok(bad2Result.issues.some((i) => i.check === 'turn-tail' && i.message.includes('after its first update')));
 });

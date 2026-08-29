@@ -8,6 +8,8 @@
  *   session-migrate migrate <srcTool> <srcSessionId> <dstTool>
  *                    [--src-root <dir>] [--dst-root <dir>] [--target-cwd <path>]
  *   session-migrate wizard [--src-root <dir>] [--dst-root <dir>]  # interactive
+ *   session-migrate reconcile dsh [--root <dir>]  # fix workspace.json registration
+ *   session-migrate verify dsh [--root <dir>] [sessionId]  # validate artifacts
  *   session-migrate demo      # dsh->dsh self round-trip
  *   session-migrate demo2     # claude<->dsh round-trip in a temp dir
  */
@@ -103,6 +105,34 @@ async function main(argv: string[]) {
         return;
       }
       console.error('usage: session-migrate reconcile [dsh] [--root <dir>]');
+      process.exit(1);
+    }
+    case 'verify': {
+      if (a === 'dsh' || !a) {
+        const { verifySessionById, verifyAllSessions } = await import('@session-migrate/core/verify');
+        const { defaultDshRoot } = await import('@session-migrate/core');
+        const root = (flags.root ?? flags.dstRoot ?? (defaultDshRoot as unknown as () => string | null)()) as string | undefined;
+        const sid = b;
+        const results = sid ? [await verifySessionById(sid, root)] : await verifyAllSessions(root);
+        let failed = 0;
+        for (const r of results) {
+          if (r.ok) {
+            const s = r.stats;
+            console.log(`OK   ${r.sessionId || '(root)'}  events=${s.events} assistant=${s.assistantMessages} text=${s.textBlocks} reasoning=${s.reasoningBlocks} toolCalls=${s.toolCalls} turns=${s.turns}`);
+          } else {
+            failed++;
+            console.log(`FAIL ${r.sessionId || '(root)'}`);
+            for (const issue of r.issues) {
+              const at = [issue.line !== undefined ? `line ${issue.line}` : null, issue.seq !== undefined ? `seq ${issue.seq}` : null].filter(Boolean).join(', ');
+              console.log(`     [${issue.check}]${at ? ' ' + at : ''}: ${issue.message}`);
+            }
+          }
+        }
+        console.log(`verified ${results.length} session(s), ${failed} failing`);
+        if (failed > 0) process.exit(1);
+        return;
+      }
+      console.error('usage: session-migrate verify [dsh] [--root <dir>] [sessionId]');
       process.exit(1);
     }
     case 'wizard':
