@@ -1,0 +1,31 @@
+{
+  "name": "@session-migrate/ui",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "跨端复用 Vue 3 组件：SessionPicker / SessionPreview / MigrateWizard（DSH 插件与独立 App 共用）",
+  "main": "./src/index.ts",
+  "exports": {
+    ".": "./src/index.ts",
+    "./types": "./src/types.ts"
+  },
+  "scripts": {
+    "typecheck": "vue-tsc --noEmit -p tsconfig.json",
+    "build": "echo 'source-only package（由宿主 vite/插件构建编译）'",
+    "test": "pnpm run typecheck"
+  },
+  "peerDependencies": {
+    "vue": "^3.5.0"
+  },
+  "dependencies": {
+    "markdown-it": "^14.1.0"
+  },
+  "devDependencies": {
+    "@session-migrate/core": "workspace:*",
+    "@types/markdown-it": "^14.1.2",
+    "@types/node": "^24.0.0",
+    "typescript": "^5.9.0",
+    "vue": "^3.5.0",
+    "vue-tsc": "^3.0.0"
+  }
+}

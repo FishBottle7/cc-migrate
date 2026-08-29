@@ -1,0 +1,350 @@
+/**
+ * @session-migrate/ui — 设计系统：「雾紫」
+ *
+ * 视觉语言：白纸基底 + 淡紫强调（主操作用中饱和紫，大面积渲染用极淡紫底），
+ * 深紫墨色正文，等宽体承载数据（路径 / id / 时间）。对比度按 WCAG 校准：
+ * 正文 ≥ 7:1，次级 ≥ 4.5:1，三级摘要 ≥ 4.5:1。
+ * 动效一律只用 transform / opacity，统一缓动曲线，尊重 prefers-reduced-motion。
+ */
+
+:root {
+  /* 纸面（白 → 极淡紫的层级） */
+  --ink-0: #ffffff; /* 页面基底 */
+  --ink-1: #ffffff; /* 卡片面 */
+  --ink-2: #f5f3fa; /* 悬停面 */
+  --ink-3: #eee9fa; /* 淡紫填充（用户气泡 / 选中底） */
+  /* 代码 / IO 卡片面（比纸面低半级，区别于纯白正文区） */
+  --code-0: #f8f7fc;
+
+  /* 线 */
+  --line-0: #e9e6f2;
+  --line-1: #d8d3ea;
+
+  /* 文（紫墨系） */
+  --fg-0: #262038;
+  --fg-1: #5a5476;
+  --fg-2: #726c92;
+
+  /* 紫 */
+  --acc-0: #7663e0; /* 主紫：按钮底 / 开关 / 焦点环 */
+  --acc-1: #6756d4; /* 悬停深紫 */
+  --acc-ink: #6452d0; /* 白底上的紫字（链接 / 强调文本，≥5:1） */
+  --acc-soft: rgba(118, 99, 224, 0.14);
+
+  /* 语义（白底下可读的低饱和色） */
+  --ok: #2f9e63;
+  --err: #c9364e;
+  --warn: #a8731c;
+
+  /* 字体 */
+  --sans: system-ui, "Segoe UI", "Microsoft YaHei UI", "PingFang SC", "Noto Sans SC", sans-serif;
+  --serif: Georgia, "Times New Roman", "STSong", "SimSun", serif;
+  --mono: ui-monospace, "Cascadia Mono", Consolas, "Sarasa Mono SC", monospace;
+
+  /* 动效 */
+  --ease-out: cubic-bezier(0.22, 1, 0.36, 1);
+  --ease-spring: cubic-bezier(0.3, 1.25, 0.45, 1);
+  --t-fast: 150ms;
+  --t-med: 280ms;
+  --t-slow: 460ms;
+
+  color-scheme: light;
+}
+
+/* ── 基础 ─────────────────────────────────────────────────── */
+
+::selection {
+  background: rgba(118, 99, 224, 0.22);
+}
+
+* {
+  scrollbar-width: thin;
+  scrollbar-color: #d6d1e6 transparent;
+}
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: #d6d1e6;
+  border-radius: 8px;
+  border: 2px solid transparent;
+  background-clip: content-box;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #c1b9dc;
+  border: 2px solid transparent;
+  background-clip: content-box;
+}
+
+:focus-visible {
+  outline: 2px solid var(--acc-0);
+  outline-offset: 2px;
+  border-radius: 6px;
+}
+
+/* ── 卡片：细线 + 极浅漫射投影 ────────────────────────────── */
+
+.sm-card {
+  background: var(--ink-1);
+  border: 1px solid var(--line-0);
+  border-radius: 10px;
+  box-shadow:
+    0 1px 2px rgba(38, 32, 66, 0.04),
+    0 6px 18px rgba(38, 32, 66, 0.04);
+}
+
+/* ── 按钮：默认幽灵 / 紫底主按钮，悬停掠光，按压回缩 ──────── */
+
+.sm-btn {
+  position: relative;
+  overflow: hidden;
+  appearance: none;
+  border: 1px solid var(--line-1);
+  background: var(--ink-1);
+  color: var(--fg-0);
+  border-radius: 8px;
+  padding: 7px 15px;
+  font: 500 13px/1.4 var(--sans);
+  letter-spacing: 0.01em;
+  cursor: pointer;
+  transition:
+    border-color var(--t-fast) ease,
+    background var(--t-fast) ease,
+    color var(--t-fast) ease,
+    transform var(--t-fast) var(--ease-out);
+}
+.sm-btn::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(105deg, transparent 42%, rgba(118, 99, 224, 0.1) 50%, transparent 58%);
+  transform: translateX(-130%);
+  pointer-events: none;
+}
+.sm-btn:hover:not(:disabled) {
+  border-color: #c6bfdf;
+  background: var(--ink-2);
+}
+.sm-btn:hover:not(:disabled)::after {
+  transform: translateX(130%);
+  transition: transform 0.55s var(--ease-out);
+}
+.sm-btn:active:not(:disabled) {
+  transform: scale(0.97);
+}
+.sm-btn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.sm-btn--primary {
+  background: var(--acc-0);
+  border-color: var(--acc-0);
+  color: #ffffff;
+  font-weight: 650;
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.22),
+    0 2px 10px rgba(118, 99, 224, 0.3);
+}
+.sm-btn--primary:hover:not(:disabled) {
+  background: var(--acc-1);
+  border-color: var(--acc-1);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.18),
+    0 3px 14px rgba(118, 99, 224, 0.38);
+}
+.sm-btn--primary::after {
+  background: linear-gradient(105deg, transparent 42%, rgba(255, 255, 255, 0.28) 50%, transparent 58%);
+}
+
+.sm-btn--ghost {
+  border-color: transparent;
+  background: transparent;
+  color: var(--fg-1);
+}
+.sm-btn--ghost:hover:not(:disabled) {
+  color: var(--fg-0);
+  background: var(--ink-2);
+}
+
+/* ── 输入：白底内嵌，聚焦紫描边 ───────────────────────────── */
+
+.sm-input {
+  appearance: none;
+  background: #fbfafe;
+  border: 1px solid var(--line-1);
+  border-radius: 8px;
+  color: var(--fg-0);
+  padding: 7px 11px;
+  font: 400 13px/1.5 var(--mono);
+  outline: none;
+  width: 100%;
+  box-sizing: border-box;
+  transition:
+    border-color var(--t-fast) ease,
+    box-shadow var(--t-fast) ease;
+}
+.sm-input:focus {
+  border-color: var(--acc-0);
+  box-shadow: 0 0 0 3px var(--acc-soft);
+  background: #ffffff;
+}
+.sm-input::placeholder {
+  color: #9a94b3;
+  font-family: var(--sans);
+}
+
+/* ── 微标签（编辑风小字） ─────────────────────────────────── */
+
+.sm-tag {
+  font: 500 10.5px/1 var(--mono);
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--fg-2);
+}
+
+/* ── 开关（替代原生 checkbox 的质感件） ───────────────────── */
+
+.sm-switch {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  cursor: pointer;
+  user-select: none;
+}
+.sm-switch input {
+  position: absolute;
+  opacity: 0;
+  pointer-events: none;
+}
+.sm-switch .sm-switch-track {
+  flex: none;
+  width: 32px;
+  height: 18px;
+  border-radius: 999px;
+  background: #e6e2f2;
+  border: 1px solid var(--line-1);
+  position: relative;
+  transition: background var(--t-med) var(--ease-out), border-color var(--t-med) ease;
+}
+.sm-switch .sm-switch-track::before {
+  content: "";
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  background: #ffffff;
+  box-shadow: 0 1px 2px rgba(38, 32, 66, 0.2);
+  transition:
+    transform var(--t-med) var(--ease-spring),
+    background var(--t-med) ease;
+}
+.sm-switch input:checked + .sm-switch-track {
+  background: var(--acc-0);
+  border-color: var(--acc-0);
+}
+.sm-switch input:checked + .sm-switch-track::before {
+  transform: translateX(14px);
+  background: #ffffff;
+}
+.sm-switch input:focus-visible + .sm-switch-track {
+  outline: 2px solid var(--acc-0);
+  outline-offset: 2px;
+}
+
+/* ── 骨架屏微光 ───────────────────────────────────────────── */
+
+.sm-sk {
+  border-radius: 8px;
+  background: linear-gradient(100deg, #f1eef8 40%, #e9e5f4 50%, #f1eef8 60%);
+  background-size: 200% 100%;
+  animation: sm-shimmer 1.4s linear infinite;
+}
+@keyframes sm-shimmer {
+  to {
+    background-position: -200% 0;
+  }
+}
+
+/* ── 不定进度流动条（扫描/解析期间的「活着」信号） ─────────── */
+
+.sm-flow {
+  position: relative;
+  height: 2px;
+  border-radius: 2px;
+  overflow: hidden;
+  background: var(--ink-2);
+}
+.sm-flow::after {
+  content: "";
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: -40%;
+  width: 40%;
+  border-radius: 2px;
+  background: linear-gradient(90deg, transparent, var(--acc-0), transparent);
+  animation: sm-flow-slide 1.2s var(--ease-out) infinite;
+}
+@keyframes sm-flow-slide {
+  to {
+    left: 100%;
+  }
+}
+
+/* ── 错落入场（子元素带 --i 序号） ────────────────────────── */
+
+.sm-stagger > * {
+  animation: sm-fade-up var(--t-med) var(--ease-out) both;
+  animation-delay: calc(min(var(--i, 0), 12) * 28ms);
+}
+@keyframes sm-fade-up {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+/* ── 通用状态 ─────────────────────────────────────────────── */
+
+.sm-spin {
+  display: inline-block;
+  width: 13px;
+  height: 13px;
+  border: 1.5px solid var(--line-1);
+  border-top-color: var(--acc-0);
+  border-radius: 50%;
+  animation: sm-spin 0.7s linear infinite;
+  vertical-align: -2px;
+}
+@keyframes sm-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.sm-mono {
+  font-family: var(--mono);
+}
+
+/* ── 降级 ─────────────────────────────────────────────────── */
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}
