@@ -440,7 +440,15 @@ export function buildIrFromEvents(header: { cwd?: string; createdAt?: number; id
     }
     if (SURFACE_TYPES.has(ev.type) && ev.surfaceOp === 'append') {
       const msg = eventToMessage(ev.type, cleanData);
-      if (msg) messages.push(msg);
+      if (msg) {
+        // Preserve wall-clock + original seq so irToEvents can restore the
+        // exact stream order (turn/start must precede its surface messages;
+        // equal-ms ties break by original seq, matching the source log).
+        // provider/model are already lifted inside normalizeMessageLike.
+        msg.timestamp = ev.time;
+        msg.seq = ev.seq;
+        messages.push(msg);
+      }
       continue;
     }
     if (ev.type === 'goal/change') {
@@ -569,8 +577,13 @@ function tryParseJson(v: unknown): unknown {
  * from `ir.title` when no matching unmapped event already carries it.
  */
 export function irToEvents(ir: MigratedSession, baseTime: number): DshEvent[] {
-  type Raw = { time: number; type: string; data: DshEvent['data']; surfaceOp?: string; sourceEventSeqs?: number[]; _msg?: MigratedMessage };
+  type Raw = { time: number; type: string; data: DshEvent['data']; surfaceOp?: string; sourceEventSeqs?: number[]; _msg?: MigratedMessage; _seq?: number };
   const raw: Raw[] = [];
+  // Foreign-origin IRs (claude/codex/...) carry no per-message seq; park them
+  // after every real source seq so ties keep insertion order without stealing
+  // earlier positions from genuine stream events.
+  const FALLBACK_SEQ_BASE = 1e12;
+  let fallbackIdx = 0;
 
   // Preserve wall-clock time faithfully — each bucket uses its own stored time
   // verbatim; only missing timestamps fall back to baseTime with a per-bucket
@@ -580,6 +593,7 @@ export function irToEvents(ir: MigratedSession, baseTime: number): DshEvent[] {
   for (const msg of ir.messages) {
     const t = msg.timestamp;
     const time = typeof t === 'number' && Number.isFinite(t) ? t : msgFallback++;
+    const seq = typeof msg.seq === 'number' && Number.isSafeInteger(msg.seq) ? msg.seq : FALLBACK_SEQ_BASE + fallbackIdx++;
     if (msg.role === 'tool') {
       // Rebuild DSH tool/result shape: {turn,step,message:{source,role,content}}
       // preserve the nested tool-result interior expected by DSH surface.
@@ -598,7 +612,7 @@ export function irToEvents(ir: MigratedSession, baseTime: number): DshEvent[] {
           id: `msg_${randomUUID()}`,
         },
       };
-      raw.push({ time, type: 'tool/result', surfaceOp: 'append', data: toolData as unknown as DshEvent['data'], _msg: msg });
+      raw.push({ time, type: 'tool/result', surfaceOp: 'append', data: toolData as unknown as DshEvent['data'], _msg: msg, _seq: seq });
       continue;
     }
     if (msg.role === 'user' || msg.role === 'system') {
@@ -611,7 +625,7 @@ export function irToEvents(ir: MigratedSession, baseTime: number): DshEvent[] {
         source: { kind: 'user', rpcId: randomUUID(), clientTimeZone: 'Asia/Shanghai' },
         content: dshContentFromBlocks(msg.content),
       } as unknown as DshEvent['data'];
-      raw.push({ time, type: 'user/message', surfaceOp: 'append', data, _msg: msg });
+      raw.push({ time, type: 'user/message', surfaceOp: 'append', data, _msg: msg, _seq: seq });
     } else {
       // DSH validates assistant/message data as {turn,step,message:{id, role:"assistant", source:{kind:"model",provider,model}, content:[]}}
       const provider = (ir.model?.provider as string) ?? 'abrdns';
@@ -626,20 +640,20 @@ export function irToEvents(ir: MigratedSession, baseTime: number): DshEvent[] {
           content: dshContentFromBlocks(msg.content),
         },
       } as unknown as DshEvent['data'];
-      raw.push({ time, type: 'assistant/message', surfaceOp: 'append', data, _msg: msg });
+      raw.push({ time, type: 'assistant/message', surfaceOp: 'append', data, _msg: msg, _seq: seq });
     }
   }
   for (const g of ir.goals ?? []) {
     const time = typeof g.time === 'number' && Number.isFinite(g.time) ? g.time : baseTime;
-    raw.push({ time, type: 'goal/change', data: g.data as unknown as DshEvent['data'] });
+    raw.push({ time, type: 'goal/change', data: g.data as unknown as DshEvent['data'], _seq: g.seq });
   }
   for (const p of ir.planModes ?? []) {
     const time = typeof p.time === 'number' && Number.isFinite(p.time) ? p.time : baseTime;
-    raw.push({ time, type: 'plan/mode', data: p.data as unknown as DshEvent['data'] });
+    raw.push({ time, type: 'plan/mode', data: p.data as unknown as DshEvent['data'], _seq: p.seq });
   }
   for (const td of ir.todos ?? []) {
     const time = typeof td.time === 'number' && Number.isFinite(td.time) ? td.time : baseTime;
-    raw.push({ time, type: 'todo/write', data: td.data as unknown as DshEvent['data'] });
+    raw.push({ time, type: 'todo/write', data: td.data as unknown as DshEvent['data'], _seq: td.seq });
   }
   for (const ev of ir.unmappedEvents ?? []) {
     const time = typeof ev.time === 'number' && Number.isFinite(ev.time) ? ev.time : baseTime;
@@ -659,6 +673,7 @@ export function irToEvents(ir: MigratedSession, baseTime: number): DshEvent[] {
         // (they keep their original seq0). The final map handles this.
         type: ev.type,
         data: ev.data as unknown as DshEvent['data'],
+        _seq: ev.seq,
       } as unknown as Raw & { __packed: true; __seq0: number; __time0: number });
       // Stash seq0/time0 via side-channel on raw entry for the final map.
       // We piggy-back on the Raw object without polluting the type.
@@ -673,6 +688,7 @@ export function irToEvents(ir: MigratedSession, baseTime: number): DshEvent[] {
       data: ev.data as unknown as DshEvent['data'],
       ...(ev.surfaceOp !== undefined ? { surfaceOp: ev.surfaceOp } : {}),
       ...(ev.sourceEventSeqs ? { sourceEventSeqs: ev.sourceEventSeqs } : {}),
+      _seq: ev.seq,
     });
   }
 
@@ -687,19 +703,18 @@ export function irToEvents(ir: MigratedSession, baseTime: number): DshEvent[] {
       // title emission. Use the smallest time among raw, or baseTime.
       const titleTime = raw.length ? Math.min(baseTime, ...raw.map((r) => r.time)) : baseTime;
       // if titleTime equals baseTime we still need it to be <= first raw time
-      raw.push({ time: titleTime, type: 'session/title', data: { title: ir.title } as unknown as DshEvent['data'] });
+      raw.push({ time: titleTime, type: 'session/title', data: { title: ir.title } as unknown as DshEvent['data'], _seq: -1 });
     }
   }
 
-  // Preserve original wall-clock ordering across buckets; stable sort keeps
-  // message order within same-time ties (messages were pushed first).
-  const order: Record<string, number> = { 'session/title': 0, 'goal/change': 1, 'plan/mode': 2, 'todo/write': 3 };
+  // Preserve original stream ordering across buckets: sort by wall-clock,
+  // ties broken by ORIGINAL source seq. Every bucket carries the seq it had
+  // in the source log, so (time, seq) reproduces the exact event order —
+  // this is what keeps turn/start ahead of its surface messages and step
+  // context intact (the GUI conversation skeleton validates that order).
   raw.sort((a, b) => {
     if (a.time !== b.time) return a.time - b.time;
-    const ao = order[a.type] ?? 10;
-    const bo = order[b.type] ?? 10;
-    if (ao !== bo) return ao - bo;
-    return 0;
+    return (a._seq ?? 0) - (b._seq ?? 0);
   });
 
   // Separate packed storage rows (seq0/time0) from seq-assigned events.
@@ -710,22 +725,49 @@ export function irToEvents(ir: MigratedSession, baseTime: number): DshEvent[] {
   const packedRaw = (raw as Array<Raw & { __packed?: boolean; __seq0?: number; __time0?: number }>).filter((r) => r.__packed);
   const normal = (raw as Array<Raw & { __packed?: boolean }>).filter((r) => !r.__packed);
 
-  // Build packed rows sorted by time0 (their wall-clock; dt reconstructs times).
-  // We keep their data verbatim (turn/step/index/dt/texts|args) but will
-  // recompute seq0 to produce a contiguous decoded stream.
-  // Sort normal events already done above (by time); keep that order.
-  // Merge by wall-clock: normal by `time`, packed by `__time0`.
+  // Build packed rows sorted by (time0, original seq0). We keep their data
+  // verbatim (turn/step/index/dt/texts|args) but recompute seq0 to produce a
+  // contiguous decoded stream. Merge with normal events by (time, _seq) so
+  // chunk payloads land exactly where they did in the source stream.
   const merged: Array<(Raw & { __packed?: boolean; __seq0?: number; __time0?: number }) | Raw> = [];
-  let pi = 0;
-  packedRaw.sort((a, b) => (a.__time0 ?? 0) - (b.__time0 ?? 0));
-  let ni = 0;
-  while (ni < normal.length || pi < packedRaw.length) {
-    const nTime = ni < normal.length ? normal[ni].time : Infinity;
-    const pTime = pi < packedRaw.length ? (packedRaw[pi].__time0 ?? 0) : Infinity;
-    if (nTime <= pTime) {
-      merged.push(normal[ni++]);
-    } else {
-      merged.push(packedRaw[pi++]);
+  packedRaw.sort((a, b) => ((a.__time0 ?? 0) - (b.__time0 ?? 0)) || ((a._seq ?? 0) - (b._seq ?? 0)));
+  {
+    let pi = 0;
+    let ni = 0;
+    const key = (t: number, s: number | undefined) => t * 4294967296 + (s ?? 0);
+    while (ni < normal.length || pi < packedRaw.length) {
+      const n = normal[ni];
+      const p = packedRaw[pi];
+      const nKey = n ? key(n.time, n._seq) : Infinity;
+      const pKey = p ? key(p.__time0 ?? 0, p._seq) : Infinity;
+      if (nKey <= pKey) {
+        merged.push(normal[ni++]);
+      } else {
+        merged.push(packedRaw[pi++]);
+      }
+    }
+  }
+
+  // Reconstruct turn/step coordinates for surface events from the restored
+  // stream: the GUI conversation skeleton groups assistant/message and
+  // tool/result by their data.turn/data.step, which must match the
+  // turn/start + step/start context they appear under (a mismatch or an
+  // event before its turn/start aborts history load with "received an
+  // update before its start Match").
+  let curTurn = 1;
+  let curStep = 1;
+  for (const entry of merged) {
+    if ((entry as { __packed?: boolean }).__packed) continue;
+    const r = entry as Raw;
+    const d = r.data as Record<string, unknown> | undefined;
+    if (r.type === 'turn/start') {
+      if (typeof d?.turn === 'number') curTurn = d.turn;
+    } else if (r.type === 'step/start') {
+      if (typeof d?.turn === 'number') curTurn = d.turn;
+      if (typeof d?.step === 'number') curStep = d.step;
+    } else if (r.type === 'assistant/message' || r.type === 'tool/result') {
+      (r.data as Record<string, unknown>).turn = curTurn;
+      (r.data as Record<string, unknown>).step = curStep;
     }
   }
 

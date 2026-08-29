@@ -28,6 +28,8 @@ export interface MigratedMessage {
   role: MessageRole;
   content: ContentBlock[];
   timestamp?: number;
+  /** Original source-stream seq (DSH); enables exact order restoration on write-back. */
+  seq?: number;
   provider?: string;
   model?: string;
   stopReason?: string;
