@@ -10,7 +10,7 @@ export * from './demo.js';
 export * from './adapters/dsh/index.js';
 export * from './adapters/claude/index.js';
 export * from './adapters/codex/index.js';
-export { projectKey, encodeSegment, defaultDshRoot } from './adapters/dsh/format.js';
+export { projectKey, encodeSegment, defaultDshRoot, readFirstFrameLine } from './adapters/dsh/format.js';
 export { ensureWorkspaceRegistration, reconcileWorkspaces } from './adapters/dsh/workspace.js';
 export { claudeProjectDirName } from './adapters/claude/path.js';
 export { defaultCodexHome, sessionIndexPath } from './adapters/codex/paths.js';

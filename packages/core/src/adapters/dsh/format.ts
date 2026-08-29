@@ -77,12 +77,25 @@ export function scanZstdFrameRanges(buf: Buffer): Array<{ start: number; end: nu
 
 /** Decompress a DSH session artifact into its plaintext JSONL (header + events). */
 export function decompressSessionBuffer(buf: Buffer): string {
-  let plain = Buffer.alloc(0);
+  // O(n)：先把各帧解压结果收进数组，最后一次 concat。
+  // （旧实现每帧 `Buffer.concat([累计, 新帧])`，几千帧的会话累计拷贝量是 O(n²)，
+  //  实测一个 1900+ 消息会话仅 memcpy 就耗掉 ~85s。）
+  const chunks: Buffer[] = [];
   for (const range of scanZstdFrameRanges(buf)) {
-    const decoded = zstdDecompressSync(buf.subarray(range.start, range.end));
-    plain = Buffer.concat([plain, decoded]);
+    chunks.push(zstdDecompressSync(buf.subarray(range.start, range.end)));
   }
-  return plain.toString('utf8');
+  return chunks.length === 1 ? chunks[0].toString('utf8') : Buffer.concat(chunks).toString('utf8');
+}
+
+/** Decompress ONLY the first frame and return its first line (the session header). */
+export function readFirstFrameLine(buf: Buffer): string | null {
+  const ranges = scanZstdFrameRanges(buf);
+  if (ranges.length === 0) return null;
+  const { start, end } = ranges[0];
+  const plain = zstdDecompressSync(buf.subarray(start, end));
+  const nl = plain.indexOf(0x0a);
+  const line = (nl === -1 ? plain : plain.subarray(0, nl)).toString('utf8').trim();
+  return line || null;
 }
 
 /** Compress one plaintext frame exactly as DSH does (checksummed single frame). */

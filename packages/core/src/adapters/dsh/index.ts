@@ -100,6 +100,7 @@ import {
   defaultDshRoot,
   encodeSegment,
   projectKey,
+  readFirstFrameLine,
 } from './format.js';
 
 interface DshHeader {
@@ -211,14 +212,14 @@ export class DshAdapter implements Adapter {
         } catch {
           continue;
         }
-        let plaintext: string;
+        // 廉价预筛：只解压首帧读 header 行；不是本会话的子代理就跳过，
+        // 绝不为他人的会话付全量解压的代价（全量解压留给命中者）。
+        let firstLine: string | null;
         try {
-          plaintext = decompressSessionBuffer(buf);
+          firstLine = readFirstFrameLine(buf);
         } catch {
           continue;
         }
-        const nl = plaintext.indexOf('\n');
-        const firstLine = (nl === -1 ? plaintext : plaintext.slice(0, nl)).trim();
         if (!firstLine) continue;
         let header: Record<string, unknown>;
         try {
@@ -227,6 +228,12 @@ export class DshAdapter implements Adapter {
           continue;
         }
         if (header.parentSession !== parentId) continue;
+        let plaintext: string;
+        try {
+          plaintext = decompressSessionBuffer(buf);
+        } catch {
+          continue;
+        }
         const childId = typeof header.id === 'string' && header.id ? header.id : sessDir;
         const createdAt = typeof header.createdAt === 'number' && Number.isSafeInteger(header.createdAt) ? header.createdAt : 0;
         const agentPreset = typeof header.agentPreset === 'string' ? header.agentPreset : undefined;
