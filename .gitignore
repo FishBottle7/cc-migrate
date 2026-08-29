@@ -7,3 +7,6 @@ dist/
 # scratch / probes
 docs/_probe*
 .env
+# audit scratch homes & probe scripts
+.tmp-*/
+packages/core/scratch/
