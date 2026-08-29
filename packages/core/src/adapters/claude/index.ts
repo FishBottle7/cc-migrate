@@ -388,8 +388,27 @@ function messageToPlainText(msg: MigratedMessage): string {
 function claudeNativeBlock(block: ContentBlock): unknown {
   if (block.type === 'text') return { type: 'text', text: block.text };
   if (block.type === 'tool_use') return { type: 'tool_use', id: block.id, name: block.name, input: block.input };
-  if (block.type === 'thinking') return { type: 'thinking', thinking: block.thinking };
-  return { type: 'tool_result', tool_use_id: (block as { toolUseId: string; content: string }).toolUseId, content: (block as { content: string }).content };
+  if (block.type === 'thinking') {
+    // signed thinking replay: the signature must ride the block (gap #1)
+    return block.signature
+      ? { type: 'thinking', thinking: block.thinking, signature: block.signature }
+      : { type: 'thinking', thinking: block.thinking };
+  }
+  if (block.type === 'file') {
+    const mediaType = block.mediaType ?? 'application/octet-stream';
+    if (block.data) return { type: 'image', source: { type: 'base64', media_type: mediaType, data: block.data } };
+    if (block.url) return { type: 'image', source: { type: 'url', url: block.url } };
+    return { type: 'text', text: `[file${block.filename ? `: ${block.filename}` : ''}]` };
+  }
+  const out: Record<string, unknown> = { type: 'tool_result', tool_use_id: block.toolUseId, content: block.content, is_error: !!block.isError };
+  if (block.attachments?.length) {
+    // anthropic tool_result content may be an array carrying images (gap #4)
+    out.content = [
+      { type: 'text', text: block.content },
+      ...block.attachments.map((a) => claudeNativeBlock(a)),
+    ];
+  }
+  return out;
 }
 
 function sanitizeAgentId(agentId: string): string {

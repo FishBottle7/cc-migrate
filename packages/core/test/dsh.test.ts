@@ -15,7 +15,8 @@ import {
   buildIrFromEvents,
   irToEvents,
 } from '../src/adapters/dsh/index.js';
-import { normalizeContent } from '../src/content.js';
+import { blocksToNative, normalizeContent } from '../src/content.js';
+import type { ContentBlock } from '../src/ir.js';
 import { fallbackIr } from '../src/demo.js';
 import { decompressSessionBuffer } from '../src/adapters/dsh/format.js';
 import { verifySessionLog } from '../src/adapters/dsh/verify.js';
@@ -120,6 +121,35 @@ test('normalizeContent handles text/tool_use/tool_result blobs', () => {
   assert.equal(blocks.length, 3);
   assert.deepEqual(blocks[1], { type: 'tool_use', id: 't1', name: 'read', input: { f: 'x' } });
   assert.deepEqual(blocks[2], { type: 'tool_result', toolUseId: 't1', content: 'result', isError: false });
+});
+
+test('normalizeContent/blocksToNative preserve images, attachments and thinking signatures (gaps #1/#4)', () => {
+  // image blocks become FileBlocks — never '[image omitted]'
+  const withImage = normalizeContent([
+    { type: 'image', source: { type: 'base64', media_type: 'image/jpeg', data: 'B64DATA' } },
+  ]);
+  assert.deepEqual(withImage, [{ type: 'file', mediaType: 'image/jpeg', data: 'B64DATA' }]);
+
+  // tool_result content arrays keep their images as attachments
+  const withAttachment = normalizeContent([
+    { type: 'tool_result', tool_use_id: 't1', content: [
+      { type: 'text', text: 'screenshot:' },
+      { type: 'image', source: { type: 'url', url: 'https://x/img.png' } },
+    ] },
+  ]) as Array<{ type: string; content?: string; attachments?: Array<{ url?: string }> }>;
+  assert.equal(withAttachment[0].content, 'screenshot:');
+  assert.equal(withAttachment[0].attachments?.[0]?.url, 'https://x/img.png');
+
+  // thinking signatures ride the block
+  const withSig = normalizeContent([{ type: 'thinking', thinking: 'h', signature: 'sig-1' }]);
+  assert.deepEqual(withSig, [{ type: 'thinking', thinking: 'h', signature: 'sig-1' }]);
+
+  // and blocksToNative round-trips all three
+  const native = blocksToNative([...withAttachment, ...withSig] as ContentBlock[]) as Array<Record<string, unknown>>;
+  const toolResult = native[0] as { content: unknown; is_error?: boolean };
+  assert.ok(Array.isArray(toolResult.content));
+  assert.deepEqual((toolResult.content as Array<Record<string, unknown>>)[1], { type: 'image', source: { type: 'url', url: 'https://x/img.png' } });
+  assert.deepEqual(native[1], { type: 'thinking', thinking: 'h', signature: 'sig-1' });
 });
 
 test('irToEvents emits surfaceOp append + contiguous seq', () => {

@@ -263,8 +263,20 @@ test('zcode parse: tool part splits into tool_use + tool_result; synthetics stay
       const pending = calls.find((t) => t.status === 'pending')!;
       assert.deepEqual(pending.input, { command: 'sleep' });
       assert.equal(calls.every((t) => typeof t.callId === 'string' && t.callId.startsWith('call_')), true);
-      const sigs = (ext['zcode.messageExtras'] as Record<string, { signatures?: Record<string, string> }>);
-      assert.ok(Object.values(sigs).some((e) => e.signatures && Object.values(e.signatures).includes('sig-xyz')));
+      // gap #1: the anthropic signature rides the thinking block itself —
+      // no source-id side-table (messageExtras is gone)
+      const think = asst.content.find((b) => b.type === 'thinking') as { thinking: string; signature?: string };
+      assert.equal(think.signature, 'sig-xyz');
+      assert.equal('zcode.messageExtras' in (ir.extensions as Record<string, unknown>), false);
+      // gap #5 (revised): step parts are preserved verbatim in msg.meta.zcode.rawParts
+      const asstMeta = (asst.meta as { zcode?: { rawParts?: Array<{ data: { type: string } }> } }).zcode;
+      assert.ok(asstMeta?.rawParts?.some((r) => r.data.type === 'step-start'));
+      assert.ok(asstMeta?.rawParts?.some((r) => r.data.type === 'step-finish'));
+      // gap #2: message-level native payload hangs off the message entity
+      const userMeta = (ir.messages[0].meta as { zcode?: Record<string, unknown> }).zcode;
+      assert.equal(userMeta?.agent, 'zcode-agent');
+      assert.equal(userMeta?.modelID, 'GLM-Test');
+      assert.equal((userMeta?.semantics as { origin?: string })?.origin, 'real_user');
       // string-form input must have been decoded to an object on tool_use
       assert.deepEqual((uses[0] as { input: unknown }).input, { command: 'ls' });
     } finally {
@@ -273,7 +285,7 @@ test('zcode parse: tool part splits into tool_use + tool_result; synthetics stay
   });
 });
 
-test('zcode parse: summary user message → IR compaction, not messages', async () => {
+test('zcode parse: compaction summary projects as a message + anchored bucket entry', async () => {
   await withoutRealZcodeHome(async () => {
     const fx = await makeFixture();
     try {
@@ -294,17 +306,50 @@ test('zcode parse: summary user message → IR compaction, not messages', async 
       }, { id: 'msg_sum_1' });
 
       const ir = await new ZcodeAdapter().parse('sess_c', fx.root);
-      assert.equal(ir.messages.length, 2); // summary user message must NOT be in messages
+      // gap #3: the summary IS projected into messages[] (canonical carrier)
+      assert.equal(ir.messages.length, 3);
+      const sum = ir.messages[2];
+      assert.equal(sum.role, 'user');
+      assert.equal((sum.content[0] as { text: string }).text, 'Summary:\n1. did things'); // body fallback (no text part)
+      const sumMeta = (sum.meta as { zcode?: Record<string, unknown> }).zcode;
+      assert.equal((sumMeta?.summary as { body?: string })?.body, 'Summary:\n1. did things');
+      assert.equal((sumMeta?.semantics as { kind?: string })?.kind, 'compact_summary');
+      // bucket entry anchored to the projected message
       assert.equal(ir.compaction?.length, 1);
       assert.match(ir.compaction![0].summary, /did things/);
       assert.equal(ir.compaction![0].tokensBefore, 42000); // paired via summaryMessageId
+      assert.equal(ir.compaction![0].anchorIndex, 2);
+      // raw boundary part kept verbatim on the assistant's meta (no side-table extensions)
+      const asstMeta = (ir.messages[1].meta as { zcode?: { rawParts?: Array<{ data: Record<string, unknown> }> } }).zcode;
+      assert.equal(asstMeta?.rawParts?.[0]?.data.summaryMessageId, 'msg_sum_1');
+      assert.equal(asstMeta?.rawParts?.[0]?.data.preCompactTokenCount, 42000);
       const ext = ir.extensions as Record<string, unknown>;
-      const rawComps = ext['zcode.compactions'] as Array<Record<string, unknown>>;
-      assert.equal(rawComps.length, 1);
-      assert.equal(rawComps[0].summaryMessageId, 'msg_sum_1');
-      const rawSummaries = ext['zcode.compactionSummaries'] as Array<Record<string, unknown>>;
-      assert.equal(rawSummaries.length, 1);
-      assert.ok((rawSummaries[0].summary as { body?: string }).body);
+      assert.equal('zcode.compactions' in ext, false);
+      assert.equal('zcode.compactionSummaries' in ext, false);
+      assert.equal('zcode.messageExtras' in ext, false);
+
+      // write-back restores the native summary row (not a real_user prompt)
+      const dstRoot = await fs.mkdtemp(join(tmpdir(), 'sm-zcode-cmp-'));
+      try {
+        const adapter = new ZcodeAdapter();
+        const res = await adapter.write(ir, { root: dstRoot, targetCwd: 'D:\\proj' });
+        const db = new DatabaseSync(join(dstRoot, 'cli', 'db', 'db.sqlite'));
+        try {
+          const rows = db.prepare('SELECT data FROM message WHERE session_id=? ORDER BY sequence').all(res.sessionId) as Array<{ data: string }>;
+          const sumRow = JSON.parse(rows[2].data);
+          assert.equal(sumRow.role, 'user');
+          assert.equal(sumRow.semantics.kind, 'compact_summary');
+          assert.equal(sumRow.semantics.uiVisibility, 'hidden');
+          assert.equal(sumRow.summary.body, 'Summary:\n1. did things');
+          assert.equal(sumRow.summary.diffs.length, 0);
+          const firstUser = JSON.parse(rows[0].data);
+          assert.equal(firstUser.semantics.origin, 'real_user'); // normal prompts untouched
+        } finally {
+          db.close();
+        }
+      } finally {
+        await fs.rm(dstRoot, { recursive: true, force: true });
+      }
     } finally {
       await fx.close();
     }
@@ -554,6 +599,140 @@ test('zcode four-state toolCalls survive write→read (pending/running re-inject
           const statuses = (db.prepare("SELECT data FROM part WHERE session_id=? AND data LIKE '%\"type\":\"tool\"%'").all(res.sessionId) as Array<{ data: string }>)
             .map((r2) => (JSON.parse(r2.data) as { state: { status: string } }).state.status).sort();
           assert.deepEqual(statuses, ['completed', 'pending', 'running']);
+        } finally {
+          db.close();
+        }
+      } finally {
+        await fs.rm(dstRoot, { recursive: true, force: true });
+      }
+    } finally {
+      await fx.close();
+    }
+  });
+});
+
+test('zcode write: meta.zcode restores native message fields (gap #2) and thinking signatures (gap #1)', async () => {
+  await withoutRealZcodeHome(async () => {
+    const dstRoot = await fs.mkdtemp(join(tmpdir(), 'sm-zcode-meta-'));
+    try {
+      const ir: MigratedSession = {
+        schemaVersion: 2,
+        originTool: 'zcode',
+        cwd: 'D:\\proj',
+        messages: [
+          {
+            role: 'user',
+            content: [{ type: 'text', text: 'with snapshot' }],
+            meta: {
+              zcode: {
+                agent: 'zcode-Explore',
+                providerID: '11111111-2222-3333-4444-555555555555',
+                modelID: 'GLM-Test',
+                variant: 'max',
+                contextSnapshot: { files: ['a.ts'] },
+                tools: { bash: true },
+                anchor: { turnId: 'turn_fixed', origin: 'realUser' },
+                metadata: { legacy: 1 },
+                semantics: { origin: 'real_user', kind: 'user_prompt', uiVisibility: 'visible', providerVisibility: 'visible', transcriptVisibility: 'visible' },
+              },
+            },
+          },
+          {
+            role: 'assistant',
+            content: [{ type: 'thinking', thinking: 'hmm', signature: 'sig-abc' }, { type: 'text', text: 'ok' }],
+            stopReason: 'stop',
+            meta: {
+              zcode: {
+                mode: 'plan',
+                agent: 'zcode-Explore',
+                cost: 0.25,
+                tokens: { input: 11, output: 7, reasoning: 2, cache: { read: 3, write: 0 } },
+                finish: 'stop',
+                time: { created: 1786000001000, completed: 1786000001999 },
+                variant: 'max',
+                providerID: '11111111-2222-3333-4444-555555555555',
+                modelID: 'GLM-Test',
+                semantics: { origin: 'agent_runtime', kind: 'assistant_response', uiVisibility: 'visible', providerVisibility: 'visible', transcriptVisibility: 'visible' },
+              },
+            },
+          },
+        ],
+      };
+      const adapter = new ZcodeAdapter();
+      const res = await adapter.write(ir, { root: dstRoot, targetCwd: 'D:\\proj' });
+      const db = new DatabaseSync(join(dstRoot, 'cli', 'db', 'db.sqlite'));
+      try {
+        const rows = db.prepare('SELECT data FROM message WHERE session_id=? ORDER BY sequence').all(res.sessionId) as Array<{ data: string }>;
+        const u = JSON.parse(rows[0].data);
+        assert.equal(u.agent, 'zcode-Explore');
+        assert.deepEqual(u.model, { providerID: '11111111-2222-3333-4444-555555555555', modelID: 'GLM-Test', variant: 'max' });
+        assert.deepEqual(u.contextSnapshot, { files: ['a.ts'] });
+        assert.deepEqual(u.tools, { bash: true });
+        assert.deepEqual(u.anchor, { turnId: 'turn_fixed', origin: 'realUser' });
+        assert.deepEqual(u.metadata, { legacy: 1 });
+        const a = JSON.parse(rows[1].data);
+        assert.equal(a.mode, 'plan');
+        assert.equal(a.cost, 0.25);
+        assert.deepEqual(a.tokens, { input: 11, output: 7, reasoning: 2, cache: { read: 3, write: 0 } });
+        assert.deepEqual(a.time, { created: 1786000001000, completed: 1786000001999 });
+        assert.equal(a.modelID, 'GLM-Test');
+        assert.equal(a.providerID, '11111111-2222-3333-4444-555555555555');
+        assert.equal(a.variant, 'max');
+        // signature lands back in the native reasoning-part slot
+        const aid = (db.prepare('SELECT id FROM message WHERE session_id=? AND sequence=1').get(res.sessionId) as { id: string }).id;
+        const parts = (db.prepare('SELECT data FROM part WHERE message_id=? ORDER BY sequence').all(aid) as Array<{ data: string }>)
+          .map((r) => JSON.parse(r.data));
+        const reasoning = parts.find((p) => p.type === 'reasoning');
+        assert.equal(reasoning.metadata.anthropic.signature, 'sig-abc');
+
+        // and re-parsing yields the same meta payload (round-trip stable)
+        const back = await adapter.parse(res.sessionId, dstRoot);
+        const backUser = (back.messages[0].meta as { zcode?: Record<string, unknown> }).zcode;
+        assert.deepEqual(backUser?.contextSnapshot, { files: ['a.ts'] });
+        assert.equal(backUser?.modelID, 'GLM-Test');
+        const backThink = back.messages[1].content.find((b) => b.type === 'thinking') as { signature?: string };
+        assert.equal(backThink.signature, 'sig-abc');
+      } finally {
+        db.close();
+      }
+    } finally {
+      await fs.rm(dstRoot, { recursive: true, force: true });
+    }
+  });
+});
+
+test('zcode file parts round-trip as FileBlocks (gap #4)', async () => {
+  await withoutRealZcodeHome(async () => {
+    const fx = await makeFixture();
+    try {
+      fx.insertSession({ id: 'sess_f' });
+      const m0 = fx.insertMessage('sess_f', 0, userData('see attachment'));
+      fx.insertPart(m0, 'sess_f', 0, { type: 'file', filename: 'chart.png', mime: 'image/png', url: 'file:///storage/chart.png' });
+      fx.insertPart(m0, 'sess_f', 1, { type: 'text', text: 'see attachment' });
+
+      const adapter = new ZcodeAdapter();
+      const ir = await adapter.parse('sess_f', fx.root);
+      const file = ir.messages[0].content.find((b) => b.type === 'file') as { filename?: string; mediaType?: string; url?: string };
+      assert.equal(file.filename, 'chart.png');
+      assert.equal(file.mediaType, 'image/png');
+      assert.equal(file.url, 'file:///storage/chart.png');
+
+      const dstRoot = await fs.mkdtemp(join(tmpdir(), 'sm-zcode-file-'));
+      try {
+        const res = await adapter.write(ir, { root: dstRoot, targetCwd: 'D:\\proj' });
+        const db = new DatabaseSync(join(dstRoot, 'cli', 'db', 'db.sqlite'));
+        try {
+          const mid = (db.prepare('SELECT id FROM message WHERE session_id=? AND sequence=0').get(res.sessionId) as { id: string }).id;
+          const parts = (db.prepare('SELECT data FROM part WHERE message_id=? ORDER BY sequence').all(mid) as Array<{ data: string }>)
+            .map((r) => JSON.parse(r.data));
+          const fp = parts.find((p) => p.type === 'file');
+          assert.equal(fp.filename, 'chart.png');
+          assert.equal(fp.mime, 'image/png');
+          assert.equal(fp.url, 'file:///storage/chart.png');
+          // and it parses back identically
+          const back = await adapter.parse(res.sessionId, dstRoot);
+          const bfile = back.messages[0].content.find((b) => b.type === 'file') as { filename?: string };
+          assert.equal(bfile.filename, 'chart.png');
         } finally {
           db.close();
         }

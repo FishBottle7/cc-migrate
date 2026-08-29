@@ -12,8 +12,10 @@
  *    the DB; the active branch is derived by the engine's `o0()` — this adapter
  *    reimplements it, otherwise rewound conversations get migrated (pitfall #13).
  *  - user messages are classified by `data.semantics` (D2 policy): only
- *    `origin==='real_user'` is real input; `summary.body` user messages are
- *    compaction summaries (→ IR `compaction[]`); todo_reminder/background_task
+ *    `origin==='real_user'` is real input; compaction-summary user messages are
+ *    projected INTO messages[] (marked by `meta.zcode`, so write-back restores
+ *    their native shape) and registered in IR `compaction[]` with an
+ *    `anchorIndex` into messages[] (gap #3); todo_reminder/background_task
  *    & co are model-only synthetics (→ extensions, never `messages[]`).
  *  - a `tool` part fuses call+result in one row (4-state). It is split by
  *    `callID` into IR `tool_use` + following role:'tool' `tool_result`;
@@ -22,6 +24,13 @@
  *    break provider replay) but ALL four states are recorded losslessly in the
  *    IR `toolCalls` typed bucket and re-injected on write-back.
  *    `state.input` may be a JSON string (older engine writes) or an object.
+ *  - reasoning parts carry their anthropic signature directly on the IR
+ *    thinking block (`signature`), so claude-target resume keeps signed
+ *    thinking (gap #1). Message-level native payload (semantics/cost/tokens/
+ *    time/anchor/contextSnapshot + every non-projected part row verbatim)
+ *    lives on `msg.meta.zcode` — attached to the message entity, never a
+ *    source-id side-table (gap #2); write-back consumes it to restore the
+ *    native rows exactly.
  *  - `providerID` is the provider-registry id (uuid or `builtin:*`); the
  *    readable name lives in `~/.zcode/v2/config.json` `provider.<id>.name` —
  *    that file also contains apiKeys, so only `name` is ever read and raw ids
@@ -41,7 +50,8 @@
  *    Verified against the engine's official `app-server --stdio` NDJSON path
  *    (session/list + resume + messages + subagents) — see zcode.md round-trip.
  *  - `part.data` fields are a superset of the bundle zod schemas (pitfall #8):
- *    parsing is tolerant, unknown fields are preserved in extensions.
+ *    parsing is tolerant, unknown fields are preserved (in `meta.zcode.rawParts`
+ *    per message / extensions for whole dropped rows).
  *  - IR `systemPrompt` is never read (engine injects it per agent profile at
  *    runtime; only sidecar snapshots have it → extensions) and never written.
  *
@@ -65,6 +75,7 @@ import { randomUUID } from 'node:crypto';
 import type { Adapter, WriteOptions, WriteResult } from '../../registry.js';
 import type {
   ContentBlock,
+  FileBlock,
   MigratedMessage,
   MigratedSession,
   MigratedSidechain,
@@ -502,8 +513,13 @@ interface ParseCtx {
   agentsRoot: string;
 }
 
-/** Per-message lossless bucket for fields the IR has no slot for (spec pitfall #9/#10). */
-interface MessageExtras {
+/**
+ * Per-message native payload with no cross-tool IR slot → `msg.meta.zcode`
+ * (gap #2 — attached to the message entity itself; write-back consumes it to
+ * restore native rows). rawParts keeps every part row that has no block
+ * projection verbatim (step/timeline/compaction/snapshot/agent/…).
+ */
+interface ZcodeMessageMeta {
   agent?: string;
   variant?: string;
   providerID?: string;
@@ -517,18 +533,23 @@ interface MessageExtras {
   tools?: Record<string, unknown>;
   anchor?: Record<string, unknown>;
   metadata?: Record<string, unknown>;
-  signatures?: Record<string, string>;
-  timelineParts?: unknown[];
-  rawParts?: unknown[];
+  semantics?: Record<string, unknown>;
+  /** user compact-summary rows: {title, body, diffs} */
+  summary?: Record<string, unknown>;
+  /** origin row id — lets write-back/tooling correlate back to the source store */
+  sourceId?: string;
+  synthetic?: boolean;
+  source?: string;
+  visibility?: string;
+  rawParts?: Array<{ sequence: number | null; data: Row }>;
   raw?: unknown;
 }
 
 interface ExpandedMessage {
   ir: MigratedMessage[];
-  extrasKey?: string;
-  extras?: MessageExtras;
+  meta?: ZcodeMessageMeta;
   synthetic?: { id: string; sequence: number | null; data: Row };
-  compaction?: { summary: string; tokensBefore?: number; raw: Row };
+  compaction?: { summary: string; sourceId: string };
   compactionParts?: Row[];
   toolCalls?: MigratedToolCall[];
   droppedToolState?: string;
@@ -550,12 +571,11 @@ async function parseFromDb(db: DbHandle, sessionId: string, root?: string): Prom
   const trimmed = o0Trim(messages, revert);
 
   const irMessages: MigratedMessage[] = [];
-  const extrasMap: Record<string, MessageExtras> = {};
   const providerIdMap: Record<string, string> = {};   // raw providerID → readable name
   const syntheticMessages: Array<{ id: string; sequence: number | null; data: Row }> = [];
-  const compactionParts: Row[] = [];        // raw compaction part rows
-  const compactionSummaries: Row[] = [];    // raw summary user-message rows (diffs etc.)
-  const summaryCandidates: Array<{ id: string; summary: string }> = [];
+  const compactionParts: Row[] = [];        // assistant-hosted compaction part rows (for tokensBefore pairing)
+  const summaryCandidates: Array<{ sourceId: string; summary: string }> = [];
+  const summaryAnchors = new Map<string, number>();   // source summary row id → index in irMessages
   const toolCalls: MigratedToolCall[] = [];
   let lastModel: { providerID?: string; modelID?: string; variant?: string } | undefined;
 
@@ -563,23 +583,20 @@ async function parseFromDb(db: DbHandle, sessionId: string, root?: string): Prom
   for (const m of trimmed.messages) {
     const parts = partsByMessage.get(m.id) ?? [];
     const exp = expandMessageRow(m, parts, ctx2);
+    if (exp.compaction) summaryAnchors.set(exp.compaction.sourceId, irMessages.length);
     irMessages.push(...exp.ir);
-    if (exp.extras && exp.extrasKey) extrasMap[exp.extrasKey] = exp.extras;
     if (exp.synthetic) syntheticMessages.push(exp.synthetic);
     if (exp.toolCalls) toolCalls.push(...exp.toolCalls);
     if (exp.compactionParts) compactionParts.push(...exp.compactionParts);
-    if (exp.compaction) {
-      compactionSummaries.push(exp.compaction.raw);
-      if (exp.compaction.summary) summaryCandidates.push({ id: String(exp.compaction.raw.id ?? ''), summary: exp.compaction.summary });
-    }
+    if (exp.compaction?.summary) summaryCandidates.push({ sourceId: exp.compaction.sourceId, summary: exp.compaction.summary });
     // session model = latest assistant model (model_change timelines are real)
-    if (exp.ir[0]?.role === 'assistant' && exp.extras?.modelID) {
-      lastModel = { providerID: exp.extras.providerID, modelID: exp.extras.modelID, variant: exp.extras.variant };
+    if (exp.ir[0]?.role === 'assistant' && exp.meta?.modelID) {
+      lastModel = { providerID: exp.meta.providerID, modelID: exp.meta.modelID, variant: exp.meta.variant };
     }
   }
 
-  // pair compaction parts with their summary message (summaryMessageId →
-  // preCompactTokenCount) to fill IR compaction[].tokensBefore
+  // pair assistant-hosted compaction parts with their summary message
+  // (summaryMessageId → preCompactTokenCount) to fill IR compaction[].tokensBefore
   const tokensBeforeBySummaryId = new Map<string, number>();
   for (const cp of compactionParts) {
     const sumId = typeof cp.summaryMessageId === 'string' ? cp.summaryMessageId : undefined;
@@ -587,7 +604,9 @@ async function parseFromDb(db: DbHandle, sessionId: string, root?: string): Prom
   }
   const compactions: NonNullable<MigratedSession['compaction']> = summaryCandidates.map((s) => ({
     summary: s.summary,
-    ...(tokensBeforeBySummaryId.get(s.id) !== undefined ? { tokensBefore: tokensBeforeBySummaryId.get(s.id) } : {}),
+    ...(tokensBeforeBySummaryId.get(s.sourceId) !== undefined ? { tokensBefore: tokensBeforeBySummaryId.get(s.sourceId) } : {}),
+    // gap #3: the summary message is projected in messages[]; anchorIndex points at it
+    ...(summaryAnchors.has(s.sourceId) ? { anchorIndex: summaryAnchors.get(s.sourceId) } : {}),
   }));
 
   // --- subagent sidechains (parent_id + sess_subagent_agent_<uuid> = the reliable cold link) ---
@@ -613,7 +632,8 @@ async function parseFromDb(db: DbHandle, sessionId: string, root?: string): Prom
   if (compactions.length) ir.compaction = compactions;
   if (toolCalls.length) ir.toolCalls = toolCalls;
 
-  // extensions (namespaced like 'dsh.headerRaw') — lossless buckets the IR has no slots for
+  // extensions (namespaced like 'dsh.headerRaw') — session-level lossless
+  // buckets; per-message payload lives on msg.meta.zcode instead (gap #2)
   const extensions: Record<string, unknown> = {
     'zcode.session': {
       projectId: sessionRow.project_id ?? null,
@@ -629,12 +649,9 @@ async function parseFromDb(db: DbHandle, sessionId: string, root?: string): Prom
       timeUpdated: typeof sessionRow.time_updated === 'number' ? sessionRow.time_updated : null,
       revertRaw: Object.keys(revert).length ? revert : null,
     },
-    'zcode.messageExtras': extrasMap,
     'zcode.providers': providerIdMap,
   };
   if (syntheticMessages.length) extensions['zcode.syntheticMessages'] = syntheticMessages;
-  if (compactionParts.length) extensions['zcode.compactions'] = compactionParts;
-  if (compactionSummaries.length) extensions['zcode.compactionSummaries'] = compactionSummaries;
   if (trimmed.pruned.length) {
     extensions['zcode.prunedMessages'] = trimmed.pruned.map((m) => ({ id: m.id, sequence: m.sequence, data: parseJsonObject(m.data) }));
   }
@@ -775,38 +792,65 @@ function expandMessageRow(m: ZcodeMessageRow, parts: ZcodePartRow[], ctx: Expand
     const d = data as ZcodeUserData;
     const cls = classifyUserMessage(d);
     if (cls === 'compactSummary') {
+      // gap #3: the summary IS a message — project it into messages[] (its
+      // text part is exactly what the engine feeds the next context) and mark
+      // it via meta.zcode so write-back restores the native summary row; the
+      // IR compaction[] entry anchors to it by index.
+      const { blocks, rawParts } = userPartsToBlocks(parts);
+      const meta = zcodeMetaForUser(d);
+      meta.sourceId = m.id;
+      if (rawParts.length) meta.rawParts = rawParts;
       const body = typeof d.summary?.body === 'string' ? d.summary.body : '';
-      return { ir: [], compaction: { summary: body, raw: { id: m.id, sequence: m.sequence, ...d } } };
+      const content: ContentBlock[] = blocks.length ? blocks : body ? [{ type: 'text', text: body }] : [];
+      if (!content.length) return { ir: [], meta };
+      const msg: MigratedMessage = { role: 'user', content, seq: m.sequence ?? undefined, meta: { zcode: meta } };
+      if (ts !== undefined) msg.timestamp = ts;
+      return { ir: [msg], meta, compaction: { summary: body, sourceId: m.id } };
     }
     if (cls !== 'realUserInput') {
       return { ir: [], synthetic: { id: m.id, sequence: m.sequence, data: d as Row } };
     }
-    const blocks = userPartsToBlocks(parts);
+    const { blocks, rawParts } = userPartsToBlocks(parts);
     if (!blocks.length) return { ir: [], synthetic: { id: m.id, sequence: m.sequence, data: d as Row } };
-    const extras = userExtras(d);
-    const msg: MigratedMessage = { role: 'user', content: blocks, seq: m.sequence ?? undefined };
+    const meta = zcodeMetaForUser(d);
+    meta.sourceId = m.id;
+    if (rawParts.length) meta.rawParts = rawParts;
+    const msg: MigratedMessage = { role: 'user', content: blocks, seq: m.sequence ?? undefined, meta: { zcode: meta } };
     if (ts !== undefined) msg.timestamp = ts;
     if (d.model?.modelID) {
       msg.model = String(d.model.modelID);
       if (d.model.providerID) msg.provider = rememberProviderName(d.model.providerID, ctx);
     }
-    return { ir: [msg], extrasKey: m.id, extras };
+    return { ir: [msg], meta };
   }
 
   if (data.role === 'assistant') {
     const d = data as ZcodeAssistantData;
-    const { blocks, toolResults, extras, compactionParts, toolCalls, droppedToolState } = assistantPartsToBlocks(
+    const { blocks, toolResults, meta, compactionParts, toolCalls, droppedToolState } = assistantPartsToBlocks(
       parts, d, { messageId: m.id, messageSequence: m.sequence ?? -1 },
     );
-    if (!blocks.length && !compactionParts) return { ir: [], extras, toolCalls, droppedToolState };
-    const msg: MigratedMessage = { role: 'assistant', content: blocks, seq: m.sequence ?? undefined };
+    if (!blocks.length) {
+      // no replayable projection (timeline-event carriers, failed compaction
+      // hosts, …) — archive the raw row in the session-level bucket; only its
+      // compaction parts (pairing channel) and tool records survive structured
+      return {
+        ir: [],
+        meta,
+        synthetic: { id: m.id, sequence: m.sequence, data: d as Row },
+        compactionParts,
+        toolCalls,
+        droppedToolState,
+      };
+    }
+    meta.sourceId = m.id;
+    const msg: MigratedMessage = { role: 'assistant', content: blocks, seq: m.sequence ?? undefined, meta: { zcode: meta } };
     if (ts !== undefined) msg.timestamp = ts;
     if (d.modelID) msg.model = String(d.modelID);
     if (d.providerID) msg.provider = rememberProviderName(d.providerID, ctx);
     if (d.finish) msg.stopReason = String(d.finish);
-    const out: MigratedMessage[] = blocks.length ? [msg] : [];
+    const out: MigratedMessage[] = [msg];
     if (toolResults.length) out.push({ role: 'tool', content: toolResults, seq: m.sequence ?? undefined, timestamp: ts });
-    return { ir: out, extrasKey: m.id, extras, compactionParts, toolCalls, droppedToolState };
+    return { ir: out, meta, compactionParts, toolCalls, droppedToolState };
   }
 
   // unknown role — keep losslessly as synthetic
@@ -820,39 +864,72 @@ function rememberProviderName(providerId: string, ctx: ExpandCtx): string {
   return name ?? providerId;
 }
 
-function userExtras(d: ZcodeUserData): MessageExtras {
-  const extras: MessageExtras = {};
-  if (d.agent) extras.agent = d.agent;
-  if (d.model?.providerID) extras.providerID = d.model.providerID;
-  if (d.model?.modelID) extras.modelID = d.model.modelID;
-  if (d.model?.variant) extras.variant = d.model.variant;
-  if (d.contextSnapshot) extras.contextSnapshot = d.contextSnapshot;
-  if (d.tools) extras.tools = d.tools;
-  if (d.anchor) extras.anchor = d.anchor;
-  if (d.metadata) extras.metadata = d.metadata;
-  return extras;
+/** user message `data` → msg.meta.zcode payload (gap #2). */
+function zcodeMetaForUser(d: ZcodeUserData): ZcodeMessageMeta {
+  const meta: ZcodeMessageMeta = {};
+  if (d.agent) meta.agent = d.agent;
+  if (d.model?.providerID) meta.providerID = d.model.providerID;
+  if (d.model?.modelID) meta.modelID = d.model.modelID;
+  if (d.model?.variant) meta.variant = d.model.variant;
+  if (d.contextSnapshot) meta.contextSnapshot = d.contextSnapshot;
+  if (d.tools) meta.tools = d.tools;
+  if (d.anchor) meta.anchor = d.anchor;
+  if (d.metadata) meta.metadata = d.metadata;
+  if (d.semantics) meta.semantics = d.semantics as Row;
+  if (d.summary) meta.summary = d.summary as Row;
+  if (d.synthetic !== undefined) meta.synthetic = d.synthetic === true;
+  if (d.source) meta.source = d.source;
+  if (d.visibility) meta.visibility = d.visibility;
+  return meta;
+}
+
+/** Read back the zcode namespace of a message's meta (write side). */
+function zcodeMetaOf(msg: MigratedMessage): ZcodeMessageMeta | undefined {
+  const z = (msg.meta as Record<string, unknown> | undefined)?.zcode;
+  return (z && typeof z === 'object' && !Array.isArray(z)) ? z as ZcodeMessageMeta : undefined;
+}
+
+/** Append meta.zcode.rawParts (verbatim non-projected part rows) to a part list. */
+function appendRawParts(parts: Array<{ data: Row; ts: number }>, zmeta: ZcodeMessageMeta | undefined, ts: number): void {
+  const raw = [...(zmeta?.rawParts ?? [])]
+    .sort((a, b) => (typeof a.sequence === 'number' ? a.sequence : Number.MAX_SAFE_INTEGER) - (typeof b.sequence === 'number' ? b.sequence : Number.MAX_SAFE_INTEGER));
+  for (const rp of raw) {
+    if (!rp.data || typeof rp.data !== 'object' || Array.isArray(rp.data)) continue;
+    parts.push({ data: rp.data, ts });
+  }
 }
 
 /**
- * user message parts → IR blocks, using the engine's own replay concatenation
- * for the meaningful part types: text (non-ignored), file →
- * `[Attached file: …]`, agent → `[Selected agent: …]` (D2 layer rules).
+ * user message parts → IR blocks + rawParts, using the engine's own replay
+ * concatenation for the meaningful part types: text (non-ignored) → text,
+ * file → FileBlock (image attachments included — gap #4), agent →
+ * `[Selected agent: …]` (D2 layer rules) with the row kept in rawParts.
+ * Everything else is engine bookkeeping → rawParts verbatim.
  */
-function userPartsToBlocks(parts: ZcodePartRow[]): ContentBlock[] {
-  const out: ContentBlock[] = [];
+function userPartsToBlocks(parts: ZcodePartRow[]): { blocks: ContentBlock[]; rawParts: Array<{ sequence: number | null; data: Row }> } {
+  const blocks: ContentBlock[] = [];
+  const rawParts: Array<{ sequence: number | null; data: Row }> = [];
   for (const p of parts) {
     const d = parseJsonObject(p.data);
     if (d.type === 'text') {
       if (d.ignored === true || d.synthetic === true) continue;
-      if (typeof d.text === 'string' && d.text) out.push({ type: 'text', text: d.text });
+      if (typeof d.text === 'string' && d.text) blocks.push({ type: 'text', text: d.text });
     } else if (d.type === 'file') {
-      out.push({ type: 'text', text: `[Attached file: ${String(d.filename ?? d.name ?? 'file')}]` });
+      const file: FileBlock = { type: 'file' };
+      if (typeof d.filename === 'string') file.filename = d.filename;
+      else if (typeof d.name === 'string') file.filename = d.name;
+      if (typeof d.mime === 'string') file.mediaType = d.mime;
+      if (typeof d.url === 'string') file.url = d.url;
+      if (file.filename || file.mediaType || file.url) blocks.push(file);
+      else rawParts.push({ sequence: p.sequence, data: d }); // no usable fields — keep raw
     } else if (d.type === 'agent') {
-      out.push({ type: 'text', text: `[Selected agent: ${String(d.name ?? 'agent')}]` });
+      blocks.push({ type: 'text', text: `[Selected agent: ${String(d.name ?? 'agent')}]` });
+      rawParts.push({ sequence: p.sequence, data: d }); // the text is only the D2 rendering
+    } else {
+      rawParts.push({ sequence: p.sequence, data: d });
     }
-    // everything else on a user message is engine bookkeeping — skipped
   }
-  return out;
+  return { blocks, rawParts };
 }
 
 /**
@@ -868,24 +945,25 @@ function assistantPartsToBlocks(
   parts: ZcodePartRow[],
   d: ZcodeAssistantData,
   source: { messageId: string; messageSequence: number },
-): { blocks: ContentBlock[]; toolResults: ContentBlock[]; extras: MessageExtras; compactionParts?: Row[]; toolCalls?: MigratedToolCall[]; droppedToolState?: string } {
+): { blocks: ContentBlock[]; toolResults: ContentBlock[]; meta: ZcodeMessageMeta; compactionParts?: Row[]; toolCalls?: MigratedToolCall[]; droppedToolState?: string } {
   const blocks: ContentBlock[] = [];
   const toolResults: ContentBlock[] = [];
-  const extras: MessageExtras = {};
+  const meta: ZcodeMessageMeta = {};
   let compactionParts: Row[] | undefined;
   let toolCalls: MigratedToolCall[] | undefined;
   let droppedToolState: string | undefined;
 
-  if (d.agent) extras.agent = d.agent;
-  if (d.providerID) extras.providerID = d.providerID;
-  if (d.modelID) extras.modelID = d.modelID;
-  if (d.variant) extras.variant = d.variant;
-  if (d.mode) extras.mode = d.mode;
-  if (d.cost !== undefined) extras.cost = d.cost;
-  if (d.tokens) extras.tokens = d.tokens;
-  if (d.finish !== undefined) extras.finish = d.finish;
-  if (d.time) extras.time = d.time;
-  if (d.error !== undefined) extras.raw = { error: d.error };
+  if (d.agent) meta.agent = d.agent;
+  if (d.providerID) meta.providerID = d.providerID;
+  if (d.modelID) meta.modelID = d.modelID;
+  if (d.variant) meta.variant = d.variant;
+  if (d.mode) meta.mode = d.mode;
+  if (d.cost !== undefined) meta.cost = d.cost;
+  if (d.tokens) meta.tokens = d.tokens;
+  if (d.finish !== undefined) meta.finish = d.finish;
+  if (d.time) meta.time = d.time;
+  if (d.semantics) meta.semantics = d.semantics as Row;
+  if (d.error !== undefined) meta.raw = { error: d.error };
 
   for (const p of parts) {
     const pd = parseJsonObject(p.data);
@@ -896,12 +974,13 @@ function assistantPartsToBlocks(
         break;
       }
       case 'reasoning': {
-        if (typeof pd.text === 'string' && pd.text) blocks.push({ type: 'thinking', thinking: pd.text });
-        const meta = parseJsonObject(pd.metadata);
-        const anth = parseJsonObject(meta.anthropic);
-        if (typeof anth.signature === 'string') {
-          extras.signatures = extras.signatures ?? {};
-          extras.signatures[String(p.sequence ?? p.id)] = anth.signature;
+        // gap #1: the anthropic signature rides ON the thinking block, not in
+        // a source-id side-table — claude-target write-back needs it
+        const anth = parseJsonObject(parseJsonObject(pd.metadata).anthropic);
+        const signature = typeof anth.signature === 'string' ? anth.signature : undefined;
+        const text = typeof pd.text === 'string' ? pd.text : '';
+        if (text || signature) {
+          blocks.push(signature ? { type: 'thinking', thinking: text, signature } : { type: 'thinking', thinking: text });
         }
         break;
       }
@@ -939,30 +1018,27 @@ function assistantPartsToBlocks(
         }
         break;
       }
-      case 'timeline': {
-        extras.timelineParts = extras.timelineParts ?? [];
-        extras.timelineParts.push(pd);
-        break;
-      }
       case 'compaction': {
-        // compression boundary events (operationId/boundaryId/tailStartMessageId
-        // …) — lossless bucket, the summary itself comes from the user row
+        // boundary record (operationId/tail_start_id/compactBoundary/
+        // summaryMessageId/preCompactTokenCount …): collected for tokensBefore
+        // pairing AND kept verbatim in the message's rawParts (gap #3)
         compactionParts = compactionParts ?? [];
         compactionParts.push(pd);
+        meta.rawParts = meta.rawParts ?? [];
+        meta.rawParts.push({ sequence: p.sequence, data: pd });
         break;
       }
-      case 'step-start':
-      case 'step-finish':
-        // zero-information replay artifacts (tokens live on the assistant row) — dropped
-        break;
       default:
-        // dormant/unknown part types (snapshot/patch/subagent/agent/retry/…) — lossless bucket
-        extras.rawParts = extras.rawParts ?? [];
-        extras.rawParts.push({ partId: p.id, sequence: p.sequence, data: pd });
+        // everything without a block projection (step-start / step-finish /
+        // timeline / snapshot / agent / retry / …) — verbatim lossless bucket.
+        // step-finish carries per-step tokens/cost/reason, so dropping it (the
+        // old "zero-information" call) was wrong; see docs/ir-protocol.md #5.
+        meta.rawParts = meta.rawParts ?? [];
+        meta.rawParts.push({ sequence: p.sequence, data: pd });
         break;
     }
   }
-  return { blocks, toolResults, extras, compactionParts, toolCalls, droppedToolState };
+  return { blocks, toolResults, meta, compactionParts, toolCalls, droppedToolState };
 }
 
 function stringOutput(v: unknown): string {
@@ -1386,28 +1462,60 @@ function writeMessages(
   for (const msg of messages) {
     clock += 1;
     const ts = msg.timestamp && msg.timestamp > 0 ? msg.timestamp : clock;
+    const zmeta = zcodeMetaOf(msg);
 
     if (msg.role === 'tool') continue; // fused into the preceding assistant's tool parts
 
     if (msg.role === 'user' || msg.role === 'system') {
-      const isSystem = msg.role === 'system';
+      const isSystem = msg.role === 'system' && !zmeta?.semantics;
+      // compaction-summary rows carry their native semantics in meta.zcode —
+      // restore them as the engine wrote them, not as real_user prompts (gap #3)
+      const isSummary = !isSystem &&
+        !!(zmeta?.summary || (zmeta?.semantics as Row | undefined)?.kind === 'compact_summary');
       const textBlocks = msg.content.filter((b): b is { type: 'text'; text: string } => b.type === 'text');
-      if (!textBlocks.length) continue; // e.g. claude-style tool_result-only user rows
+      const fileBlocks = msg.content.filter((b): b is FileBlock => b.type === 'file');
+      if (!textBlocks.length && !fileBlocks.length && !isSummary) continue; // e.g. claude-style tool_result-only user rows
       const parts: Array<{ data: Row; ts: number }> = textBlocks.map((b) => ({
         data: { type: 'text', text: b.text, time: { start: ts, end: ts } },
         ts,
       }));
+      for (const b of fileBlocks) {
+        parts.push({
+          data: {
+            type: 'file',
+            ...(b.filename ? { filename: b.filename } : {}),
+            ...(b.mediaType ? { mime: b.mediaType } : {}),
+            ...(b.url ? { url: b.url } : {}),
+            ...(b.data ? { data: b.data } : {}),
+          },
+          ts,
+        });
+      }
+      appendRawParts(parts, zmeta, ts);
       const data: Row = {
         role: 'user',
         time: { created: ts },
-        agent: defaultAgent,
-        semantics: isSystem
-          ? { origin: 'system', kind: 'system_reminder', uiVisibility: 'hidden', providerVisibility: 'visible', transcriptVisibility: 'hidden' }
-          : { origin: 'real_user', kind: 'user_prompt', uiVisibility: 'visible', providerVisibility: 'visible', transcriptVisibility: 'visible' },
-        anchor: { turnId: `turn_${randomUUID()}`, origin: 'realUser' },
+        agent: zmeta?.agent ?? defaultAgent,
+        semantics: zmeta?.semantics
+          ? zmeta.semantics
+          : isSystem
+            ? { origin: 'system', kind: 'system_reminder', uiVisibility: 'hidden', providerVisibility: 'visible', transcriptVisibility: 'hidden' }
+            : { origin: 'real_user', kind: 'user_prompt', uiVisibility: 'visible', providerVisibility: 'visible', transcriptVisibility: 'visible' },
+        anchor: zmeta?.anchor ?? { turnId: `turn_${randomUUID()}`, origin: 'realUser' },
       };
+      if (isSummary || zmeta?.summary) {
+        data.summary = zmeta?.summary ?? { body: textBlocks.map((b) => b.text).join('\n') };
+      }
+      if (zmeta?.contextSnapshot) data.contextSnapshot = zmeta.contextSnapshot;
+      if (zmeta?.tools) data.tools = zmeta.tools;
+      if (zmeta?.metadata) data.metadata = zmeta.metadata;
+      if (zmeta?.synthetic) data.synthetic = true;
+      if (zmeta?.source) data.source = zmeta.source;
+      if (zmeta?.visibility) data.visibility = zmeta.visibility;
       if (!isSystem) {
-        const model = resolveProviderModel(msg, ctx);
+        const model = zmeta?.modelID
+          ? { modelID: zmeta.modelID, ...(zmeta.providerID ? { providerID: zmeta.providerID } : {}), ...(zmeta.variant ? { variant: zmeta.variant } : {}) }
+          : resolveProviderModel(msg, ctx);
         if (model) data.model = { providerID: model.providerID, modelID: model.modelID, ...(model.variant ? { variant: model.variant } : {}) };
       }
       const userId = insertMessageWithParts(db, sessionId, sequence, ts, data, parts);
@@ -1424,7 +1532,22 @@ function writeMessages(
       if (b.type === 'text') {
         parts.push({ data: { type: 'text', text: b.text, time: { start: ts, end: ts } }, ts });
       } else if (b.type === 'thinking') {
-        parts.push({ data: { type: 'reasoning', text: b.thinking, time: { start: ts, end: ts } }, ts });
+        const rdata: Row = { type: 'reasoning', text: b.thinking, time: { start: ts, end: ts } };
+        // gap #1: native reasoning parts keep the anthropic signature in
+        // metadata.anthropic — required for signed-thinking replay
+        if (b.signature) rdata.metadata = { anthropic: { signature: b.signature } };
+        parts.push({ data: rdata, ts });
+      } else if (b.type === 'file') {
+        parts.push({
+          data: {
+            type: 'file',
+            ...(b.filename ? { filename: b.filename } : {}),
+            ...(b.mediaType ? { mime: b.mediaType } : {}),
+            ...(b.url ? { url: b.url } : {}),
+            ...(b.data ? { data: b.data } : {}),
+          },
+          ts,
+        });
       } else if (b.type === 'tool_use') {
         // subagent Agent calls always get a fresh call id (see pass 2) so the
         // engine's global sidecar index cannot re-link them to the source child
@@ -1462,12 +1585,16 @@ function writeMessages(
       }
       // tool_result blocks on the assistant row are folded into ctx.results already
     }
-    // re-inject pending/running invocations recorded in the lossless bucket —
-    // they have no replayable tool_use block, matched back by source sequence
-    if (msg.seq !== undefined && nonReplayable.length) {
-      for (const rec of nonReplayable
-        .filter((t) => t.source?.messageSequence === msg.seq)
-        .sort((a, b) => (a.source?.partSequence ?? 0) - (b.source?.partSequence ?? 0))) {
+    // re-inject parts that have no replayable block, at their source part
+    // positions: pending/running invocations from the lossless bucket + every
+    // non-projected part row (step/timeline/compaction/…) from meta.zcode.
+    // Model-visible replay comes only from text/reasoning/tool parts, whose
+    // relative order the blocks already preserve, so appending after them is
+    // replay-exact; raw positions only order engine bookkeeping.
+    const reinject: Array<{ seq: number; data: Row }> = [];
+    if (msg.seq !== undefined) {
+      for (const rec of nonReplayable) {
+        if (rec.source?.messageSequence !== msg.seq) continue;
         const state: Row = {
           status: rec.status,
           ...(rec.input !== undefined ? { input: rec.input } : {}),
@@ -1475,29 +1602,42 @@ function writeMessages(
           ...(rec.time ? { time: rec.time } : {}),
           metadata: { schemaVersion: 1, ...(rec.metadata ?? {}) },
         };
-        parts.push({ data: { type: 'tool', callID: rec.callId, tool: rec.tool, state }, ts });
+        reinject.push({ seq: rec.source.partSequence, data: { type: 'tool', callID: rec.callId, tool: rec.tool, state } });
       }
     }
+    for (const rp of zmeta?.rawParts ?? []) {
+      reinject.push({ seq: typeof rp.sequence === 'number' ? rp.sequence : Number.MAX_SAFE_INTEGER, data: rp.data });
+    }
+    reinject.sort((a, b) => a.seq - b.seq);
+    for (const r of reinject) parts.push({ data: r.data, ts });
     if (!parts.length) continue; // nothing replayable in this message
 
+    const ztime = (zmeta?.time && typeof zmeta.time === 'object') ? zmeta.time as Row : undefined;
     const data: Row = {
       role: 'assistant',
-      time: { created: ts, completed: ts + 1 },
-      mode: 'build',
-      agent: defaultAgent,
+      time: {
+        created: typeof ztime?.created === 'number' ? ztime.created : ts,
+        completed: typeof ztime?.completed === 'number' ? ztime.completed : ts + 1,
+      },
+      mode: zmeta?.mode ?? 'build',
+      agent: zmeta?.agent ?? defaultAgent,
       path: { cwd: ctx.cwd, root: ctx.cwd },
-      cost: 0,
-      tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
-      finish: normalizeFinish(msg, toolUses.length > 0),
-      semantics: { origin: 'agent_runtime', kind: 'assistant_response', uiVisibility: 'visible', providerVisibility: 'visible', transcriptVisibility: 'visible' },
+      cost: typeof zmeta?.cost === 'number' ? zmeta.cost : 0,
+      tokens: zmeta?.tokens ?? { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+      finish: zmeta?.finish !== undefined ? zmeta.finish : normalizeFinish(msg, toolUses.length > 0),
+      semantics: zmeta?.semantics ?? { origin: 'agent_runtime', kind: 'assistant_response', uiVisibility: 'visible', providerVisibility: 'visible', transcriptVisibility: 'visible' },
     };
     if (prevId) data.parentID = prevId;
-    const model = resolveProviderModel(msg, ctx);
+    // meta carries the RAW registry ids captured at read time — prefer them
+    // over name→id re-resolution for exact zcode→zcode round-trips
+    const model = zmeta?.modelID
+      ? { modelID: zmeta.modelID, ...(zmeta.providerID ? { providerID: zmeta.providerID } : {}) }
+      : resolveProviderModel(msg, ctx);
     if (model) {
       data.modelID = model.modelID;
       if (model.providerID) data.providerID = model.providerID;
-      if (model.variant) data.variant = model.variant;
     }
+    if (zmeta?.variant) data.variant = zmeta.variant;
     insertMessageWithParts(db, sessionId, sequence, ts, data, parts);
     sequence += 1;
     // keep prevId: back-to-back assistant rows share the same user parent
