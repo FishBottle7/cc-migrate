@@ -25,11 +25,26 @@
 
 export type ToolId = 'dsh' | 'claude' | 'codex' | 'opencode' | 'pi' | 'zcode' | 'unknown';
 
+/**
+ * File / image attachment block. One type covers both: an image is a file with
+ * an `image/*` mediaType. `data` (base64) when the source store inlines the
+ * bytes, `url` when it references bytes stored elsewhere — either may be
+ * absent when only the name is known. (Gap #4 in docs/ir-protocol.md.)
+ */
+export interface FileBlock {
+  type: 'file';
+  filename?: string;
+  mediaType?: string;
+  data?: string;
+  url?: string;
+}
+
 export type ContentBlock =
   | { type: 'text'; text: string }
   | { type: 'tool_use'; id: string; name: string; input: unknown }
-  | { type: 'tool_result'; toolUseId: string; content: string; isError?: boolean }
-  | { type: 'thinking'; thinking: string };
+  | { type: 'tool_result'; toolUseId: string; content: string; isError?: boolean; attachments?: FileBlock[] }
+  | { type: 'thinking'; thinking: string; signature?: string }
+  | FileBlock;
 
 export type MessageRole = 'user' | 'assistant' | 'tool' | 'system';
 
@@ -42,6 +57,23 @@ export interface MigratedMessage {
   provider?: string;
   model?: string;
   stopReason?: string;
+  /**
+   * Adapter-namespaced message-level payload with no cross-tool slot (native
+   * semantics/cost/tokens/time/anchor/contextSnapshot, raw non-projected
+   * parts, …), keyed by adapter: `{ zcode: {...} }`. Attached to the message
+   * entity itself — never a source-id side-table (gap #2 in
+   * docs/ir-protocol.md). Adapters that don't need it ignore it.
+   */
+  meta?: Record<string, unknown>;
+  /**
+   * True when the message was injected by the SOURCE harness rather than
+   * typed by a human (DSH persists runtime-context snapshots and
+   * `<system-reminder>` payloads as ordinary user/message events with
+   * `source.kind === 'plugin'`). Target adapters decide the fate: drop, or
+   * keep flagged (e.g. OpenCode `ignored: true` text parts — hidden in the
+   * timeline AND excluded from LLM replay by toModelMessagesEffect).
+   */
+  synthetic?: boolean;
 }
 
 export type SidechainKind = 'subagent' | 'teammate';
@@ -134,7 +166,21 @@ export interface MigratedSession {
   systemPrompt?: string;
   messages: MigratedMessage[];
   sidechains?: MigratedSidechain[];
-  compaction?: Array<{ summary: string; tokensBefore?: number; retainedTail?: unknown[]; firstKeptId?: string }>;
+  /**
+   * Compaction (context-compression) records. The summary text is ALSO
+   * projected as a role:'user' message in messages[] by adapters that store it
+   * in-stream (that message is the canonical conversation carrier — it travels
+   * to targets that ignore this bucket); `anchorIndex` points at that message.
+   * Native boundary records stay on the summary message's `meta` (gap #3).
+   */
+  compaction?: Array<{
+    summary: string;
+    tokensBefore?: number;
+    retainedTail?: unknown[];
+    firstKeptId?: string;
+    /** index into messages[] of the projected compaction-summary message */
+    anchorIndex?: number;
+  }>;
   /** Typed lossless tool-invocation bucket (zcode fused call+result parts). */
   toolCalls?: MigratedToolCall[];
   branchSummaries?: Array<{ fromId: string; summary: string }>;
@@ -159,6 +205,7 @@ export function isMigratedMessage(v: unknown): v is MigratedMessage {
   const m = v as Record<string, unknown>;
   if (m.role !== 'user' && m.role !== 'assistant' && m.role !== 'tool' && m.role !== 'system') return false;
   if (!Array.isArray(m.content)) return false;
+  if (m.meta !== undefined && (typeof m.meta !== 'object' || m.meta === null || Array.isArray(m.meta))) return false;
   return true;
 }
 
@@ -209,6 +256,13 @@ export function validateSession(ir: MigratedSession): MigratedSession {
       if (!isValidToolCall(tc)) throw new Error(`validateSession: toolCalls[${i}] is malformed`);
     }
   }
+  if (ir.compaction !== undefined) {
+    if (!Array.isArray(ir.compaction)) throw new Error('validateSession: compaction must be an array');
+    for (const [i, c] of ir.compaction.entries()) {
+      if (typeof c !== 'object' || c === null || Array.isArray(c)) throw new Error(`validateSession: compaction[${i}] is malformed`);
+      if (typeof (c as { summary?: unknown }).summary !== 'string') throw new Error(`validateSession: compaction[${i}].summary must be a string`);
+    }
+  }
   if (ir.model !== undefined) {
     if (typeof ir.model !== 'object' || ir.model === null || Array.isArray(ir.model)) {
       throw new Error('validateSession: model must be an object { id }');
@@ -232,6 +286,8 @@ export function messageToText(msg: MigratedMessage): string {
           return `[tool_result] ${b.content}`;
         case 'thinking':
           return `[thinking] ${b.thinking}`;
+        case 'file':
+          return `[file${b.filename ? `: ${b.filename}` : b.mediaType ? `: ${b.mediaType}` : ''}]`;
         default:
           return '';
       }

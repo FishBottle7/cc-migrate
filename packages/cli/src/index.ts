@@ -7,6 +7,7 @@
  *   session-migrate preview <tool> <sessionId> [--root <dir>]
  *   session-migrate migrate <srcTool> <srcSessionId> <dstTool>
  *                    [--src-root <dir>] [--dst-root <dir>] [--target-cwd <path>]
+ *                    [--keep-runtime-context]
  *   session-migrate wizard [--src-root <dir>] [--dst-root <dir>]  # interactive
  *   session-migrate reconcile dsh [--root <dir>]  # fix workspace.json registration
  *   session-migrate verify dsh [--root <dir>] [sessionId]  # validate artifacts
@@ -29,6 +30,7 @@ interface Flags {
   targetCwd?: string;
   root?: string;
   flatten?: boolean;
+  keepSynthetic?: boolean;
 }
 
 function parseFlags(argv: string[]): { flags: Flags; positionals: string[] } {
@@ -43,6 +45,7 @@ function parseFlags(argv: string[]): { flags: Flags; positionals: string[] } {
     else if (tok === '--target-cwd') f.targetCwd = value('target-cwd');
     else if (tok === '--flatten') f.flatten = value('flatten') !== 'false';
     else if (tok === '--no-flatten') f.flatten = false;
+    else if (tok === '--keep-runtime-context') f.keepSynthetic = true;
     else positionals.push(tok);
   }
   return { flags: f, positionals };
@@ -87,6 +90,7 @@ async function main(argv: string[]) {
         root: flags.dstRoot,
         targetCwd: flags.targetCwd ?? ir.cwd,
         flatten: flags.flatten,
+        keepSynthetic: flags.keepSynthetic,
         ...(disambiguateTitle ? { disambiguateTitle: true } : {}),
       });
       console.log(`migrated ${a}:${b} -> ${c}:${res.sessionId}`);

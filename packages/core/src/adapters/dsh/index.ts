@@ -503,6 +503,11 @@ function eventToMessage(type: string, data: DshEvent['data']): MigratedMessage |
       const isToolBridged = source?.kind === 'tool' || (Array.isArray(content) && content.some((b) => typeof b === 'object' && b !== null && ((b as Record<string, unknown>).type === 'tool-result' || (b as Record<string, unknown>).type === 'tool_result')));
       const msg = normalizeMessageLike(data);
       if (!msg) return null;
+      // Harness-injected content (runtime-context snapshots, agent-instructions
+      // <system-reminder>, skill catalogs) is persisted as ordinary user/message
+      // events but carries source.kind === 'plugin'; human turns carry
+      // source.kind === 'user'. Mark for target-side policy (drop / keep flagged).
+      if (source?.kind === 'plugin') return { ...msg, synthetic: true };
       if (isToolBridged) return { ...msg, role: 'tool' as const };
       return msg;
     }

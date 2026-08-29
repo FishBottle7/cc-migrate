@@ -39,6 +39,15 @@ export interface WriteOptions {
    * source. Default `false` — keeps `write` faithful / round-trip lossless.
    */
   disambiguateTitle?: boolean;
+  /**
+   * Keep harness-injected content (IR `synthetic` messages: DSH runtime-context
+   * snapshots, `<system-reminder>` skill/instruction payloads) in the target
+   * session, flagged inert where the target supports it (OpenCode text parts
+   * get `ignored: true` — hidden in the timeline AND excluded from LLM replay).
+   * Default `false`: drop them — the target harness manages its own runtime
+   * context, and replaying the source's would fight it.
+   */
+  keepSynthetic?: boolean;
 }
 
 export interface WriteResult {

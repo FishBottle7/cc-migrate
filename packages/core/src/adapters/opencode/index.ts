@@ -232,7 +232,7 @@ export class OpenCodeAdapter implements Adapter {
               `WP DB helpers are not applicable here (different sandbox domain).`,
             );
           }
-          const written = writeToDb(db, ir, newId, targetCwd, flatten);
+          const written = writeToDb(db, ir, newId, targetCwd, flatten, opts?.keepSynthetic ?? false);
           return { tool: 'opencode', sessionId: written, paths: [dbPath ?? '<db>'] };
         } finally {
           try { db.close(); } catch { /* ignore */ }
@@ -573,7 +573,7 @@ function mapToolPart(tool: string, input: Record<string, unknown>, output: strin
  * Write an IR session into the REAL v1.18 schema: project + session +
  * message + part. No silent error swallowing — a failed insert throws.
  */
-function writeToDb(db: DbHandle, ir: MigratedSession, newId: string, cwd: string, _flatten: boolean): string {
+function writeToDb(db: DbHandle, ir: MigratedSession, newId: string, cwd: string, _flatten: boolean, keepSynthetic: boolean): string {
   const now = Date.now();
   const dir = fwdSlash(cwd || '/');
   // Attach to the app's own project row when present, else 'global' (the
@@ -641,6 +641,12 @@ function writeToDb(db: DbHandle, ir: MigratedSession, newId: string, cwd: string
   ir.messages.forEach((m, idx) => {
     if (consumedToolMsgs.has(idx) && m.role === 'tool') return; // merged into tool part
     if (m.role === 'system') return; // system prompts are opencode config, not chat rows
+    // Harness-injected messages (DSH runtime context / <system-reminder>):
+    // default drop — OpenCode manages its own runtime context. With
+    // keepSynthetic, keep them but write text parts `ignored: true` so the
+    // TUI hides them (index.tsx) AND toModelMessagesEffect skips them on
+    // LLM replay — lossless storage without polluting the model context.
+    if (m.synthetic && !keepSynthetic) return;
     const time = m.timestamp ?? now;
     const id = newMsgId(time);
 
@@ -656,7 +662,7 @@ function writeToDb(db: DbHandle, ir: MigratedSession, newId: string, cwd: string
         id, newId, time, now, JSON.stringify(data),
       );
       for (const b of m.content) {
-        if (b.type === 'text') insertPart(id, { type: 'text', text: b.text }, time);
+        if (b.type === 'text') insertPart(id, { type: 'text', text: b.text, ignored: m.synthetic ? true : undefined, synthetic: m.synthetic ? true : undefined }, time);
       }
       currentUserId = id;
       return;
