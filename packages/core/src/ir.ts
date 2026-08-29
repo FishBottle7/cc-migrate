@@ -14,7 +14,7 @@
  *    ContentBlock.thinking; encrypted_content is the ONLY allowed drop.
  */
 
-export type ToolId = 'dsh' | 'claude' | 'codex' | 'opencode' | 'pi' | 'unknown';
+export type ToolId = 'dsh' | 'claude' | 'codex' | 'opencode' | 'pi' | 'zcode' | 'unknown';
 
 export type ContentBlock =
   | { type: 'text'; text: string }

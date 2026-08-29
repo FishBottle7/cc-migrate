@@ -14,6 +14,7 @@ export { projectKey, encodeSegment, defaultDshRoot } from './adapters/dsh/format
 export { ensureWorkspaceRegistration, reconcileWorkspaces } from './adapters/dsh/workspace.js';
 export { claudeProjectDirName } from './adapters/claude/path.js';
 export { defaultCodexHome, sessionIndexPath } from './adapters/codex/paths.js';
+export { ZcodeAdapter, zcodeProjectId, o0Trim, classifyUserMessage } from './adapters/zcode/index.js';
 
 import { createRegistry } from './registry.js';
 import { DshAdapter } from './adapters/dsh/index.js';
@@ -21,6 +22,7 @@ import { ClaudeAdapter } from './adapters/claude/index.js';
 import { CodexAdapter } from './adapters/codex/index.js';
 import { PiAdapter } from './adapters/pi/index.js';
 import { OpenCodeAdapter } from './adapters/opencode/index.js';
+import { ZcodeAdapter } from './adapters/zcode/index.js';
 
 /** Build a registry with all built-in adapters wired. */
 export function builtinRegistry() {
@@ -30,5 +32,6 @@ export function builtinRegistry() {
   registry.register(new CodexAdapter());
   registry.register(new PiAdapter());
   registry.register(new OpenCodeAdapter());
+  registry.register(new ZcodeAdapter());
   return registry;
 }

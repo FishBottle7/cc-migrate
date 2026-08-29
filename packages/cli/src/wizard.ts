@@ -13,7 +13,7 @@
 
 import type { SessionMeta, ToolId } from '@session-migrate/core';
 
-export const TOOLS: ToolId[] = ['dsh', 'claude', 'codex', 'pi', 'opencode'];
+export const TOOLS: ToolId[] = ['dsh', 'claude', 'codex', 'pi', 'opencode', 'zcode'];
 
 export interface WizardAnswers {
   srcTool: ToolId;
@@ -39,6 +39,7 @@ export function defaultRootFor(tool: ToolId): string {
     case 'codex': return '~/.codex/sessions';
     case 'pi': return '~/.pi/agent/sessions';
     case 'opencode': return '~/.local/share/opencode/opencode.db';
+    case 'zcode': return '~/.zcode/cli/db/db.sqlite';
     default: return '';
   }
 }
@@ -277,26 +278,30 @@ export async function runWizard(io: WizardIO, deps: WizardDeps, pre?: Partial<Wi
   // Only prompt about flatten when it actually matters: at least one side is
   // opencode AND the session carries sidechains/hidden tasks.
   let flatten: boolean | undefined = pre?.flatten;
-  if (flatten === undefined && (srcTool === 'opencode' || dstTool === 'opencode')) {
+  if (flatten === undefined && (srcTool === 'opencode' || dstTool === 'opencode' || srcTool === 'zcode' || dstTool === 'zcode')) {
     try {
       cachedIr = await deps.readSource(registry, srcTool!, sessionId!, srcRoot);
     } catch {
       cachedIr = null;
     }
     const hasSidechains = !!(cachedIr && typeof cachedIr === 'object' && Array.isArray((cachedIr as { sidechains?: unknown[] }).sidechains) && ((cachedIr as { sidechains?: unknown[] }).sidechains!.length > 0));
-    // opencode source always deserves the question even if parse didn't emit
-    // sidechains — the hidden-task extraction might still be relevant. For
-    // non-opencode sources, only ask when there is actually a sidechain to
-    // decide about.
-    const shouldAsk = srcTool === 'opencode' ? true : hasSidechains;
+    // opencode/zcode source always deserves the question even if parse didn't
+    // emit sidechains — hidden tasks/subagents might still be relevant. For
+    // other sources, only ask when there is actually a sidechain to decide about.
+    const sidechainTool = srcTool === 'opencode' || srcTool === 'zcode' ? srcTool : undefined;
+    const shouldAsk = sidechainTool !== undefined ? true : hasSidechains;
     if (shouldAsk) {
       let prompt: string;
-      if (srcTool === 'opencode' && dstTool !== 'opencode') {
+      if (sidechainTool === 'zcode' && dstTool !== 'zcode') {
+        prompt = '检测到 ZCode subagent 旁链，是否展平为目标工具的独立旁链（Y=可直接续聊）？ [Y/n] > ';
+      } else if (sidechainTool === 'opencode' && dstTool !== 'opencode') {
         prompt = '检测到 OpenCode hidden task，是否展平为目标工具的独立旁链（Y=可直接续聊）？ [Y/n] > ';
-      } else if (srcTool !== 'opencode' && dstTool === 'opencode') {
+      } else if (dstTool === 'zcode' && srcTool !== 'zcode') {
+        prompt = '目标为 ZCode，是否将旁链写成 subagent_child 子会话（N，保留隐藏语义）还是展平为顶层消息（Y）？ [Y/n，默认 N] > ';
+      } else if (dstTool === 'opencode' && srcTool !== 'opencode') {
         prompt = '目标为 OpenCode，是否将旁链展平为顶层消息（Y）还是压回 task 工具块（N，保留隐藏语义）？ [Y/n，默认 Y] > ';
       } else {
-        prompt = 'OpenCode 间迁移，是否保持展平（Y）还是保留 hidden task 嵌套（N）？ [Y/n，默认 Y] > ';
+        prompt = '同工具间迁移，是否保持旁链嵌套（N）还是展平（Y）？ [Y/n，默认 N] > ';
       }
       const ans = (await io.question(prompt)).trim().toLowerCase();
       flatten = !(ans === 'n' || ans === 'no');
