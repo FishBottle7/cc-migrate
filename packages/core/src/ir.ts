@@ -21,6 +21,17 @@
  *    only on the write side per target capability.
  *  - validateSession / messageToText updated; thinking preserved via
  *    ContentBlock.thinking; encrypted_content is the ONLY allowed drop.
+ *
+ * v3.1 additive changes (2026-08-29, codex 适配器调查驱动 — 全部为可选字段，旧适配器
+ * 忽略即可，见 docs/ir-protocol.md「v3.1 登记」):
+ *  - MessageRole 新增 'developer'（Codex/OpenAI Responses 的 developer 角色，
+ *    与 system 不同——resume 回放时按原角色还原，跨工具由各写端自行降级）。
+ *  - MigratedSession.meta?: 会话级适配器命名空间原生载荷（与 MigratedMessage.meta
+ *    同契约），承载 codex session_meta 行（source/git/history_mode/…）等。
+ *  - compaction[] 新增 replacementHistory?: MigratedMessage[]（codex
+ *    CompactedItem.replacement_history 的类型化投影）与 meta?:（原生记录）。
+ *  - unmappedEvents 语义泛化：不再限 DSH，泛指"源 harness 事件日志"
+ *    （codex event_msg 行等），seq = 源日志位置。
  */
 
 export type ToolId = 'dsh' | 'claude' | 'codex' | 'opencode' | 'pi' | 'zcode' | 'unknown';
@@ -46,7 +57,7 @@ export type ContentBlock =
   | { type: 'thinking'; thinking: string; signature?: string }
   | FileBlock;
 
-export type MessageRole = 'user' | 'assistant' | 'tool' | 'system';
+export type MessageRole = 'user' | 'assistant' | 'tool' | 'system' | 'developer';
 
 export interface MigratedMessage {
   role: MessageRole;
@@ -60,7 +71,8 @@ export interface MigratedMessage {
   /**
    * Adapter-namespaced message-level payload with no cross-tool slot (native
    * semantics/cost/tokens/time/anchor/contextSnapshot, raw non-projected
-   * parts, …), keyed by adapter: `{ zcode: {...} }`. Attached to the message
+   * parts, codex ResponseItem id/phase/passthrough/envelope-metadata, …),
+   * keyed by adapter: `{ zcode: {...} }`. Attached to the message
    * entity itself — never a source-id side-table (gap #2 in
    * docs/ir-protocol.md). Adapters that don't need it ignore it.
    */
@@ -154,6 +166,29 @@ export interface MigratedUnmappedEvent {
   sourceEventSeqs?: number[];
 }
 
+/**
+ * One compaction (context-compression) record. `summary` + `anchorIndex`
+ * travel cross-tool; the rest is source-fidelity:
+ *  - `replacementHistory` — codex `CompactedItem.replacement_history`: the
+ *    full kept model history that REPLACES everything before it on resume
+ *    (typed projection, same message mapping as messages[]). Absent for
+ *    legacy-style compaction (Pi retainedTail / codex pre-replacement era).
+ *  - `meta` — adapter-namespaced native record (codex: window_number /
+ *    window ids / mcp_resource_origins / raw payload; zcode: boundary row).
+ */
+export interface MigratedCompaction {
+  summary: string;
+  tokensBefore?: number;
+  retainedTail?: unknown[];
+  firstKeptId?: string;
+  /** index into messages[] of the projected compaction-summary message */
+  anchorIndex?: number;
+  /** full kept-history base that supersedes everything before it (codex) */
+  replacementHistory?: MigratedMessage[];
+  /** adapter-namespaced native record, same contract as MigratedMessage.meta */
+  meta?: Record<string, unknown>;
+}
+
 export interface MigratedSession {
   schemaVersion: 2;
   originTool: ToolId;
@@ -164,6 +199,15 @@ export interface MigratedSession {
   model?: { provider?: string; id: string; variant?: string };
   thinkingLevel?: string;
   systemPrompt?: string;
+  /**
+   * The SOURCE session's base system prompt (the thing the source tool sends
+   * as the model's instructions slot — codex `base_instructions`, Claude
+   * system prompt, …). NOT project docs like AGENTS.md/CLAUDE.md: those live
+   * in messages[] as user-role content and are carried as ordinary history.
+   * Write-side rule (docs/agents/codex.md §系统提示词选择规范): map to the
+   * target's ONE canonical system-prompt slot — never stack it on top of the
+   * target's own system prompt as an extra developer/system/user message.
+   */
   messages: MigratedMessage[];
   sidechains?: MigratedSidechain[];
   /**
@@ -173,14 +217,7 @@ export interface MigratedSession {
    * to targets that ignore this bucket); `anchorIndex` points at that message.
    * Native boundary records stay on the summary message's `meta` (gap #3).
    */
-  compaction?: Array<{
-    summary: string;
-    tokensBefore?: number;
-    retainedTail?: unknown[];
-    firstKeptId?: string;
-    /** index into messages[] of the projected compaction-summary message */
-    anchorIndex?: number;
-  }>;
+  compaction?: MigratedCompaction[];
   /** Typed lossless tool-invocation bucket (zcode fused call+result parts). */
   toolCalls?: MigratedToolCall[];
   branchSummaries?: Array<{ fromId: string; summary: string }>;
@@ -190,8 +227,24 @@ export interface MigratedSession {
   planModes?: MigratedPlanMode[];
   /** Typed lossless domain state from DSH (todo/write). */
   todos?: MigratedTodo[];
-  /** Catch-all for remaining non-encrypted DSH events. */
+  /**
+   * Catch-all for the source harness's event log — originally DSH's event
+   * stream, now generic (v3.1): codex `event_msg` rollout lines, etc.
+   * `seq` = position in the source log (file line order when the source has
+   * no explicit sequence), `type` = source event type, `data` = raw payload
+   * (minus encrypted fields). Resume-relevant codex events (turn boundaries,
+   * rollback, settings) are replayed by the codex write side from here.
+   */
   unmappedEvents?: MigratedUnmappedEvent[];
+  /**
+   * Adapter-namespaced session-level native payload with no cross-tool slot
+   * (codex session_meta line: source/thread_source/git/originator/
+   * cli_version/history_mode/fork linkage/…), keyed by adapter:
+   * `{ codex: {...} }`. Session-level mirror of MigratedMessage.meta —
+   * attached to the session entity itself, never a source-id side table
+   * (v3.1, docs/ir-protocol.md). Adapters that don't need it ignore it.
+   */
+  meta?: Record<string, unknown>;
   extensions?: Record<string, unknown>;
   raw?: unknown;
 }
@@ -200,10 +253,12 @@ export interface MigratedSession {
  * Validation helpers
  * ------------------------------------------------------------------ */
 
+const MESSAGE_ROLES = new Set(['user', 'assistant', 'tool', 'system', 'developer']);
+
 export function isMigratedMessage(v: unknown): v is MigratedMessage {
   if (typeof v !== 'object' || v === null || Array.isArray(v)) return false;
   const m = v as Record<string, unknown>;
-  if (m.role !== 'user' && m.role !== 'assistant' && m.role !== 'tool' && m.role !== 'system') return false;
+  if (typeof m.role !== 'string' || !MESSAGE_ROLES.has(m.role)) return false;
   if (!Array.isArray(m.content)) return false;
   if (m.meta !== undefined && (typeof m.meta !== 'object' || m.meta === null || Array.isArray(m.meta))) return false;
   return true;
@@ -261,7 +316,20 @@ export function validateSession(ir: MigratedSession): MigratedSession {
     for (const [i, c] of ir.compaction.entries()) {
       if (typeof c !== 'object' || c === null || Array.isArray(c)) throw new Error(`validateSession: compaction[${i}] is malformed`);
       if (typeof (c as { summary?: unknown }).summary !== 'string') throw new Error(`validateSession: compaction[${i}].summary must be a string`);
+      const comp = c as MigratedCompaction;
+      if (comp.replacementHistory !== undefined) {
+        if (!Array.isArray(comp.replacementHistory)) throw new Error(`validateSession: compaction[${i}].replacementHistory must be an array`);
+        for (const [j, msg] of comp.replacementHistory.entries()) {
+          if (!isMigratedMessage(msg)) throw new Error(`validateSession: compaction[${i}].replacementHistory[${j}] is malformed`);
+        }
+      }
+      if (comp.meta !== undefined && (typeof comp.meta !== 'object' || comp.meta === null || Array.isArray(comp.meta))) {
+        throw new Error(`validateSession: compaction[${i}].meta must be an object`);
+      }
     }
+  }
+  if (ir.meta !== undefined && (typeof ir.meta !== 'object' || ir.meta === null || Array.isArray(ir.meta))) {
+    throw new Error('validateSession: meta must be an object');
   }
   if (ir.model !== undefined) {
     if (typeof ir.model !== 'object' || ir.model === null || Array.isArray(ir.model)) {

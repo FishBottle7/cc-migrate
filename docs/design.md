@@ -69,15 +69,20 @@
 - **编码**：cwd 中所有非字母数字（`:`, `\`, `/`, `_`, 空格）→ `-`（例 `D:\codes\foo_bar` → `D--codes-foo-bar--`）。
 - **记录**：`parentUuid` 链串起 `user`/`assistant`，首尾控制行 `mode`/`last-prompt`（权威形 `{type:'last-prompt', lastPrompt:<≤200 chars>, sessionId}`，无 `leafUuid`，见 `reAppendSessionMetadata`），`message.content` 含 `tool_use`/`tool_result` 块。旁链在 `subagents/agent-*.jsonl`（`isSidechain:true` + `agentId` + 可选 `.meta.json`）。resume 读 jsonl 找最近 leaf。详见 `docs/agents/claude.md`。
 
-### 2.3 Codex（新版权威 `codex-main/codex-rs`）
+### 2.3 Codex（新版权威 `codex-main/codex-rs`，2026-08-29 深查更新）
 
 ```
-~/.codex/sessions/YYYY/MM/DD/rollout-<timestamp>-<sessionId>.jsonl[.zst]
-~/.codex/sessions/YYYY/MM/DD/rollout-<ts>-<id>_<rolloutId>.jsonl.zst  # 新：后缀 + zstd 可选
+~/.codex/sessions/YYYY/MM/DD/rollout-<ts>-<threadId>[_<rolloutId>].jsonl[.zst]
+~/.codex/archived_sessions/…   +  session_index.jsonl（name→id，append-only）
+state_5.sqlite 等               = 从 rollout 回填的派生缓存（引擎不写）
 ```
 
-- 首行 `session_meta`（`protocol.rs:2975` 新增 `session_id`/`history_mode` 等，`list.rs:379` 本地时间落盘），后续 `response_item` 为 OpenAI Responses API 事件流（`message`/`function_call`/`function_call_output` 等，`models.rs:975` 新增 `AgentMessage`/`AdditionalTools`/`ContextCompaction`，`call_id` 变 `Option`）。
-- `history.jsonl` 仅用户消息索引，`session_index.jsonl` 仅 `name→id` 索引（`session_index.rs`），**权威 = rollout**。详见 `docs/agents/codex.md`。
+- 每行 `{"timestamp","ordinal"?,"type","payload"}`，**11 类记录**：`session_meta`（24 字段 +
+  `base_instructions{text,provenance}`；旧 `instructions` 已废）、`response_item`（17 变体，含
+  developer 角色与 `reasoning`——仅 `encrypted_content` 可丢）、`event_msg`（持久化子集：turn 边界/
+  回滚/设置/usage）、`turn_context`、`world_state`、`compacted`（`replacement_history` = resume 历史
+  基点）、`inter_agent_communication`、`security_risk_score`、`realtime_item`。
+- 旧版"Responses API 事件流"单一描述作废；全字段映射与写回配方见 `docs/agents/codex.md`。
 
 ### 2.4 OpenCode（DB 权威）
 
@@ -140,22 +145,33 @@ interface MigratedSession {
   schemaVersion: 2;
   originTool: ToolId;       // 'codex'|'claude'|'opencode'|'dsh'|'pi'|'unknown'
   originSessionId?: string;
-  title?: string;           // DSH session/title | Pi session_info.name
+  title?: string;           // DSH session/title | Pi session_info.name | codex session_index.thread_name
   createdAt?: number;
   cwd?: string;             // 原工作目录 → 目标适配器重映射
   model?: { provider?: string; id: string; variant?: string };
-  thinkingLevel?: string; systemPrompt?: string;
-  messages: MigratedMessage[];   // 按序，主链
+  thinkingLevel?: string; systemPrompt?: string;  // 源 base 系统提示词（见下方「系统提示词选择规范」）
+  messages: MigratedMessage[];   // 按序，主链（v3.1 role 可为 'developer'）
   sidechains?: MigratedSidechain[]; // 旁链/子代理分支（完整搬运文件，非折叠文本）
-  compaction?: Array<{ summary: string; tokensBefore?: number; retainedTail?: unknown[]; firstKeptId?: string }>;
+  compaction?: MigratedCompaction[]; // v3.1 += replacementHistory? / meta?
   branchSummaries?: Array<{ fromId: string; summary: string }>;
   goals?: MigratedGoal[]; planModes?: MigratedPlanMode[]; todos?: MigratedTodo[]; // typed lossless (DSH)
-  unmappedEvents?: MigratedUnmappedEvent[]; // catch-all lossless (DSH)
+  unmappedEvents?: MigratedUnmappedEvent[]; // 源 harness 事件日志（v3.1 泛化：DSH 事件/codex event_msg）
+  meta?: Record<string, unknown>;   // v3.1 会话级适配器命名空间原生载荷（{codex:{sessionMetaLine,…}}）
   extensions?: Record<string, unknown>; raw?: unknown;
 }
 ```
 
 > v3 语义：`agent→IR` 零丢弃（除 `encrypted_content/encrypted` 占位 `[encrypted omitted]`），`goal/change→goals`、`plan/mode→planModes`、`todo/write→todos`、`session/title→title`，其余 `~40` 类 `known-event-type` 进 `unmappedEvents`（含 `surfaceOp/sourceEventSeqs`）；`IR→DSH` 按 `time` 合并重排 `seq 0..N-1` 全量保留，`IR→Claude/Codex/OpenCode/Pi` 按目标能力丢弃领域桶（见 `docs/plans/ir-v3-lossless-100.md §2.4`）。
+>
+> **v3.1 增量**（2026-08-29，codex 调查驱动，全部可选字段；登记与需同步适配器见 `docs/ir-protocol.md` §v3.1）：`MessageRole += 'developer'`；`MigratedSession.meta`（会话级命名空间原生载荷）；`compaction[].replacementHistory/meta`；`unmappedEvents` 泛化为源 harness 事件日志。
+
+**系统提示词选择规范**（引擎级选项 `source` / `target`，2026-08-29 成文，机制细节 `docs/agents/codex.md` §7）：
+
+1. **单一系统提示词原则**：目标端 canonical system-prompt 槽位里只放一份提示词。严禁把源系统提示词以 user/developer 消息形式**叠**在目标自己的系统提示词之上——两份系统提示词互相稀释指令，会劣化 agent 表现（codex resume 源码也证实其自身就是"config 覆盖 > 记录值 > 渲染默认"三选一，从不叠加）。
+2. `source`：源方提示词写入目标的 canonical 槽位（codex → `base_instructions{provenance:custom}`；claude → system prompt；dsh/zcode → 各自 systemPrompt 载体）。
+3. `target`：目标用自己原生提示词开场（codex → 不写 base_instructions，resume 回退渲染默认）。
+4. **项目文档（AGENTS.md/CLAUDE.md）不参与本选项**：它们是 user 角色消息，随 messages[] 走。跨项目迁移时旧项目文档会成为历史噪音（codex 有 replace-diff 机制兜底），UI 需提示。
+5. harness 运行时上下文（codex `<environment_context>`/`<permissions instructions>`/world_state、DSH runtime snapshot）默认视为 `synthetic` 注入内容：默认丢弃由目标自查自建，opt-in 才原样保真；**永远不**当作系统提示词搬运。
 
 **设计要点**：IR 是「对话流水线」而非「事件日志」。不同工具内部状态机各异（DSH turn/step/compaction、Claude parentUuid 链、Codex Responses 流、Pi 树+compaction、OpenCode seq 序），跨工具**无损上限为消息级**，DSH↔DSH 额外做到领域状态 100% 无损。这是诚实边界：B 级 = 消息上下文 + 工具调用历史完整保留，目标工具能接着对话继续思考、继续调工具。
 
@@ -165,7 +181,7 @@ interface MigratedSession {
 |------|----------|---------|
 | Claude | `subagents/agent-<id>.jsonl`（`isSidechain:true`）+ `.meta.json` | `sidechains[]` 每项一文件，`agentId` 保留，`agentType` 透传 |
 | DSH | 独立 session 文件经 `parentSession`/`agent/inbox/spliced` 关联 | `sidechains[]` 或独立 session（`parentSession` 链），按目标 DSH 布局落盘 |
-| Codex | 兄弟 rollout 会话（同目录另一 `rollout-*.jsonl`） | 预留 `sidechains[]`，当前主用单文件 |
+| Codex | 独立兄弟 rollout 文件，`session_meta.source = subagent.thread_spawn{parent_thread_id, depth, agent_path, agent_nickname}` + `parent_thread_id` 双重关联 | `sidechains[]`（agentId=threadId, agentType=agent_role）或独立会话 + `meta.codex` 链路，见 `docs/agents/codex.md` §8 |
 | Pi | 同一文件树内分支（`branch`/`leafId`，`branch_summary`/`compaction`） | `sidechains[]` 暂不主用，分支在单文件内用 `parentId` 树表达 |
 | OpenCode | `session.parent_id` 自引 | 隐式父子，`sidechains` 预留 |
 

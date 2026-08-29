@@ -1,6 +1,6 @@
 # 6 家 AI 编码工具会话存储格式审计（基于真实数据逆向）
 
-> 状态：完整（v2，2026-08-28 增补 DSH/OpenCode/Pi 的权威源码锚点 + DELTA）。
+> 状态：完整（v2，2026-08-28 增补 DSH/OpenCode/Pi 的权威源码锚点 + DELTA；2026-08-29 增补 ZCode 行，细节见 `docs/agents/zcode.md`）。
 > 全部字段基于本机真实文件 + 三套新放入的权威源码（`deepseek-harness-master` / `opencode-dev` / `pi-main`）交叉验证，未依赖文档假设。
 > 目的：为会话迁移引擎提供「字节级构造可 resume session」的最小字段集，并记录与旧版审计的 DELTA。
 > 旧版：v1（4 家）见 git 历史；本版扩到 6 工具（新增 Pi，Codex 已按 `codex-main` 增量更新）。
@@ -10,13 +10,14 @@
 | 工具 | 权威存储 | 记录格式 | 单文件 or 关系 | resume 方式 | 最小可伪造性 |
 |------|---------|---------|--------------|------------|-------------|
 | **DSH** | `~/.dsh/sessions/--<proj>--/<id>/session.jsonl.zstd`（或 `/_no-cwd/<id>/`） | 事件日志（zstd 拼接帧，可选 `packChunks` 打包 `text-chunks` 行） | 单文件+顺序 seq | `loadStored`→`foldSurface`→`deriveEventMessage` | ✅ 已 round-trip |
-| **Codex** | `~/.codex/sessions/YYYY/MM/DD/rollout-<ts>-<id>.jsonl[.zst]` | OpenAI Responses API 事件流 | 单文件 + `session_index.jsonl`（仅 name→id 索引） | 读 rollout 重建 | ✅ 公开格式 |
+| **Codex** | `~/.codex/sessions/YYYY/MM/DD/rollout-<ts>-<id>.jsonl[.zst]` | 混合事件流：`session_meta`/`response_item`/`event_msg`/`turn_context`/`world_state`/`compacted` 等 11 类记录（v3.1 深查） | 单文件 + `session_index.jsonl`（name→id）+ `archived_sessions/`；state DB 为派生缓存 | 读 rollout 反向重建（compacted.replacement_history 为历史基点） | ✅ 公开格式（详见 `docs/agents/codex.md`） |
 | **Claude Code** | `~/.claude/projects/<编码路径>/<uuid>.jsonl` | Anthropic JSONL 消息流（`parentUuid` 链 + 末尾 `last-prompt`） | 单文件（首尾控制行）+ `subagents/agent-*.jsonl` | 读 jsonl 找 leaf | ✅ 结构简单 |
 | **OpenCode** | `~/.local/share/opencode/opencode.db`（`$XDG_DATA/opencode/opencode.db`，channel 变体见 `database.ts:path()`）| SQLite（Drizzle）权威；会话正文在 `session_message` 序列表 | 关系（`session` + `session_message` + `session_context_epoch` + `project` + `event`）| `SessionHistory.load(sessionID)` 读 `session_message` 按 seq 排序，compaction 感知 | ⚠️ 需 DB 事务写 3+ 表，无文件镜像 |
 | **Pi** | `~/.pi/agent/sessions/--<path>--/<ts>_<uuid>.jsonl` | JSONL 树（`id`/`parentId` 8-char hex，`leafId` 指针）| 单文件，树在文件内 | `SessionManager.open(path)` / `continueRecent(cwd)` 读树→`buildSessionContext()` | ✅ 单文件，易伪造（需首个 assistant 才落盘）|
+| **ZCode** | `~/.zcode/cli/db/db.sqlite`（`ZCODE_HOME` 覆盖）| SQLite（WAL）权威，正文在 `message`/`part` 行的 `data` JSON + 双 sequence | 关系（`session`+`message`+`part`，附属 sidecar `cli/agents/`、`rollout/`、`artifacts/`）| 按 `sequence` 排序回放（官方投影跳过 summary 与 model-only 合成 user）| ⚠️ 需 DB 写 3 表 + 活 WAL；详见 `docs/agents/zcode.md` |
 | **Cursor / Windsurf** | 未落盘到本机扫描范围（本次未放入源码）| — | — | — | `unknown`（占位）|
 
-> 关键洞察：**DSH/Codex/Claude/Pi 四家都有一条单一权威文件线**（zstd 拼接 / rollout / jsonl / Pi JSONL 树），**OpenCode 是唯一 DB 权威**。因此 `任意⇄任意` 的 IR 只需保住 `role + content 块 + 工具调用 + cwd + model` 五元组即可无损覆盖前四家；OpenCode 需 DB 适配器单独处理。
+> 关键洞察：**DSH/Codex/Claude/Pi 四家都有一条单一权威文件线**（zstd 拼接 / rollout / jsonl / Pi JSONL 树），**OpenCode 与 ZCode 是 DB 权威**。因此 `任意⇄任意` 的 IR 只需保住 `role + content 块 + 工具调用 + cwd + model` 五元组即可无损覆盖前四家；OpenCode/ZCode 需 DB 适配器单独处理。
 
 ---
 
@@ -109,34 +110,45 @@
 
 ## 2. Codex — `rollout-<ts>-<id>.jsonl`
 
-> 源码锚点：`codex-main/codex-rs`（`core/src/rollout/list.rs:379`、`protocol/src/protocol.rs:2975`、`protocol/src/models.rs:975`、`core/src/rollout/session_index.rs`）
+> ⚠️ **2026-08-29 深查重写**（`docs/agents/codex.md` 为权威细节版，含全字段表/锚点/映射）。旧版本节的
+> `instructions` 字段、`session_meta` 单行假设、"Responses API 事件流"单描述均已过时。
 
 ### 存储位置
 
 ```
-~/.codex/sessions/YYYY/MM/DD/rollout-<timestamp>-<sessionId>.jsonl[.zst]
+~/.codex/sessions/YYYY/MM/DD/rollout-<ts>-<threadId>[_<rolloutId>].jsonl[.zst]
+~/.codex/archived_sessions/…                    # 归档同格式
+~/.codex/session_index.jsonl                    # name→id，append-only 新条目胜出
+~/.codex/state_5.sqlite 等                      # 从 rollout 回填的派生缓存（迁移引擎不写）
 ```
 
-按创建时间分层：`2026/01/12/rollout-2026-01-12T20-55-48-019bb246-....jsonl`。
-另有 `history.jsonl`（每行 `{session_id, ts, text}`，仅用户消息索引，非权威）。
-SQLite（`logs_2.sqlite` 等）主存日志/记忆，会话正文在 rollout jsonl。**权威 = rollout jsonl。**
+`$CODEX_HOME` 覆盖 `~/.codex`。**权威 = rollout 文件**；新会话首轮前不落盘（deferred creation）。
 
-### 记录格式（OpenAI Responses API 事件流）
+### 记录格式（11 类记录，每行 `{"timestamp","ordinal"?,"type","payload"}`）
 
-每行一个 JSON，`{"timestamp","type","payload"}`：
-- **type=`session_meta`**（首行）payload 含：`id`, `session_id`（新）、`timestamp`, `cwd`, `originator:"codex_cli_rs"`, `cli_version`, `source`, `model_provider`, `instructions`(系统提示/AGENTS.md), `git`。
-- **type=`response_item`** payload 是 Responses API 对象：
-  - `{type:"message", role:"user"|"assistant", content:[{type:"input_text"|"output_text", text}]}`
-  - 另有 `function_call`, `function_call_output`, `reasoning`, `computer_call`, ... (工具/RAG)
+- `session_meta`：24 字段（`id`/`session_id`/`forked_from_id`/`parent_thread_id`/`source`(含
+  `subagent.thread_spawn`)/`thread_source`/`agent_*`/`model_provider`/`base_instructions{text,provenance}`/
+  `history_mode`/`history_base`/`context_window`…）+ `git`。**旧版 `instructions` 字段已废弃**；
+  子代理 rollout 可含多条继承的 session_meta 行。
+- `response_item`：Responses API 对象 17 变体——`message`(含 **developer** role)/`agent_message`/`reasoning`
+  (summary+content 必保，仅 `encrypted_content` 可丢)/`function_call`/`function_call_output`(output=串或裸数组，
+  call_id 可空)/`custom_tool_call(+-output)`/`local_shell_call`/`web_search_call`/`tool_search_*`/
+  `image_generation_call`(result=base64 图)/`compaction`(纯加密)/`context_compaction`/`compaction_trigger`/`additional_tools`。
+- `event_msg`：90+ 变体的持久化子集（`task_started`/`task_complete`/`token_count`/`thread_rolled_back`/
+  `thread_settings_applied`/`thread_goal_updated`/`turn_aborted`…）；UI/transient 类不落盘。
+- `turn_context`（每真实用户轮的 cwd/model/approval/sandbox/effort/personality 基线）、
+  `world_state`（full/patch 快照，含 agents_md 全文）、`compacted`（`replacement_history` 完整保留史 +
+  窗口 id）、`inter_agent_communication`（模型可见）、`security_risk_score`、`realtime_item`。
 
 ### 构造可 resume 会话
 
-写一个 rollout jsonl：
-1. `session_meta`（新 id、cwd、instructions、`cli_version`）
-2. 若干 `response_item` message（developer/user/assistant），内容块用 `input_text`/`output_text`
-3. 放在 `~/.codex/sessions/<YYYY/MM/DD>/` 下，文件名 `rollout-<ts>-<newId>.jsonl`
-4. 在 `~/.codex/session_index.jsonl` 追加一行 `{"id":"<thread_id>","thread_name":"<标题>","updated_at":"<ISO8601>"}` 供 `codex resume` 列表搜到
-> SQLite 角色确认：`logs_2.sqlite`=仅应用日志；`queue_1.sqlite`=上报/同步队列；`goals_1.sqlite`/`memories_1.sqlite`=运行时状态；`state_5.sqlite`=运行期线程树（被进程持锁）。**盘中权威 = rollout 文件**，DB/索引可增量重建。伪造难度：低。
+最小集（官方 external-agent-migration 导入器实证）：`session_meta` + 若干 `response_item` message + 伪造
+`task_started`/`task_complete`/`token_count` 事件，放对 `YYYY/MM/DD` 目录 + 追加 `session_index.jsonl` 一行。
+100% 保真写回另需 `turn_context`/`world_state`/`compacted`/持久化 `event_msg` 全量（配方见 `docs/agents/codex.md` §9）。
+
+> **DELTA vs 旧版审计**：旧版只识别 `session_meta`+`response_item` 两类记录；漏 `event_msg`/
+> `turn_context`/`world_state`/`compacted`/IAC/ordinal/zst 后台压缩/`_rolloutId` revert 变体/子代理
+> session_meta 前缀/`base_instructions` 语义变迁；`model_provider` 之外的 20+ 元字段全部缺失。
 
 ---
 
@@ -304,7 +316,7 @@ Entry 类型：
 | 工具 | 写一个可 resume 会话要造什么 | 难度 |
 |------|------------------------------|------|
 | DSH | 1 个 zstd 拼接文件（header frame + 消息事件 frame，`surfaceOp:'append'` + 连续 seq，`_no-cwd` 分支按 `cwd===undefined` 处理）| 低（已验证）|
-| Codex | 1 个 rollout jsonl（`session_meta` + `response_item`）+ `session_index` 一行 | 低 |
+| Codex | 最小：1 个 rollout jsonl（`session_meta`+`response_item`）+ `session_index` 追加一行；100% 保真另需 `turn_context`/`world_state`/`compacted`/持久化 `event_msg`（`docs/agents/codex.md` §9） | 低 |
 | Claude | 1 个 jsonl（`user`/`assistant` 链 + `last-prompt`）+ 正确编码目录 + 可选 `subagents/agent-*.jsonl` | 低 |
 | Pi | 1 个 JSONL 树（`session` header + `message` 链，`id`/`parentId` 8-char hex，至少 1 条 assistant 才落盘）| 低 |
 | OpenCode | DB 事务写 `project` + `session` + `session_message`（`seq` 连续）(+ `session_context_epoch` / `event`) | 中（待一次真实写采样）|
