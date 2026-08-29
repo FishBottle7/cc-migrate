@@ -493,11 +493,12 @@ function writeToDb(db: DbHandle, ir: MigratedSession, newId: string, cwd: string
   const projectId = resolveProjectRow(db, dir);
 
   db.prepare(
-    'INSERT INTO session (id, project_id, workspace_id, parent_id, slug, directory, path, title, version, share_url, summary_additions, summary_deletions, summary_files, summary_diffs, metadata, cost, tokens_input, tokens_output, tokens_reasoning, tokens_cache_read, tokens_cache_write, revert, permission, agent, model, time_created, time_updated, time_compacting, time_archived) VALUES (?, ?, NULL, NULL, ?, ?, NULL, ?, ?, NULL, NULL, NULL, NULL, NULL, NULL, 0, 0, 0, 0, 0, 0, NULL, NULL, NULL, NULL, ?, ?, NULL, NULL)',
+    'INSERT INTO session (id, project_id, workspace_id, parent_id, slug, directory, path, title, version, share_url, summary_additions, summary_deletions, summary_files, summary_diffs, metadata, cost, tokens_input, tokens_output, tokens_reasoning, tokens_cache_read, tokens_cache_write, revert, permission, agent, model, time_created, time_updated, time_compacting, time_archived) VALUES (?, ?, NULL, NULL, ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, NULL, NULL, 0, 0, 0, 0, 0, 0, NULL, NULL, NULL, NULL, ?, ?, NULL, NULL)',
   ).run(
     newId,
     projectId,
     `migrated-${newId.replace(/[^a-z0-9]/gi, '').slice(-10).toLowerCase()}`,
+    dir,
     dir,
     ir.title ?? '(migrated)',
     OPENCODE_APP_VERSION,
@@ -508,7 +509,12 @@ function writeToDb(db: DbHandle, ir: MigratedSession, newId: string, cwd: string
   const modelID = ir.model?.id ?? 'glm-5.3-flash';
   const providerID = ir.model?.provider ?? 'opencode';
   const path = { cwd: dir, root: dir };
-  const zeroTokens = { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } };
+  const zeroTokens = { total: 0, input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } };
+  // The TUI renders assistant content ONLY inside step boundaries: every real
+  // assistant message opens with a step-start part and closes with a
+  // step-finish part (reason + tokens + cost + snapshot). Without them the
+  // conversation renders blank even though storage reads back fine.
+  const snapshot = '0'.repeat(40);
 
   // Pair tool-role IR messages into the preceding assistant's tool parts
   // (opencode stores tool output inside the part, not as separate rows).
@@ -604,6 +610,7 @@ function writeToDb(db: DbHandle, ir: MigratedSession, newId: string, cwd: string
     db.prepare('INSERT INTO message (id, session_id, time_created, time_updated, data) VALUES (?, ?, ?, ?, ?)').run(
       id, newId, time, now, JSON.stringify(data),
     );
+    insertPart(id, { type: 'step-start', snapshot }, time);
     for (const b of m.content) {
       if (b.type === 'thinking') insertPart(id, { type: 'reasoning', text: b.thinking }, time);
       else if (b.type === 'text') insertPart(id, { type: 'text', text: b.text }, time);
@@ -622,6 +629,13 @@ function writeToDb(db: DbHandle, ir: MigratedSession, newId: string, cwd: string
         }, time);
       }
     }
+    insertPart(id, {
+      type: 'step-finish',
+      reason: hasToolCall ? 'tool-calls' : 'stop',
+      snapshot,
+      tokens: zeroTokens,
+      cost: 0,
+    }, time);
   });
   void partSeq;
   return newId;
