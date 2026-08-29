@@ -638,6 +638,22 @@ function writeToDb(db: DbHandle, ir: MigratedSession, newId: string, cwd: string
     );
   };
 
+  // DSH compaction checkpoints (IR gap #3 bucket) map to OpenCode's NATIVE
+  // compaction boundary: a user message carrying a `compaction` part plus an
+  // assistant `summary: true` message. OpenCode keeps the shadowed
+  // pre-compaction messages in storage but filterCompacted() excludes them
+  // from model replay — exactly DSH's "原文还在日志里,模型只见摘要+后文".
+  const compactionByAnchor = new Map<number, { summary: string; auto: boolean }>();
+  for (const [i, c] of (ir.compaction ?? []).entries()) {
+    if (typeof c.anchorIndex !== 'number') continue;
+    const anchor = ir.messages[c.anchorIndex];
+    const nativeSource = (anchor?.meta as { dsh?: { source?: Record<string, unknown> } } | undefined)?.dsh?.source;
+    compactionByAnchor.set(c.anchorIndex, {
+      summary: c.summary,
+      auto: !(nativeSource && typeof nativeSource.sourceCommandId === 'string'),
+    });
+  }
+
   ir.messages.forEach((m, idx) => {
     if (consumedToolMsgs.has(idx) && m.role === 'tool') return; // merged into tool part
     if (m.role === 'system') return; // system prompts are opencode config, not chat rows
@@ -651,6 +667,46 @@ function writeToDb(db: DbHandle, ir: MigratedSession, newId: string, cwd: string
     const id = newMsgId(time);
 
     if (m.role === 'user') {
+      // Compaction checkpoint -> boundary pair (native OpenCode semantics).
+      if (compactionByAnchor.has(idx)) {
+        const entry = compactionByAnchor.get(idx)!;
+        const boundaryData: Record<string, unknown> = {
+          role: 'user',
+          time: { created: time },
+          agent: 'build',
+          model: { providerID, modelID },
+          summary: { diffs: [] },
+        };
+        db.prepare('INSERT INTO message (id, session_id, time_created, time_updated, data) VALUES (?, ?, ?, ?, ?)').run(
+          id, newId, time, now, JSON.stringify(boundaryData),
+        );
+        insertPart(id, { type: 'compaction', auto: entry.auto }, time);
+        currentUserId = id;
+        // summary assistant parented to the boundary user (message-v2.ts
+        // filterCompacted: info.summary && info.finish && parentID match)
+        const summaryId = newMsgId(time + 1);
+        const summaryData: Record<string, unknown> = {
+          parentID: id,
+          role: 'assistant',
+          mode: 'compaction',
+          agent: 'compaction',
+          path,
+          cost: 0,
+          tokens: zeroTokens,
+          modelID,
+          providerID,
+          time: { created: time + 1, completed: time + 1 },
+          finish: 'stop',
+          summary: true,
+        };
+        db.prepare('INSERT INTO message (id, session_id, time_created, time_updated, data) VALUES (?, ?, ?, ?, ?)').run(
+          summaryId, newId, time + 1, now, JSON.stringify(summaryData),
+        );
+        insertPart(summaryId, { type: 'step-start', snapshot }, time + 1);
+        insertPart(summaryId, { type: 'text', text: entry.summary }, time + 1);
+        insertPart(summaryId, { type: 'step-finish', reason: 'stop', snapshot, tokens: zeroTokens, cost: 0 }, time + 1);
+        return;
+      }
       const data: Record<string, unknown> = {
         role: 'user',
         time: { created: time },

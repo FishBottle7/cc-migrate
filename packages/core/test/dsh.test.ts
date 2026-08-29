@@ -296,8 +296,12 @@ test('irToEvents re-points replace surfaceOps and sourceEventSeqs at the renumbe
     { type: 'assistant/message', seq: 2, time: 12, surfaceOp: { op: 'replace', start: 1, end: 1 }, sourceEventSeqs: [1], data: msg('a2', 'v2') },
   ];
   const ir = buildIrFromEvents({ id: 's', createdAt: 10 }, raw as never);
-  // the replaced message must land in unmapped (surfaceOp !== append)
-  assert.ok((ir.unmappedEvents ?? []).some((e) => (e.surfaceOp as unknown as Record<string, unknown>)?.op === 'replace'));
+  // the REPLACER surfaces as a message carrying its native op; the shadowed
+  // original stays in messages[] flagged (full log preserved, fold visible)
+  const a1 = ir.messages[1];
+  const a2 = ir.messages[2];
+  assert.equal(((a1.meta as { dsh?: { shadowed?: boolean } }).dsh)?.shadowed, true);
+  assert.deepEqual(((a2.meta as { dsh?: { surfaceOp?: unknown } }).dsh)?.surfaceOp, { op: 'replace', start: 1, end: 1 });
 
   const events = irToEvents(ir, 10) as unknown as Array<Record<string, unknown>>;
   assert.equal(events.length, 3);
@@ -309,6 +313,54 @@ test('irToEvents re-points replace surfaceOps and sourceEventSeqs at the renumbe
   assert.equal(rop.start, 1);
   assert.equal(rop.end, 1);
   assert.deepEqual(replaced.sourceEventSeqs, [1]);
+});
+
+test('compacted session: shadowed span + checkpoint fold, round-trip byte-faithful', async () => {
+  const adapter = new DshAdapter();
+  const root = await tempRoot();
+  const asst = (id: string, text: string) => ({
+    turn: 1, step: 1,
+    message: { id, role: 'assistant', source: { kind: 'model', provider: 'p', model: 'm' }, content: [{ type: 'text', text }] },
+  });
+  const raw = [
+    { type: 'user/message', seq: 0, time: 1, surfaceOp: 'append', data: { id: 'u1', role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: 'old question' }] } },
+    { type: 'assistant/message', seq: 1, time: 2, surfaceOp: 'append', data: asst('a1', 'old answer') },
+    // log-only metering record for the compaction
+    { type: 'compaction/summary', seq: 2, time: 3, data: { compactionId: 'c1', summary: [], shadowedRange: { start: 0, end: 1 }, shadowedSeqs: [0, 1], shadowedTokenCount: 4321, provider: 'p', model: 'm' } },
+    // the checkpoint shadows BOTH surface nodes (positions 0..1) and carries the summary
+    { type: 'user/message', seq: 3, time: 4, surfaceOp: { op: 'replace', start: 0, end: 1 }, sourceEventSeqs: [2, 0, 1], data: { id: 'ck1', role: 'user', source: { kind: 'plugin', plugin: 'compact', compactionId: 'c1' }, content: [{ type: 'text', text: 'This is an automatically generated checkpoint condensing an earlier span of the conversation to free up context.' }] } },
+    { type: 'user/message', seq: 4, time: 5, surfaceOp: 'append', data: { id: 'u2', role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: 'new question' }] } },
+    { type: 'assistant/message', seq: 5, time: 6, surfaceOp: 'append', data: asst('a2', 'new answer') },
+  ];
+  const ir = buildIrFromEvents({ id: 's', createdAt: 1 }, raw as never);
+  // ALL surface messages survive (log keeps everything); compaction/summary
+  // is log-only and lands in unmappedEvents.
+  assert.equal(ir.messages.length, 5);
+  const byId = (id: string) => ir.messages.find((m) => ((m.meta as { dsh?: { id?: string } }).dsh)?.id === id)!;
+  // ...but the fold marks exactly the shadowed span
+  assert.equal(((byId('u1').meta as { dsh?: { shadowed?: boolean } }).dsh)?.shadowed, true);
+  assert.equal(((byId('a1').meta as { dsh?: { shadowed?: boolean } }).dsh)?.shadowed, true);
+  assert.equal((byId('u2').meta as { dsh?: { shadowed?: boolean } }).dsh?.shadowed, undefined);
+  assert.equal((byId('a2').meta as { dsh?: { shadowed?: boolean } }).dsh?.shadowed, undefined);
+  // the checkpoint itself is a message, NOT synthetic (compaction exemption)
+  assert.equal(byId('ck1').synthetic, undefined);
+  // IR gap #3 compaction bucket: summary + anchor + tokensBefore from the paired metering event
+  assert.equal(ir.compaction?.length, 1);
+  assert.match(ir.compaction![0].summary, /automatically generated checkpoint/);
+  assert.equal(ir.compaction![0].anchorIndex, ir.messages.indexOf(byId('ck1')));
+  assert.equal(ir.compaction![0].tokensBefore, 4321);
+
+  // write -> parse round-trip preserves the compacted shape byte-faithfully
+  const res = await adapter.write(ir, { root, targetCwd: 'D:\\proj-compact' });
+  const back = await adapter.parse(res.sessionId, root);
+  assert.equal(back.messages.length, ir.messages.length);
+  const backCk = back.messages.find((m) => ((m.meta as { dsh?: { id?: string } }).dsh)?.id === 'ck1')!;
+  assert.deepEqual((backCk.meta as { dsh?: { surfaceOp?: unknown } }).dsh?.surfaceOp, { op: 'replace', start: 0, end: 1 });
+  // sourceEventSeqs survive as the provenance SET (canonicalized sorted —
+  // the fold only requires set membership over the shadowed surface nodes)
+  assert.deepEqual((backCk.meta as { dsh?: { sourceEventSeqs?: number[] } }).dsh?.sourceEventSeqs, [0, 1, 2]);
+  assert.equal(((back.messages.find((m) => ((m.meta as { dsh?: { id?: string } }).dsh)?.id === 'u1')!.meta as { dsh?: { shadowed?: boolean } }).dsh)?.shadowed, true);
+  assert.equal(back.compaction?.length, 1);
 });
 test('synthetic flag: plugin-sourced injections marked, compaction checkpoints exempt', () => {
   const raw = [

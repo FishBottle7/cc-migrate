@@ -32,6 +32,14 @@ interface DshMessageNative {
   turn?: number;
   step?: number;
   rawContent?: unknown[];
+  /** Original surfaceOp for replace-surface events (compaction checkpoints). */
+  surfaceOp?: unknown;
+  /** Original sourceEventSeqs provenance for replace-surface events. */
+  sourceEventSeqs?: number[];
+  /** True when this message was shadowed by a later positional replace
+   * (compaction): it stays in the DSH log but the model never sees it again.
+   * Targets decide how to express that (OpenCode: compaction boundary pair). */
+  shadowed?: boolean;
 }
 
 function withDshNative(msg: MigratedMessage, native: DshMessageNative): MigratedMessage {
@@ -459,7 +467,26 @@ export function buildIrFromEvents(header: { cwd?: string; createdAt?: number; id
   const planModes: NonNullable<MigratedSession['planModes']> = [];
   const todos: NonNullable<MigratedSession['todos']> = [];
   const unmappedEvents: NonNullable<MigratedSession['unmappedEvents']> = [];
+  const compaction: NonNullable<MigratedSession['compaction']> = [];
   let title: string | undefined;
+
+  // Surface fold with positional replace (mirrors DSH foldSurface): 'append'
+  // adds a node; surfaceOp {op:'replace',start,end} splices the CURRENT node
+  // list at those POSITIONS with the replacing event's seq. A compacted span
+  // therefore stays in the log but leaves the model-visible surface — the
+  // checkpoint (a user/message carrying the replace op) is the summary that
+  // replaces it. Shadowed messages keep meta.dsh.shadowed; the checkpoint
+  // becomes a message too (IR gap #3: the in-stream summary travels).
+  const nodes: number[] = [];
+  const compactionSummaries = new Map<number, Record<string, unknown>>(); // seq -> compaction/summary data
+  const seqToMsg = new Map<number, MigratedMessage>();
+
+  const stampAndPush = (ev: DshEvent, msg: MigratedMessage): void => {
+    msg.timestamp = ev.time;
+    msg.seq = ev.seq;
+    messages.push(msg);
+    seqToMsg.set(ev.seq, msg);
+  };
 
   for (const ev of events) {
     // Packed chunk rows carry seq0/time0 (not seq/time); treat them as
@@ -498,16 +525,63 @@ export function buildIrFromEvents(header: { cwd?: string; createdAt?: number; id
       } as NonNullable<MigratedSession['unmappedEvents']>[number]);
       continue;
     }
-    if (SURFACE_TYPES.has(ev.type) && ev.surfaceOp === 'append') {
+    if (ev.type === 'compaction/summary') {
+      // log-only metering record; keep lossless AND index it so the shadowing
+      // checkpoint below can pair with its shadowedTokenCount.
+      compactionSummaries.set(ev.seq, cleanData as Record<string, unknown>);
+      unmappedEvents.push({
+        seq: ev.seq,
+        time: ev.time ?? 0,
+        type: ev.type,
+        data: cleanData,
+      } as NonNullable<MigratedSession['unmappedEvents']>[number]);
+      continue;
+    }
+    if (SURFACE_TYPES.has(ev.type) && (ev.surfaceOp === 'append' || (typeof ev.surfaceOp === 'object' && ev.surfaceOp !== null && (ev.surfaceOp as Record<string, unknown>).op === 'replace'))) {
       const msg = eventToMessage(ev.type, cleanData);
       if (msg) {
         // Preserve wall-clock + original seq so irToEvents can restore the
         // exact stream order (turn/start must precede its surface messages;
         // equal-ms ties break by original seq, matching the source log).
         // provider/model are already lifted inside normalizeMessageLike.
-        msg.timestamp = ev.time;
-        msg.seq = ev.seq;
-        messages.push(msg);
+        const native = (msg.meta as { dsh?: DshMessageNative } | undefined)?.dsh;
+        if (ev.surfaceOp !== 'append') {
+          // replace-surface event (compaction checkpoint): keep the op and its
+          // provenance verbatim for byte-faithful write-back.
+          const sourceSeqs = (ev as { sourceEventSeqs?: number[] }).sourceEventSeqs;
+          const replacer = withDshNative(msg, { surfaceOp: ev.surfaceOp, ...(sourceSeqs ? { sourceEventSeqs: sourceSeqs } : {}) });
+          stampAndPush(ev, replacer);
+          // positional splice over the CURRENT node list
+          const op = ev.surfaceOp as { op: 'replace'; start: number; end: number };
+          const startIdx = Math.max(0, Math.min(op.start, nodes.length - 1));
+          const endIdx = Math.max(startIdx, Math.min(op.end, nodes.length - 1));
+          const shadowedSeqs = nodes.slice(startIdx, endIdx + 1);
+          nodes.splice(startIdx, endIdx - startIdx + 1, ev.seq);
+          for (const s of shadowedSeqs) {
+            const shadowedMsg = seqToMsg.get(s);
+            if (shadowedMsg) {
+              const prev = (shadowedMsg.meta as { dsh?: DshMessageNative } | undefined)?.dsh ?? {};
+              shadowedMsg.meta = { ...(shadowedMsg.meta ?? {}), dsh: { ...prev, shadowed: true } };
+            }
+          }
+          // IR gap #3 compaction bucket: summary text + anchor + token count
+          const summaryText = replacer.content
+            .filter((b) => b.type === 'text')
+            .map((b) => (b as { text: string }).text)
+            .join('\n');
+          const tokensBefore = sourceSeqs
+            ?.map((s) => compactionSummaries.get(s))
+            .map((d) => (d ? d.shadowedTokenCount : undefined))
+            .find((v): v is number => typeof v === 'number');
+          compaction.push({
+            summary: summaryText,
+            anchorIndex: messages.length - 1,
+            ...(tokensBefore !== undefined ? { tokensBefore } : {}),
+          });
+        } else {
+          stampAndPush(ev, msg);
+          nodes.push(ev.seq);
+        }
       }
       continue;
     }
@@ -539,6 +613,7 @@ export function buildIrFromEvents(header: { cwd?: string; createdAt?: number; id
   if (goals.length) ir.goals = goals;
   if (planModes.length) ir.planModes = planModes;
   if (todos.length) ir.todos = todos;
+  if (compaction.length) ir.compaction = compaction;
   if (unmappedEvents.length) ir.unmappedEvents = unmappedEvents;
   // preserve header for lossless same-tool round-trip
   ir.extensions = { 'dsh.headerRaw': { ...header } };
@@ -706,6 +781,16 @@ export function irToEvents(ir: MigratedSession, baseTime: number): DshEvent[] {
   // restored verbatim; otherwise synthesized values keep legacy behavior.
   const nativeOf = (msg: MigratedMessage): DshMessageNative =>
     (msg.meta as { dsh?: DshMessageNative } | undefined)?.dsh ?? {};
+  /** Restore the original surfaceOp ('append' or a replace object) plus its
+   * sourceEventSeqs provenance — without this, compacted sessions would
+   * round-trip as if nothing had been shadowed. */
+  const surfaceOf = (msg: MigratedMessage): { surfaceOp: unknown; sourceEventSeqs?: number[] } => {
+    const native = nativeOf(msg);
+    return {
+      surfaceOp: native.surfaceOp ?? 'append',
+      ...(native.sourceEventSeqs ? { sourceEventSeqs: native.sourceEventSeqs } : {}),
+    };
+  };
   let msgFallback = baseTime;
   for (const msg of ir.messages) {
     const t = msg.timestamp;
@@ -741,7 +826,7 @@ export function irToEvents(ir: MigratedSession, baseTime: number): DshEvent[] {
           }),
         },
       };
-      raw.push({ time, type: 'tool/result', surfaceOp: 'append', data: toolData as unknown as DshEvent['data'], _msg: msg, _seq: seq });
+      raw.push({ time, type: 'tool/result', ...(surfaceOf(msg) as { surfaceOp: string; sourceEventSeqs?: number[] }), data: toolData as unknown as DshEvent['data'], _msg: msg, _seq: seq });
       continue;
     }
     if (msg.role === 'user' || msg.role === 'system') {
@@ -754,7 +839,7 @@ export function irToEvents(ir: MigratedSession, baseTime: number): DshEvent[] {
         ...(native.source !== undefined ? { source: native.source } : { source: { kind: 'user', rpcId: randomUUID(), clientTimeZone: 'Asia/Shanghai' } }),
         content: native.rawContent ?? dshContentFromBlocks(msg.content),
       } as unknown as DshEvent['data'];
-      raw.push({ time, type: 'user/message', surfaceOp: 'append', data, _msg: msg, _seq: seq });
+      raw.push({ time, type: 'user/message', ...(surfaceOf(msg) as { surfaceOp: string; sourceEventSeqs?: number[] }), data, _msg: msg, _seq: seq });
     } else {
       // DSH validates assistant/message data as {turn,step,message:{id, role:"assistant", source:{kind:"model",provider,model}, content:[]}}
       const provider = (ir.model?.provider as string) ?? 'abrdns';
@@ -773,7 +858,7 @@ export function irToEvents(ir: MigratedSession, baseTime: number): DshEvent[] {
           content: native.rawContent ?? dshContentFromBlocks(msg.content),
         },
       } as unknown as DshEvent['data'];
-      raw.push({ time, type: 'assistant/message', surfaceOp: 'append', data, _msg: msg, _seq: seq });
+      raw.push({ time, type: 'assistant/message', ...(surfaceOf(msg) as { surfaceOp: string; sourceEventSeqs?: number[] }), data, _msg: msg, _seq: seq });
     }
   }
   for (const g of ir.goals ?? []) {
