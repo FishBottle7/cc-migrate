@@ -9,12 +9,14 @@
  * This adapter does NOT depend on `@deepseek-ai/dsh` internals — it re-derives
  * enough of the format to read/write resumable sessions using only `node:zlib`.
  *
- * TODO(ir-protocol): this adapter predates the toolCalls typed bucket and the
- * per-message association rules — see docs/ir-protocol.md「dsh 待适配清单」:
- *  1. read: emit MigratedToolCall records from tool-call + tool-result events
- *  2. write: consume ir.toolCalls (state wins over the block-level view)
- *  3. per-message native fields now ride MigratedMessage.meta.dsh (gap #2);
- *     'dsh.headerRaw' remains for the session header only.
+ * IR protocol status (docs/ir-protocol.md「dsh 待适配清单」— all landed):
+ *  1. read: `tool/call` + `tool/result` events → typed `toolCalls` records
+ *     (status derived from result presence/isError; raw arguments preserved).
+ *  2. write: `ir.toolCalls` → re-emitted `tool/call` events (a running record
+ *     is a lone call event — native shape for interrupted calls).
+ *  3. per-message native fields ride MigratedMessage.meta.dsh (gap #2); the
+ *     session header rides session-level MigratedSession.meta.dsh (v3.1) —
+ *     extensions no longer carries DSH state.
  */
 
 /**
@@ -86,6 +88,7 @@ import type {
   FileBlock,
   MigratedMessage,
   MigratedSession,
+  MigratedToolCall,
   MessageRole,
   SessionMeta,
 } from '../../ir.js';
@@ -466,6 +469,8 @@ export function buildIrFromEvents(header: { cwd?: string; createdAt?: number; id
   const goals: NonNullable<MigratedSession['goals']> = [];
   const planModes: NonNullable<MigratedSession['planModes']> = [];
   const todos: NonNullable<MigratedSession['todos']> = [];
+  const toolCalls: NonNullable<MigratedSession['toolCalls']> = [];
+  const toolCallByCallId = new Map<string, MigratedToolCall>();
   const unmappedEvents: NonNullable<MigratedSession['unmappedEvents']> = [];
   const compaction: NonNullable<MigratedSession['compaction']> = [];
   let title: string | undefined;
@@ -537,6 +542,34 @@ export function buildIrFromEvents(header: { cwd?: string; createdAt?: number; id
       } as NonNullable<MigratedSession['unmappedEvents']>[number]);
       continue;
     }
+    if (ev.type === 'tool/call') {
+      // toolCalls typed bucket (清单 #1): one record per invocation event.
+      // `arguments` is the RAW model-produced JSON string — kept verbatim in
+      // metadata.dsh for byte-faithful write-back; `input` carries the parsed
+      // form for consumers. No result event (yet) → non-replayable 'running'.
+      const d = cleanData as { turn?: number; step?: number; callId?: string; name?: string; arguments?: string };
+      if (typeof d.callId === 'string' && d.callId) {
+        const rec: MigratedToolCall = {
+          callId: d.callId,
+          tool: String(d.name ?? 'tool'),
+          status: 'running',
+          input: tryParseJson(d.arguments),
+          time: { start: ev.time },
+          metadata: {
+            dsh: {
+              ...(typeof d.turn === 'number' ? { turn: d.turn } : {}),
+              ...(typeof d.step === 'number' ? { step: d.step } : {}),
+              seq: ev.seq,
+              ...(typeof d.arguments === 'string' ? { arguments: d.arguments } : {}),
+              ...(ev.time !== undefined ? { time: ev.time } : {}),
+            },
+          },
+        };
+        toolCalls.push(rec);
+        toolCallByCallId.set(rec.callId, rec);
+      }
+      continue;
+    }
     if (SURFACE_TYPES.has(ev.type) && (ev.surfaceOp === 'append' || (typeof ev.surfaceOp === 'object' && ev.surfaceOp !== null && (ev.surfaceOp as Record<string, unknown>).op === 'replace'))) {
       const msg = eventToMessage(ev.type, cleanData);
       if (msg) {
@@ -551,17 +584,25 @@ export function buildIrFromEvents(header: { cwd?: string; createdAt?: number; id
           const sourceSeqs = (ev as { sourceEventSeqs?: number[] }).sourceEventSeqs;
           const replacer = withDshNative(msg, { surfaceOp: ev.surfaceOp, ...(sourceSeqs ? { sourceEventSeqs: sourceSeqs } : {}) });
           stampAndPush(ev, replacer);
-          // positional splice over the CURRENT node list
+          // Surface fold: op.start/op.end are SURFACE NODE SEQs (DSH
+          // replacementRange does nodes.indexOf(op.start)); the splice removes
+          // every current node between them plus both endpoints. An invalid
+          // reference never occurs in a log DSH itself would load — degrade to
+          // append rather than fail the migration.
           const op = ev.surfaceOp as { op: 'replace'; start: number; end: number };
-          const startIdx = Math.max(0, Math.min(op.start, nodes.length - 1));
-          const endIdx = Math.max(startIdx, Math.min(op.end, nodes.length - 1));
-          const shadowedSeqs = nodes.slice(startIdx, endIdx + 1);
-          nodes.splice(startIdx, endIdx - startIdx + 1, ev.seq);
-          for (const s of shadowedSeqs) {
-            const shadowedMsg = seqToMsg.get(s);
-            if (shadowedMsg) {
-              const prev = (shadowedMsg.meta as { dsh?: DshMessageNative } | undefined)?.dsh ?? {};
-              shadowedMsg.meta = { ...(shadowedMsg.meta ?? {}), dsh: { ...prev, shadowed: true } };
+          const startIdx = nodes.indexOf(op.start);
+          const endIdx = nodes.indexOf(op.end);
+          if (startIdx === -1 || endIdx === -1 || startIdx > endIdx) {
+            nodes.push(ev.seq);
+          } else {
+            const shadowedSeqs = nodes.slice(startIdx, endIdx + 1);
+            nodes.splice(startIdx, endIdx - startIdx + 1, ev.seq);
+            for (const s of shadowedSeqs) {
+              const shadowedMsg = seqToMsg.get(s);
+              if (shadowedMsg) {
+                const prev = (shadowedMsg.meta as { dsh?: DshMessageNative } | undefined)?.dsh ?? {};
+                shadowedMsg.meta = { ...(shadowedMsg.meta ?? {}), dsh: { ...prev, shadowed: true } };
+              }
             }
           }
           // IR gap #3 compaction bucket: summary text + anchor + token count
@@ -581,6 +622,7 @@ export function buildIrFromEvents(header: { cwd?: string; createdAt?: number; id
         } else {
           stampAndPush(ev, msg);
           nodes.push(ev.seq);
+          if (ev.type === 'tool/result') backfillToolCall(toolCallByCallId, cleanData, ev.time);
         }
       }
       continue;
@@ -613,11 +655,54 @@ export function buildIrFromEvents(header: { cwd?: string; createdAt?: number; id
   if (goals.length) ir.goals = goals;
   if (planModes.length) ir.planModes = planModes;
   if (todos.length) ir.todos = todos;
+  if (toolCalls.length) ir.toolCalls = toolCalls;
   if (compaction.length) ir.compaction = compaction;
   if (unmappedEvents.length) ir.unmappedEvents = unmappedEvents;
-  // preserve header for lossless same-tool round-trip
-  ir.extensions = { 'dsh.headerRaw': { ...header } };
+  // Session header rides the SESSION-LEVEL meta namespace (v3.1: eliminates
+  // the last extensions bypass; write-back prefers meta.dsh.headerRaw and
+  // still honours the legacy extensions key from pre-v3.1 exported IRs).
+  ir.meta = { dsh: { headerRaw: { ...header } } };
   return ir;
+}
+
+/** toolCalls 清单 #1（result 回填）：pair the result event with its bucket
+ * record by callId — status flips to completed/error, output/error text is
+ * extracted from the tool-result interior, time.end and DSH-native extras
+ * (error identity, tool-private result meta) ride metadata.dsh. */
+function backfillToolCall(
+  map: Map<string, MigratedToolCall>,
+  data: unknown,
+  time: number | undefined,
+): void {
+  const d = data as {
+    message?: { source?: { callId?: unknown }; content?: unknown[] };
+    error?: { name?: string; code?: string };
+    meta?: unknown;
+  } | undefined;
+  const callId = d?.message?.source?.callId;
+  const rec = typeof callId === 'string' ? map.get(callId) : undefined;
+  if (!rec) return;
+  const block = (d?.message?.content ?? []).find(
+    (b) => typeof b === 'object' && b !== null && ((b as Record<string, unknown>).type === 'tool-result' || (b as Record<string, unknown>).type === 'tool_result'),
+  ) as Record<string, unknown> | undefined;
+  const isError = Boolean(block?.isError) || d?.error !== undefined;
+  const text = Array.isArray(block?.content)
+    ? (block!.content as unknown[])
+        .map((p) => (typeof p === 'object' && p !== null && (p as Record<string, unknown>).type === 'text' ? String((p as Record<string, unknown>).text ?? '') : JSON.stringify(p)))
+        .join('')
+    : typeof block?.content === 'string' ? block.content : '';
+  rec.status = isError ? 'error' : 'completed';
+  if (isError) rec.error = text;
+  else rec.output = text;
+  if (rec.time && time !== undefined) rec.time.end = time;
+  rec.metadata = {
+    ...(rec.metadata ?? {}),
+    dsh: {
+      ...(rec.metadata?.dsh ?? {}),
+      ...(d?.error ? { errorIdentity: d.error } : {}),
+      ...(d?.meta !== undefined ? { resultMeta: d.meta } : {}),
+    },
+  };
 }
 
 function eventToMessage(type: string, data: DshEvent['data']): MigratedMessage | null {
@@ -753,12 +838,16 @@ function tryParseJson(v: unknown): unknown {
   }
 }
 
+function isSafeSeq(v: unknown): v is number {
+  return typeof v === 'number' && Number.isSafeInteger(v) && v >= 0;
+}
+
 /**
  * Build IR back into DSH event rows (with seq + surfaceOp).
  *
- * v3: merges messages + goals + planModes + todos + unmappedEvents into a
- * single time-ordered stream, then reassigns contiguous seq 0..N-1. This is
- * the only path that makes `agent->IR->agent` lossless for DSH (see
+ * v3: merges messages + goals + planModes + todos + toolCalls + unmappedEvents
+ * into a single time-ordered stream, then reassigns contiguous seq 0..N-1. This
+ * is the only path that makes `agent->IR->agent` lossless for DSH (see
  * docs/plans/ir-v3-lossless-100.md §3). Domain buckets are merged by time so
  * the original wall-clock ordering survives. `session/title` is synthesized
  * from `ir.title` when no matching unmapped event already carries it.
@@ -864,6 +953,29 @@ export function irToEvents(ir: MigratedSession, baseTime: number): DshEvent[] {
   for (const g of ir.goals ?? []) {
     const time = typeof g.time === 'number' && Number.isFinite(g.time) ? g.time : baseTime;
     raw.push({ time, type: 'goal/change', data: g.data as unknown as DshEvent['data'], _seq: g.seq });
+  }
+  // toolCalls 清单 #2：re-emit one tool/call event per bucket record. A record
+  // without a result (running/pending) is the ONLY representation — native DSH
+  // logs carry no result event for interrupted calls; completed/error records
+  // additionally pair with the tool/result events emitted from tool-role
+  // messages above, matching the native trio (assistant block + tool/call +
+  // tool/result). metadata.dsh restores the exact turn/step/seq and the RAW
+  // model-produced arguments string.
+  for (const tc of ir.toolCalls ?? []) {
+    const dsh = (tc.metadata as { dsh?: { turn?: number; step?: number; seq?: number; time?: number; arguments?: string } } | undefined)?.dsh;
+    const time = typeof dsh?.time === 'number' && Number.isFinite(dsh.time) ? dsh.time : baseTime;
+    raw.push({
+      time,
+      type: 'tool/call',
+      data: {
+        turn: dsh?.turn ?? 1,
+        step: dsh?.step ?? 1,
+        callId: tc.callId,
+        name: tc.tool,
+        arguments: typeof dsh?.arguments === 'string' ? dsh.arguments : JSON.stringify(tc.input ?? {}),
+      } as unknown as DshEvent['data'],
+      _seq: isSafeSeq(dsh?.seq) ? dsh.seq : undefined,
+    });
   }
   for (const p of ir.planModes ?? []) {
     const time = typeof p.time === 'number' && Number.isFinite(p.time) ? p.time : baseTime;

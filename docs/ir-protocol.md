@@ -27,6 +27,20 @@
 
 `meta` 的契约要点：键是适配器命名空间；写回端只消费自己命名空间的键，未知键忽略。rawParts 还原时排在投影块之后（模型可见回放只来自 text/reasoning/tool part，块序已保真；raw 序只影响引擎记账部分）。extensions 里的 `zcode.messageExtras` / `zcode.compactions` / `zcode.compactionSummaries` 已随 #1/#2/#3 落地**废除**。
 
+## v3.1 登记（2026-08-29，codex 适配器开发前调查驱动）
+
+全部为**可选字段**——旧适配器读到时忽略即可，不破坏任何现有读写；但**写端**需按约定消费。依据：codex-main 源码深查（2026-08 版，本机实测 cli 0.146.0），完整字段映射见 `docs/agents/codex.md`。改动明细另见 `packages/core/src/ir.ts` 头注释。
+
+| 扩展 | 载体 | 语义 | 产出/消费 | 需同步的适配器 |
+|------|------|------|-----------|----------------|
+| `MessageRole` 新增 `'developer'` | 每条消息 | OpenAI Responses 的 developer 角色（codex `<permissions instructions>`、client-authored developer 消息、`developer_instructions` 配置）。与 `system` 不同：resume 回放按原角色还原。**写端降级规则**：codex 写回保留原样；claude/dsh 并入或降为 `system`；zcode/pi/opencode 降为 `user` 可见行；禁止降为 assistant（模型会当成自己的话） | codex 读写两端；其余写端补一个 role 分支 | **全部**（写端） |
+| `MigratedSession.meta?: Record<string, unknown>` | 会话级 | `MigratedMessage.meta` 的会话级镜像：适配器命名空间原生会话载荷。codex 命名空间放 `session_meta` 行原生 payload（`source`/`thread_source`/`git`/`originator`/`cli_version`/`history_mode`/fork/parent 链/`agent_*`/`dynamic_tools`/`context_window` 等）+ `sessionIndex` 标题行；dsh 的 header 级信息应从 `extensions['dsh.headerRaw']` 迁入 `meta.dsh`（消除最后一处旁路） | codex 读写两端；dsh 迁移跟进 | **codex**（新）、**dsh**（待迁移）；其余忽略 |
+| `compaction[].replacementHistory?: MigratedMessage[]` | compaction 桶 | codex `CompactedItem.replacement_history`：压缩后**取代此前全部历史**的完整保留史（与 messages[] 同构投影）。区别于 Pi 的 `retainedTail`（Pi 是自包含保留尾） | codex 读写两端；其他忽略 | **codex**（新）；其余忽略 |
+| `compaction[].meta?: Record<string, unknown>` | compaction 桶 | 压缩记录实体上的原生载荷（codex：`window_number`/`first_window_id`/`previous_window_id`/`window_id`/`mcp_resource_origins`），不开源 id 旁表 | codex 读写两端 | **codex**（新）；zcode 可选跟进（边界行迁 `meta.zcode`） |
+| `unmappedEvents` 语义泛化 | 事件日志桶 | 原注释限定 DSH，现泛化为**源 harness 事件日志**（codex `event_msg` 行等）：`seq`=源日志位置（无显式序号时取行号），`type`=源事件类型，`data`=原始载荷（去加密字段）。codex 写回从桶重放 resume 相关事件（turn 边界/rollback/settings） | dsh 不变 + codex 读 | **codex**（新）；dsh 无动作 |
+
+**turn/事件级残条归属约定**（codex 特有，其他工具参考同型做法）：`turn_context`（每真实用户轮的 cwd/model/approval/sandbox/effort/personality 基线）与 `world_state`（全量/补丁快照）挂到该轮首条消息的 `meta.codex`（zcode 已有 contextSnapshot 挂消息 meta 的先例）；会话级基线随首条用户消息走。`event_msg` 整流进 `unmappedEvents`，不散挂。`ResponseItem` 级原生字段（id/phase/`internal_chat_message_metadata_passthrough`/envelope `client_authored`）挂对应消息的 `meta.codex`。
+
 ## ⚠️ 压缩折叠的坑（写给后来写适配器的人）
 
 > 2026-08-29 实际踩坑：dsh 适配器第一版把 compacted 会话**两头都做反了**——
@@ -36,7 +50,7 @@
 **源日志 ≠ 模型可见面。** DSH（以及任何"压缩不重写日志"的源工具）压缩后：
 
 - 被折叠的旧消息**原样留在日志里**（surfaceOp 仍是 `append`）；
-- 模型可见面是**计算出来的**：checkpoint（`user/message`，`source.kind==='plugin' && plugin==='compact'`）携带 `surfaceOp: {op:'replace', start, end}`，对**当前可见节点列表的 [start,end] 位置区间**做拼接顶替——注意 start/end 是**节点列表位置**，不是事件 seq；
+- 模型可见面是**计算出来的**：checkpoint（`user/message`，`source.kind==='plugin' && plugin==='compact'`）携带 `surfaceOp: {op:'replace', start, end}`，DSH 用 `nodes.indexOf(start/end)` 定位——**start/end 是可见节点表中作为端点的两个节点 seq**（不是列表下标！`replacementRange` 的报错 "start seq 42 not found in surface" 即证据），两者之间（含端点）的全部当前节点被顶替为 checkpoint 自身；
 - 精确的被遮蔽集合由 checkpoint 的 `sourceEventSeqs` 溯源（集合语义，顺序不重要，写回端可规范化排序）。
 
 **因此，naive 适配器的两个典型错误**：
@@ -68,7 +82,7 @@ messages[] 里**全量保留**（含被遮蔽消息）——无损原则；"哪�
 | # | 问题 | 现状（违共识点） | 建议槽位 | 影响适配器 |
 |---|------|------------------|----------|------------|
 | 1 | ~~anthropic thinking 签名~~ | ✅ 已落地：`ContentBlock.thinking.signature`（zcode 读写、claude 读写） | — | — |
-| 2 | ~~消息级附加信息~~ | ✅ 已落地：`MigratedMessage.meta`（zcode 读写两端；dsh 的 header 级旁路信息仍待迁移，见下） | dsh 跟进 | dsh |
+| 2 | ~~消息级附加信息~~ | ✅ 已落地：`MigratedMessage.meta`（zcode 读写两端；dsh 已跟进——消息级 `meta.dsh` + 会话级 `meta.dsh.headerRaw`，extensions 旁路消除） | — | — |
 | 3 | ~~compaction 无位置锚~~ | ✅ 已落地：摘要投影进 messages[] + `anchorIndex`（zcode 写回还原原生 summary 行） | — | — |
 | 4 | ~~tool_result 多块/图像内容~~ | ✅ 已落地：`FileBlock` + `tool_result.attachments`（claude/zcode 读写；dsh/codex 写端文本降级） | — | — |
 | 5 | step-start / step-finish / timeline 等 part | **决策（修订版）**：part 行原文全部保留在 `meta.zcode.rawParts`（探针证实 step-finish 携带每步 tokens/cost/reason，旧「零信息」判断对它不成立；step-start 确为空对象，保留无成本）；但**不投影进块流**——引擎 D2 回放层本就不把它们喂给模型上下文，投影只会伪造目标工具里不存在的对话内容 | — | zcode（已按此实现） |
@@ -79,13 +93,14 @@ messages[] 里**全量保留**（含被遮蔽消息）——无损原则；"哪�
 
 | 适配器 | 状态 |
 |--------|------|
-| dsh | ✅ 大部分已落地（meta.dsh 原生字段 / FileBlock 图像投影 + tool_result attachments / compaction 位置替换折叠 + 锚 / synthetic 判定）；⚠️ `toolCalls` 桶仍待适配（清单见下） |
+| dsh | ✅ **全部落地**（meta.dsh 消息级+会话级 / FileBlock 图像投影 + tool_result attachments / compaction 折叠 + 锚 / synthetic 判定 / toolCalls 桶读写） |
 | zcode | ✅ 已落地（toolCalls / signature / meta / FileBlock / compaction 锚，读写两端） |
 | claude | ✅ 已跟进 #1/#4（normalizeContent + claudeNativeBlock：签名、图像、attachments、is_error） |
-| pi / codex | ✅ 兼容——新桶均为可选字段，忽略即可；pi 已带 FileBlock 文本降级 |
+| pi | ✅ 兼容——新桶均为可选字段，忽略即可；pi 已带 FileBlock 文本降级 |
+| codex | ⚠️ **待重写**——现有实现按旧版格式假设（`instructions` 字段已不存在、`reasoning`/`web_search_call`/`turn_context`/`world_state`/`event_msg`/`compacted` 全部丢弃、无 `session_index` 写回），不能达标 100% 无损；按 `docs/agents/codex.md` 重做，消费上表 v3.1 槽位 |
 | opencode | ✅ 已落地（写端消费 compaction 桶 → 原生边界对；synthetic 默认丢弃 / `--keep-runtime-context` 惰性保留；TUI 工具/思考渲染契约对齐） |
 
-### dsh 待适配清单
+### dsh 待适配清单（✅ 已全部完成，留档）
 
-1. **读**：`tool/call` 类事件 + `tool/result` 事件 → 产出 `toolCalls` 记录（status 由结果事件存在性/isError 推导），使 dsh→zcode 等目标能拿到调用级精确状态，而不是只靠块词汇表回推。
-2. **写**：消费 `ir.toolCalls`（与现有 tool-call 块 + tool/result 事件的融合视角等价，桶里有额外状态时以桶为准）。
+1. ✅ **读**：`tool/call` 事件（log-only：`{turn, step, callId, name, arguments}`，arguments 为模型原始 JSON 串）→ `toolCalls` 记录。无结果事件 → `running`；有结果按块 `isError`/事件级 `error` 身份 → `completed`/`error`；原始 arguments 存 `metadata.dsh.arguments` 保真；事件级工具私有 `meta` 存 `metadata.dsh.resultMeta`。tool/call 事件不再进 unmapped（避免写回双发）。
+2. ✅ **写**：每条桶记录重发一个 `tool/call` 事件。running/pending 记录只有孤立 call 事件——正是 DSH 中断调用的原生形态；completed/error 由消息侧 tool/result 事件配对，凑齐原生三元组（assistant 块 + tool/call + tool/result）。

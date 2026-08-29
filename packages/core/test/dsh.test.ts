@@ -444,3 +444,79 @@ test('DSH ImageBlocks project to FileBlock (dsh-attachment url) and round-trip v
   const d = userEv.data as { content: Array<Record<string, unknown>> };
   assert.deepEqual(d.content[0], { type: 'image', attachment: imageAttachment });
 });
+
+test('toolCalls bucket: events typed on read, running without result, backfilled on result', () => {
+  const raw = [
+    {
+      type: 'user/message', seq: 0, time: 1, surfaceOp: 'append',
+      data: { id: 'u1', role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: 'run it' }] },
+    },
+    {
+      type: 'assistant/message', seq: 1, time: 2, surfaceOp: 'append',
+      data: { turn: 1, step: 1, message: { id: 'a1', role: 'assistant', source: { kind: 'model', provider: 'p', model: 'm' }, content: [{ type: 'tool-call', id: 'call_ok', name: 'read', arguments: '{"path":"a.txt"}' }, { type: 'tool-call', id: 'call_bad', name: 'write', arguments: '{"path":"b.txt"}' }, { type: 'tool-call', id: 'call_lost', name: 'bash', arguments: '"ls"' }] } },
+    },
+    // call events (log-only) — typed into the bucket, NOT unmapped
+    { type: 'tool/call', seq: 2, time: 3, data: { turn: 1, step: 1, callId: 'call_ok', name: 'read', arguments: '{"path":"a.txt"}' } },
+    { type: 'tool/call', seq: 3, time: 4, data: { turn: 1, step: 1, callId: 'call_bad', name: 'write', arguments: '{"path":"b.txt"}' } },
+    { type: 'tool/call', seq: 4, time: 5, data: { turn: 1, step: 1, callId: 'call_lost', name: 'bash', arguments: '"ls"' } },
+    // results for two of them; call_lost is interrupted (no result)
+    {
+      type: 'tool/result', seq: 5, time: 6, surfaceOp: 'append',
+      data: { turn: 1, step: 1, message: { role: 'user', source: { kind: 'tool', callId: 'call_ok' }, content: [{ type: 'tool-result', toolCallId: 'call_ok', content: [{ type: 'text', text: 'file body' }] }] } },
+    },
+    {
+      type: 'tool/result', seq: 6, time: 7, surfaceOp: 'append',
+      data: { turn: 1, step: 2, message: { role: 'user', source: { kind: 'tool', callId: 'call_bad' }, content: [{ type: 'tool-result', toolCallId: 'call_bad', content: [{ type: 'text', text: 'disk full' }], isError: true }] }, error: { name: 'WriteError', code: 'ENOSPC' } },
+    },
+  ];
+  const ir = buildIrFromEvents({ id: 's', createdAt: 1 }, raw as never);
+  assert.equal(ir.toolCalls?.length, 3);
+  const byCall = (id: string) => ir.toolCalls!.find((t) => t.callId === id)!;
+  // completed: output + time.end
+  const ok = byCall('call_ok');
+  assert.equal(ok.status, 'completed');
+  assert.equal(ok.output, 'file body');
+  assert.equal(ok.time?.start, 3);
+  assert.equal(ok.time?.end, 6);
+  assert.deepEqual(ok.input, { path: 'a.txt' });
+  // error: error text + native error identity
+  const bad = byCall('call_bad');
+  assert.equal(bad.status, 'error');
+  assert.equal(bad.error, 'disk full');
+  assert.deepEqual((bad.metadata as { dsh?: { errorIdentity?: unknown } }).dsh?.errorIdentity, { name: 'WriteError', code: 'ENOSPC' });
+  // interrupted call stays running — the only place it exists
+  assert.equal(byCall('call_lost').status, 'running');
+  // tool/call events are typed now — they must NOT also sit in unmapped
+  assert.ok(!(ir.unmappedEvents ?? []).some((e) => e.type === 'tool/call'));
+});
+
+test('toolCalls write-back: running record emits a lone tool/call; native round-trip preserves raw arguments', async () => {
+  const adapter = new DshAdapter();
+  const root = await tempRoot();
+  // foreign-origin IR: a running invocation that has no block projection
+  const ir = {
+    schemaVersion: 2 as const,
+    originTool: 'zcode' as const,
+    messages: [{ role: 'user' as const, content: [{ type: 'text' as const, text: 'q' }], timestamp: 10 }],
+    toolCalls: [{
+      callId: 'call_x',
+      tool: 'bash',
+      status: 'running' as const,
+      input: { command: 'sleep 100' },
+      metadata: { dsh: { turn: 2, step: 3, seq: 7, time: 12, arguments: '{"command":"sleep 100"}' } },
+    }],
+  };
+  const res = await adapter.write(ir as never, { root, targetCwd: 'D:\\proj-tc' });
+  const buf = await fs.readFile(res.paths[0]);
+  const plain = decompressSessionBuffer(buf);
+  const events = plain.split('\n').filter((l) => l.trim()).slice(1).map((l) => JSON.parse(l)) as DshEventLike[];
+  const calls = events.filter((e) => e.type === 'tool/call');
+  assert.equal(calls.length, 1);
+  assert.deepEqual(calls[0].data, { turn: 2, step: 3, callId: 'call_x', name: 'bash', arguments: '{"command":"sleep 100"}' });
+  assert.ok(!events.some((e) => e.type === 'tool/result' && (e.data as { message?: { source?: { callId?: string } } }).message?.source?.callId === 'call_x'));
+  // re-parse: the interrupted call comes back as a running bucket record
+  const back = await adapter.parse(res.sessionId, root);
+  assert.equal(back.toolCalls?.length, 1);
+  assert.equal(back.toolCalls![0].status, 'running');
+  assert.equal(back.toolCalls![0].callId, 'call_x');
+});
