@@ -248,7 +248,21 @@ test('zcode parse: tool part splits into tool_use + tool_result; synthetics stay
       // extensions bookkeeping
       const ext = ir.extensions as Record<string, unknown>;
       assert.equal((ext['zcode.syntheticMessages'] as unknown[]).length, 1);
-      assert.deepEqual(ext['zcode.pendingToolCalls'], ['pending:Bash:call_pend789']);
+      // typed lossless bucket: every invocation, all four states
+      const calls = ir.toolCalls ?? [];
+      assert.deepEqual(calls.map((t) => t.status), ['completed', 'error', 'pending']);
+      const completed = calls.find((t) => t.status === 'completed')!;
+      assert.equal(completed.tool, 'Bash');
+      assert.deepEqual(completed.input, { command: 'ls' });
+      assert.equal(completed.output, 'file.txt');
+      assert.equal(completed.title, 'Bash');
+      assert.ok(completed.time?.start);
+      assert.ok(completed.source && completed.source.messageSequence === 1);
+      const errored = calls.find((t) => t.status === 'error')!;
+      assert.equal(errored.error, 'File content exceeds maximum allowed size.');
+      const pending = calls.find((t) => t.status === 'pending')!;
+      assert.deepEqual(pending.input, { command: 'sleep' });
+      assert.equal(calls.every((t) => typeof t.callId === 'string' && t.callId.startsWith('call_')), true);
       const sigs = (ext['zcode.messageExtras'] as Record<string, { signatures?: Record<string, string> }>);
       assert.ok(Object.values(sigs).some((e) => e.signatures && Object.values(e.signatures).includes('sig-xyz')));
       // string-form input must have been decoded to an object on tool_use
@@ -491,6 +505,63 @@ test('zcode write: claude-style tool_result user rows fuse into tool parts; erro
       }
     } finally {
       await fs.rm(dstRoot, { recursive: true, force: true });
+    }
+  });
+});
+
+test('zcode four-state toolCalls survive write→read (pending/running re-injected)', async () => {
+  await withoutRealZcodeHome(async () => {
+    const fx = await makeFixture();
+    try {
+      fx.insertSession({ id: 'sess_4' });
+      const m0 = fx.insertMessage('sess_4', 0, userData('go'));
+      fx.insertPart(m0, 'sess_4', 0, { type: 'text', text: 'go' });
+      const m1 = fx.insertMessage('sess_4', 1, assistantData({ finish: 'tool-calls' }));
+      fx.insertPart(m1, 'sess_4', 0, {
+        type: 'tool', callID: 'call_done1', tool: 'Bash',
+        state: { status: 'completed', input: { command: 'ls' }, output: 'a.txt', title: 'Bash', metadata: { schemaVersion: 1, serialization: { truncated: false } }, time: { start: T0, end: T0 + 3 } },
+      });
+      fx.insertPart(m1, 'sess_4', 1, {
+        type: 'tool', callID: 'call_pending1', tool: 'Bash',
+        state: { status: 'pending', input: { command: 'sleep 100' } },
+      });
+      fx.insertPart(m1, 'sess_4', 2, {
+        type: 'tool', callID: 'call_running1', tool: 'Bash',
+        state: { status: 'running', input: { command: 'npm test' }, startedAt: T0 },
+      });
+
+      const adapter = new ZcodeAdapter();
+      const ir = await adapter.parse('sess_4', fx.root);
+      assert.deepEqual((ir.toolCalls ?? []).map((t) => t.status), ['completed', 'pending', 'running']);
+
+      // write → read round-trip through a fresh sandbox
+      const dstRoot = await fs.mkdtemp(join(tmpdir(), 'sm-zcode-dst3-'));
+      try {
+        const res = await adapter.write(ir, { root: dstRoot, targetCwd: 'D:\\proj' });
+        const back = await adapter.parse(res.sessionId, dstRoot);
+        assert.equal(back.toolCalls?.length, 3);
+        assert.deepEqual(back.toolCalls!.map((t) => t.status), ['completed', 'pending', 'running']);
+        const p = back.toolCalls!.find((t) => t.status === 'pending')!;
+        assert.deepEqual(p.input, { command: 'sleep 100' });
+        const r = back.toolCalls!.find((t) => t.status === 'running')!;
+        assert.deepEqual(r.input, { command: 'npm test' });
+        const c = back.toolCalls!.find((t) => t.status === 'completed')!;
+        assert.equal(c.output, 'a.txt');
+        assert.deepEqual(c.metadata, { schemaVersion: 1, serialization: { truncated: false } });
+        // the sandbox db itself carries the non-replayable parts again
+        const db = new DatabaseSync(join(dstRoot, 'cli', 'db', 'db.sqlite'));
+        try {
+          const statuses = (db.prepare("SELECT data FROM part WHERE session_id=? AND data LIKE '%\"type\":\"tool\"%'").all(res.sessionId) as Array<{ data: string }>)
+            .map((r2) => (JSON.parse(r2.data) as { state: { status: string } }).state.status).sort();
+          assert.deepEqual(statuses, ['completed', 'pending', 'running']);
+        } finally {
+          db.close();
+        }
+      } finally {
+        await fs.rm(dstRoot, { recursive: true, force: true });
+      }
+    } finally {
+      await fx.close();
     }
   });
 });

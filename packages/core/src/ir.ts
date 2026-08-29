@@ -43,6 +43,35 @@ export interface MigratedSidechain {
   agentType?: string;
   parentMessageId?: string;
   messages: MigratedMessage[];
+  /** typed lossless tool-invocation bucket, same contract as the session-level one */
+  toolCalls?: MigratedToolCall[];
+}
+
+/**
+ * Native tool-invocation record for stores that fuse call+result in ONE row
+ * (zcode `tool` part: pending/running/completed/error four-state). This is a
+ * typed lossless bucket alongside messages[]: messages carry the
+ * interoperable projection (tool_use/tool_result pairs for completed/error
+ * calls — replayable), the bucket carries every invocation in full native
+ * fidelity (including non-replayable pending/running states and part-level
+ * metadata/time). Adapters for stores without the concept simply ignore it.
+ */
+export type ToolCallStatus = 'pending' | 'running' | 'completed' | 'error';
+
+export interface MigratedToolCall {
+  callId: string;
+  tool: string;
+  status: ToolCallStatus;
+  input?: unknown;
+  /** completed state: fused output text */
+  output?: string;
+  /** error state: the error text */
+  error?: string;
+  title?: string;
+  metadata?: Record<string, unknown>;
+  time?: { start?: number; end?: number };
+  /** position in the source store, for exact part reconstruction on write-back */
+  source?: { messageId: string; messageSequence: number; partSequence: number };
 }
 
 /** Light metadata for a listed session (for GUI pickers / CLI --list). */
@@ -97,6 +126,8 @@ export interface MigratedSession {
   messages: MigratedMessage[];
   sidechains?: MigratedSidechain[];
   compaction?: Array<{ summary: string; tokensBefore?: number; retainedTail?: unknown[]; firstKeptId?: string }>;
+  /** Typed lossless tool-invocation bucket (zcode fused call+result parts). */
+  toolCalls?: MigratedToolCall[];
   branchSummaries?: Array<{ fromId: string; summary: string }>;
   /** Typed lossless domain state from DSH (goal/change). */
   goals?: MigratedGoal[];
@@ -134,6 +165,17 @@ function isValidSidechain(v: unknown): boolean {
   return true;
 }
 
+const TOOL_CALL_STATUSES = new Set(['pending', 'running', 'completed', 'error']);
+
+function isValidToolCall(v: unknown): boolean {
+  if (typeof v !== 'object' || v === null || Array.isArray(v)) return false;
+  const t = v as Record<string, unknown>;
+  if (typeof t.callId !== 'string' || !t.callId) return false;
+  if (typeof t.tool !== 'string' || !t.tool) return false;
+  if (typeof t.status !== 'string' || !TOOL_CALL_STATUSES.has(t.status)) return false;
+  return true;
+}
+
 export function validateSession(ir: MigratedSession): MigratedSession {
   if (!ir || typeof ir !== 'object') throw new Error('validateSession: ir is not an object');
   if (
@@ -150,6 +192,12 @@ export function validateSession(ir: MigratedSession): MigratedSession {
     if (!Array.isArray(ir.sidechains)) throw new Error('validateSession: sidechains must be an array');
     for (const [i, sc] of ir.sidechains.entries()) {
       if (!isValidSidechain(sc)) throw new Error(`validateSession: sidechains[${i}] is malformed`);
+    }
+  }
+  if (ir.toolCalls !== undefined) {
+    if (!Array.isArray(ir.toolCalls)) throw new Error('validateSession: toolCalls must be an array');
+    for (const [i, tc] of ir.toolCalls.entries()) {
+      if (!isValidToolCall(tc)) throw new Error(`validateSession: toolCalls[${i}] is malformed`);
     }
   }
   if (ir.model !== undefined) {

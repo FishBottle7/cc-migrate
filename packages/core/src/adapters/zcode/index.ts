@@ -18,7 +18,9 @@
  *  - a `tool` part fuses call+result in one row (4-state). It is split by
  *    `callID` into IR `tool_use` + following role:'tool' `tool_result`;
  *    `state.status==='error'` uses `state.error` (isError:true); pending/running
- *    states are skipped (would produce dangling tool_use on replay).
+ *    states are not projected into messages (a tool_use without result would
+ *    break provider replay) but ALL four states are recorded losslessly in the
+ *    IR `toolCalls` typed bucket and re-injected on write-back.
  *    `state.input` may be a JSON string (older engine writes) or an object.
  *  - `providerID` is the provider-registry id (uuid or `builtin:*`); the
  *    readable name lives in `~/.zcode/v2/config.json` `provider.<id>.name` —
@@ -66,6 +68,7 @@ import type {
   MigratedMessage,
   MigratedSession,
   MigratedSidechain,
+  MigratedToolCall,
   SessionMeta,
 } from '../../ir.js';
 import { validateSession } from '../../ir.js';
@@ -527,6 +530,7 @@ interface ExpandedMessage {
   synthetic?: { id: string; sequence: number | null; data: Row };
   compaction?: { summary: string; tokensBefore?: number; raw: Row };
   compactionParts?: Row[];
+  toolCalls?: MigratedToolCall[];
   droppedToolState?: string;
 }
 
@@ -552,7 +556,7 @@ async function parseFromDb(db: DbHandle, sessionId: string, root?: string): Prom
   const compactionParts: Row[] = [];        // raw compaction part rows
   const compactionSummaries: Row[] = [];    // raw summary user-message rows (diffs etc.)
   const summaryCandidates: Array<{ id: string; summary: string }> = [];
-  const pendingToolStates: string[] = [];
+  const toolCalls: MigratedToolCall[] = [];
   let lastModel: { providerID?: string; modelID?: string; variant?: string } | undefined;
 
   const ctx2: ExpandCtx = { ...ctx, providerIdMap };
@@ -562,7 +566,7 @@ async function parseFromDb(db: DbHandle, sessionId: string, root?: string): Prom
     irMessages.push(...exp.ir);
     if (exp.extras && exp.extrasKey) extrasMap[exp.extrasKey] = exp.extras;
     if (exp.synthetic) syntheticMessages.push(exp.synthetic);
-    if (exp.droppedToolState) pendingToolStates.push(exp.droppedToolState);
+    if (exp.toolCalls) toolCalls.push(...exp.toolCalls);
     if (exp.compactionParts) compactionParts.push(...exp.compactionParts);
     if (exp.compaction) {
       compactionSummaries.push(exp.compaction.raw);
@@ -607,6 +611,7 @@ async function parseFromDb(db: DbHandle, sessionId: string, root?: string): Prom
   }
   if (sidechains.length) ir.sidechains = sidechains;
   if (compactions.length) ir.compaction = compactions;
+  if (toolCalls.length) ir.toolCalls = toolCalls;
 
   // extensions (namespaced like 'dsh.headerRaw') — lossless buckets the IR has no slots for
   const extensions: Record<string, unknown> = {
@@ -630,7 +635,6 @@ async function parseFromDb(db: DbHandle, sessionId: string, root?: string): Prom
   if (syntheticMessages.length) extensions['zcode.syntheticMessages'] = syntheticMessages;
   if (compactionParts.length) extensions['zcode.compactions'] = compactionParts;
   if (compactionSummaries.length) extensions['zcode.compactionSummaries'] = compactionSummaries;
-  if (pendingToolStates.length) extensions['zcode.pendingToolCalls'] = pendingToolStates;
   if (trimmed.pruned.length) {
     extensions['zcode.prunedMessages'] = trimmed.pruned.map((m) => ({ id: m.id, sequence: m.sequence, data: parseJsonObject(m.data) }));
   }
@@ -791,8 +795,10 @@ function expandMessageRow(m: ZcodeMessageRow, parts: ZcodePartRow[], ctx: Expand
 
   if (data.role === 'assistant') {
     const d = data as ZcodeAssistantData;
-    const { blocks, toolResults, extras, compactionParts, droppedToolState } = assistantPartsToBlocks(parts, d);
-    if (!blocks.length && !compactionParts) return { ir: [], extras, droppedToolState };
+    const { blocks, toolResults, extras, compactionParts, toolCalls, droppedToolState } = assistantPartsToBlocks(
+      parts, d, { messageId: m.id, messageSequence: m.sequence ?? -1 },
+    );
+    if (!blocks.length && !compactionParts) return { ir: [], extras, toolCalls, droppedToolState };
     const msg: MigratedMessage = { role: 'assistant', content: blocks, seq: m.sequence ?? undefined };
     if (ts !== undefined) msg.timestamp = ts;
     if (d.modelID) msg.model = String(d.modelID);
@@ -800,7 +806,7 @@ function expandMessageRow(m: ZcodeMessageRow, parts: ZcodePartRow[], ctx: Expand
     if (d.finish) msg.stopReason = String(d.finish);
     const out: MigratedMessage[] = blocks.length ? [msg] : [];
     if (toolResults.length) out.push({ role: 'tool', content: toolResults, seq: m.sequence ?? undefined, timestamp: ts });
-    return { ir: out, extrasKey: m.id, extras, compactionParts, droppedToolState };
+    return { ir: out, extrasKey: m.id, extras, compactionParts, toolCalls, droppedToolState };
   }
 
   // unknown role — keep losslessly as synthetic
@@ -853,17 +859,21 @@ function userPartsToBlocks(parts: ZcodePartRow[]): ContentBlock[] {
  * assistant message parts → IR blocks. `tool` parts split by callID into a
  * `tool_use` (kept on the assistant) + `tool_result` blocks (emitted as the
  * following role:'tool' IR message). completed → output; error →
- * state.error with isError:true; pending/running are skipped entirely (a
- * tool_use without result would break provider replay after migration).
+ * state.error with isError:true; pending/running are NOT projected into
+ * messages (a tool_use without result would break provider replay after
+ * migration) but every invocation — all four states — is recorded losslessly
+ * in the `toolCalls` bucket with its source position.
  */
 function assistantPartsToBlocks(
   parts: ZcodePartRow[],
   d: ZcodeAssistantData,
-): { blocks: ContentBlock[]; toolResults: ContentBlock[]; extras: MessageExtras; compactionParts?: Row[]; droppedToolState?: string } {
+  source: { messageId: string; messageSequence: number },
+): { blocks: ContentBlock[]; toolResults: ContentBlock[]; extras: MessageExtras; compactionParts?: Row[]; toolCalls?: MigratedToolCall[]; droppedToolState?: string } {
   const blocks: ContentBlock[] = [];
   const toolResults: ContentBlock[] = [];
   const extras: MessageExtras = {};
   let compactionParts: Row[] | undefined;
+  let toolCalls: MigratedToolCall[] | undefined;
   let droppedToolState: string | undefined;
 
   if (d.agent) extras.agent = d.agent;
@@ -900,22 +910,32 @@ function assistantPartsToBlocks(
         const callId = String(tool.callID ?? '');
         const name = String(tool.tool ?? 'tool');
         const state = tool.state ?? {};
-        if (state.status === 'pending' || state.status === 'running') {
-          droppedToolState = `${state.status}:${name}:${callId}`;
+        const status = state.status;
+        // typed lossless record for EVERY invocation, whatever its state
+        if (callId) {
+          toolCalls = toolCalls ?? [];
+          toolCalls.push({
+            callId,
+            tool: name,
+            status: status === 'running' || status === 'pending' || status === 'error' ? status : 'completed',
+            ...(state.input !== undefined ? { input: tryParse(state.input) } : {}),
+            ...(status === 'error' ? { error: String(state.error ?? 'tool call failed') } : { output: stringOutput(state.output) }),
+            ...(state.title ? { title: String(state.title) } : {}),
+            ...(state.metadata && Object.keys(state.metadata).length ? { metadata: state.metadata } : {}),
+            ...(state.time ? { time: state.time as { start?: number; end?: number } } : {}),
+            source: { messageId: source.messageId, messageSequence: source.messageSequence, partSequence: p.sequence ?? -1 },
+          });
+        }
+        if (status === 'pending' || status === 'running') {
+          droppedToolState = `${status}:${name}:${callId}`;
           break;
         }
         if (!callId) break;
         blocks.push({ type: 'tool_use', id: callId, name, input: tryParse(state.input) });
-        if (state.status === 'error') {
+        if (status === 'error') {
           toolResults.push({ type: 'tool_result', toolUseId: callId, content: String(state.error ?? 'tool call failed'), isError: true });
         } else {
           toolResults.push({ type: 'tool_result', toolUseId: callId, content: stringOutput(state.output), isError: false });
-        }
-        // keep Agent-call metadata (childSessionId/agentId when the engine wrote it)
-        const md = parseJsonObject(state.metadata);
-        if (isSubagentToolName(name) && Object.keys(md).length) {
-          extras.rawParts = extras.rawParts ?? [];
-          extras.rawParts.push({ kind: 'agentToolMetadata', callID: callId, metadata: md });
         }
         break;
       }
@@ -942,7 +962,7 @@ function assistantPartsToBlocks(
         break;
     }
   }
-  return { blocks, toolResults, extras, compactionParts, droppedToolState };
+  return { blocks, toolResults, extras, compactionParts, toolCalls, droppedToolState };
 }
 
 function stringOutput(v: unknown): string {
@@ -993,11 +1013,13 @@ async function buildSidechains(
     const trimmed = o0Trim(childMessages, childRevert);
 
     const irMessages: MigratedMessage[] = [];
+    const childToolCalls: MigratedToolCall[] = [];
     let agentType: string | undefined;
     for (const m of trimmed.messages) {
       const parts = childParts.get(m.id) ?? [];
       const exp = expandMessageRow(m, parts, ctx);
       irMessages.push(...exp.ir);
+      if (exp.toolCalls) childToolCalls.push(...exp.toolCalls);
       if (!agentType) {
         const d = parseJsonObject(m.data) as { agent?: string };
         if (d.agent) agentType = agentTypeOf(d.agent);
@@ -1038,6 +1060,7 @@ async function buildSidechains(
       ...(agentType ? { agentType } : {}),
       ...(parentCallId ? { parentMessageId: parentCallId } : {}),
       messages: irMessages,
+      ...(childToolCalls.length ? { toolCalls: childToolCalls } : {}),
     });
   }
 
@@ -1220,7 +1243,7 @@ function writeToDb(db: DbHandle, ir: MigratedSession, newId: string, cwd: string
     titleSource: 'first_input',
   });
   paths.push(`session:${newId}`);
-  writeMessages(db, ir.messages, newId, ctx, createdAt, 'zcode-agent');
+  writeMessages(db, ir.messages, newId, ctx, createdAt, 'zcode-agent', ir.toolCalls);
 
   // pass 3: sidechains → subagent_child sessions (+ parent_id, engine's
   // Cl('subagent_'+agentId) id convention).
@@ -1238,7 +1261,7 @@ function writeToDb(db: DbHandle, ir: MigratedSession, newId: string, cwd: string
       titleSource: 'first_input',
     });
     paths.push(`session:${slot.childId}`);
-    writeMessages(db, sc.messages, slot.childId, ctx, createdAt, childAgent);
+    writeMessages(db, sc.messages, slot.childId, ctx, createdAt, childAgent, sc.toolCalls);
   }
   return paths;
 }
@@ -1337,9 +1360,12 @@ function insertSessionRow(
 /**
  * IR messages → native message/part rows. Ordering is positional (message
  * sequence 0..N-1, part sequence per message 0..M); tool_use/tool_result
- * blocks are fused back into single 4-state tool parts; IR system messages
- * become hidden system_reminder user rows; role:'tool' messages carry no row
- * of their own (results live in the tool parts).
+ * blocks are fused back into single 4-state tool parts — a matching
+ * `toolCalls` record (typed lossless bucket) restores the exact native state
+ * (status/title/metadata/time) and re-injects pending/running invocations
+ * that have no replayable block; IR system messages become hidden
+ * system_reminder user rows; role:'tool' messages carry no row of their own
+ * (results live in the tool parts).
  */
 function writeMessages(
   db: DbHandle,
@@ -1348,10 +1374,14 @@ function writeMessages(
   ctx: WriteContext,
   baseTime: number,
   defaultAgent: string,
+  toolCalls?: MigratedToolCall[],
 ): void {
   let sequence = 0;
   let prevId: string | null = null;
   let clock = baseTime;
+  const recordByCallId = new Map((toolCalls ?? []).map((t) => [t.callId, t]));
+  // pending/running records keyed by their source message sequence for re-injection
+  const nonReplayable = (toolCalls ?? []).filter((t) => t.status === 'pending' || t.status === 'running');
 
   for (const msg of messages) {
     clock += 1;
@@ -1400,16 +1430,17 @@ function writeMessages(
         // engine's global sidecar index cannot re-link them to the source child
         const callId = isSubagentToolName(b.name) ? remapCallId(ctx, b.id)
           : (looksLikeCallId(b.id) ? b.id : remapCallId(ctx, b.id));
+        const record = recordByCallId.get(b.id) ?? recordByCallId.get(callId);
         const result = ctx.results.get(b.id) ?? ctx.results.get(callId);
         const state: Row = {
-          status: result?.isError ? 'error' : 'completed',
-          input: (b.input && typeof b.input === 'object') ? b.input : tryParse(b.input),
-          title: b.name,
-          time: { start: ts, end: ts + 1 },
+          status: record?.status ?? (result?.isError ? 'error' : 'completed'),
+          input: record?.input !== undefined ? record.input : ((b.input && typeof b.input === 'object') ? b.input : tryParse(b.input)),
+          title: record?.title ?? b.name,
+          time: record?.time ?? { start: ts, end: ts + 1 },
         };
-        if (result?.isError) state.error = result.content;
-        else state.output = result?.content ?? '';
-        const metadata: Row = { schemaVersion: 1 };
+        if (state.status === 'error') state.error = record?.error ?? result?.content ?? 'tool call failed';
+        else state.output = record?.output ?? result?.content ?? '';
+        const metadata: Row = { schemaVersion: 1, ...(record?.metadata ?? {}) };
         if (isSubagentToolName(b.name)) {
           const slot = ctx.subagentSlots.find((s) => s.toolUseId === callId);
           if (slot) {
@@ -1430,6 +1461,22 @@ function writeMessages(
         parts.push({ data: { type: 'tool', callID: callId, tool: b.name, state }, ts });
       }
       // tool_result blocks on the assistant row are folded into ctx.results already
+    }
+    // re-inject pending/running invocations recorded in the lossless bucket —
+    // they have no replayable tool_use block, matched back by source sequence
+    if (msg.seq !== undefined && nonReplayable.length) {
+      for (const rec of nonReplayable
+        .filter((t) => t.source?.messageSequence === msg.seq)
+        .sort((a, b) => (a.source?.partSequence ?? 0) - (b.source?.partSequence ?? 0))) {
+        const state: Row = {
+          status: rec.status,
+          ...(rec.input !== undefined ? { input: rec.input } : {}),
+          ...(rec.title ? { title: rec.title } : {}),
+          ...(rec.time ? { time: rec.time } : {}),
+          metadata: { schemaVersion: 1, ...(rec.metadata ?? {}) },
+        };
+        parts.push({ data: { type: 'tool', callID: rec.callId, tool: rec.tool, state }, ts });
+      }
     }
     if (!parts.length) continue; // nothing replayable in this message
 
