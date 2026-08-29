@@ -157,11 +157,14 @@ export async function ensureWorkspaceRegistration(
 /**
  * Best-effort repair: scan `sessionsRoot` for session artifacts whose
  * header `cwd` is not yet accounted, and register each missing one.
+ * Also prunes dangling registrations (sessionIds whose artifact directory
+ * no longer exists anywhere under `sessionsRoot`) so the GUI list never
+ * offers entries that cannot load.
  * Useful for the "exported filename not visible after refresh" diagnosis.
  */
 export async function reconcileWorkspaces(
   sessionsRoot: string,
-): Promise<{ scanned: number; registered: number; errors: string[] }> {
+): Promise<{ scanned: number; registered: number; pruned: number; errors: string[] }> {
   const { readdir, readFile } = await import('node:fs/promises');
   const { join: joinPath } = await import('node:path');
   const { decompressSessionBuffer } = await import('./format.js');
@@ -170,29 +173,18 @@ export async function reconcileWorkspaces(
   try {
     projects = await readdir(sessionsRoot);
   } catch (e) {
-    return { scanned: 0, registered: 0, errors: [String((e as Error).message)] };
+    return { scanned: 0, registered: 0, pruned: 0, errors: [String((e as Error).message)] };
   }
 
   let scanned = 0;
   let registered = 0;
+  let pruned = 0;
   const errors: string[] = [];
 
-  // Snapshot workspace.json once to collect accounted ids, then register
-  // incrementally (each call re-reads the file so concurrent writers win).
-  const wsPath = workspaceJsonPath(sessionsRoot);
-  let accounted = new Set<string>();
-  if (wsPath) {
-    try {
-      const raw = await readFile(wsPath, 'utf8');
-      const doc = JSON.parse(raw);
-      for (const rec of Object.values<any>(doc.tables?.workspaces ?? {})) {
-        for (const sid of rec.sessionIds ?? []) accounted.add(sid);
-      }
-    } catch {
-      // best-effort
-    }
-  }
-
+  // Collect the on-disk session id set across every project dir. A
+  // registration is dangling when its artifact directory is gone.
+  const onDisk = new Set<string>();
+  const projectDirs: Array<{ proj: string; sessDirs: string[] }> = [];
   for (const proj of projects) {
     if (!(proj.startsWith('--') && proj.endsWith('--'))) continue;
     let sessDirs: string[];
@@ -201,6 +193,36 @@ export async function reconcileWorkspaces(
     } catch {
       continue;
     }
+    projectDirs.push({ proj, sessDirs });
+    for (const sid of sessDirs) onDisk.add(sid);
+  }
+
+  // Prune dangling registrations first, using one read-modify-write cycle.
+  const wsPath = workspaceJsonPath(sessionsRoot);
+  let accounted = new Set<string>();
+  if (wsPath) {
+    try {
+      const raw = await readFile(wsPath, 'utf8');
+      const doc = JSON.parse(raw) as { tables?: { workspaces?: Record<string, { sessionIds?: string[] }> } };
+      let dirty = false;
+      for (const rec of Object.values<any>(doc.tables?.workspaces ?? {})) {
+        const ids = rec.sessionIds;
+        if (!Array.isArray(ids)) continue;
+        const kept = ids.filter((sid) => onDisk.has(sid));
+        if (kept.length !== ids.length) {
+          pruned += ids.length - kept.length;
+          rec.sessionIds = kept;
+          dirty = true;
+        }
+        for (const sid of kept) accounted.add(sid);
+      }
+      if (dirty) await writeAtomic(wsPath, JSON.stringify(doc, null, '\t') + '\n');
+    } catch {
+      // best-effort
+    }
+  }
+
+  for (const { proj, sessDirs } of projectDirs) {
     for (const sid of sessDirs) {
       scanned++;
       if (accounted.has(sid)) continue;
@@ -223,5 +245,5 @@ export async function reconcileWorkspaces(
       }
     }
   }
-  return { scanned, registered, errors };
+  return { scanned, registered, pruned, errors };
 }
