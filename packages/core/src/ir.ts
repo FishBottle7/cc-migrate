@@ -5,6 +5,15 @@
  * session and writes an IR session back. This is the sole N-adapter pivot
  * (not N² pairwise converters).
  *
+ * Design consensus (docs/ir-protocol.md — binding for all adapters):
+ *  - the IR is a LIVING protocol: when a source tool carries a concept the IR
+ *    has no slot for, extending the IR (typed bucket / optional field) is the
+ *    sanctioned move — never silent drops, extensions strings are a stopgap;
+ *  - every piece of information must attach unambiguously to the entity it
+ *    describes (session / message / block / single tool invocation) — no
+ *    side-table keying by source ids that breaks under filter/reorder;
+ *  - extensions are additive and optional; old adapters ignore new buckets.
+ *
  * v3 breaking changes vs v2:
  *  - schemaVersion: 1 -> 2
  *  - Adds typed lossless buckets: goals / planModes / todos / unmappedEvents

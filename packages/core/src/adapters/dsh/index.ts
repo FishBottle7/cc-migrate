@@ -8,6 +8,13 @@
  *
  * This adapter does NOT depend on `@deepseek-ai/dsh` internals — it re-derives
  * enough of the format to read/write resumable sessions using only `node:zlib`.
+ *
+ * TODO(ir-protocol): this adapter predates the toolCalls typed bucket and the
+ * per-message association rules — see docs/ir-protocol.md「dsh 待适配清单」:
+ *  1. read: emit MigratedToolCall records from tool-call + tool-result events
+ *  2. write: consume ir.toolCalls (state wins over the block-level view)
+ *  3. after MigratedMessage.meta lands: move message-level fields out of the
+ *     'dsh.headerRaw' side-table into per-message association
  */
 
 import { promises as fs } from 'node:fs';
