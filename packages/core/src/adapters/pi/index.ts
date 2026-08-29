@@ -362,7 +362,9 @@ function piMessageFromMigrated(msg: MigratedMessage): Record<string, unknown> {
     if (b.type === 'text') return { type: 'text', text: b.text };
     if (b.type === 'thinking') return { type: 'thinking', thinking: b.thinking };
     if (b.type === 'tool_use') return { type: 'toolCall', id: b.id, name: b.name, arguments: b.input };
-    return { type: 'toolResult', toolCallId: b.toolUseId, content: b.content, isError: b.isError ?? false };
+    if (b.type === 'tool_result') return { type: 'toolResult', toolCallId: b.toolUseId, content: b.content, isError: b.isError ?? false };
+    // FileBlock: no tool-result semantics — render as a text placeholder.
+    return { type: 'text', text: `[file: ${b.filename ?? b.url ?? b.mediaType ?? 'attachment'}]` };
   });
   const out: Record<string, unknown> = {
     role,

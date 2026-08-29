@@ -480,6 +480,95 @@ function normalizeOutputToMessages(output: unknown): MigratedMessage[] {
   return [];
 }
 
+/* ------------------------------------------------------------------ */
+/* Tool mapping: DSH (Claude-style) -> OpenCode                        */
+/* ------------------------------------------------------------------ */
+
+/**
+ * The TUI dispatches tool parts by EXACT name (packages/tui
+ * routes/session/index.tsx `toolDisplays`) and renders per-tool components
+ * that read OpenCode's input keys. DSH uses Claude-style names/keys
+ * ("Read" + `file_path`), so without this mapping every read/write/edit part
+ * renders as a pending placeholder ("~ Reading file...").
+ */
+const OPENCODE_TOOL_NAMES = new Set([
+  'bash', 'glob', 'read', 'grep', 'webfetch', 'websearch', 'write', 'edit',
+  'task', 'apply_patch', 'todowrite', 'question', 'skill', 'execute',
+]);
+const TOOL_NAME_MAP: Record<string, string> = {
+  read: 'read', write: 'write', edit: 'edit', multiedit: 'edit', bash: 'bash',
+  grep: 'grep', glob: 'glob', webfetch: 'webfetch', websearch: 'websearch',
+  task: 'task', todowrite: 'todowrite', todo_write: 'todowrite', todoread: 'todoread',
+  notebookedit: 'edit', applypatch: 'apply_patch',
+};
+
+/** Input key renames per tool (Claude-style -> OpenCode-style). */
+const FILE_PATH_TOOLS = new Set(['read', 'write', 'edit']);
+
+function mapToolPart(tool: string, input: Record<string, unknown>, output: string | undefined): {
+  tool: string;
+  input: Record<string, unknown>;
+  metadata: Record<string, unknown>;
+  title: string;
+} {
+  const lower = tool.toLowerCase();
+  const name = TOOL_NAME_MAP[lower] ?? (OPENCODE_TOOL_NAMES.has(lower) ? lower : lower);
+
+  const mapped: Record<string, unknown> = { ...input };
+  if (FILE_PATH_TOOLS.has(name)) {
+    if (typeof mapped.file_path === 'string') { mapped.filePath = mapped.file_path; delete mapped.file_path; }
+    else if (typeof mapped.path === 'string' && name === 'read' && typeof mapped.filePath !== 'string') {
+      // some DSH variants pass `path`
+      mapped.filePath = mapped.path;
+    }
+  }
+
+  const str = (v: unknown): string => (typeof v === 'string' ? v : v === undefined || v === null ? '' : String(v));
+  const filePath = str(mapped.filePath ?? mapped.file_path);
+
+  // Per-tool state.title (production convention) + metadata the renderers use.
+  let title = name;
+  const metadata: Record<string, unknown> = {};
+  switch (name) {
+    case 'read':
+      title = filePath;
+      if (filePath) metadata.loaded = [filePath];
+      break;
+    case 'write':
+    case 'edit':
+      title = filePath;
+      break;
+    case 'bash':
+      title = str(mapped.command).slice(0, 200);
+      // The TUI renders the output block from metadata.output.
+      if (output) metadata.output = output;
+      break;
+    case 'grep':
+    case 'glob':
+      title = str(mapped.pattern);
+      break;
+    case 'webfetch':
+      title = str(mapped.url);
+      break;
+    case 'websearch':
+      title = str(mapped.query);
+      break;
+    case 'task':
+      title = str(mapped.description);
+      break;
+    case 'todowrite': {
+      // TodoWrite renders the list block from metadata.todos ({status, content}).
+      title = '# Todos';
+      if (Array.isArray(mapped.todos)) metadata.todos = mapped.todos;
+      break;
+    }
+    default:
+      title = name;
+  }
+  if (!title) title = name;
+  return { tool: name, input: mapped, metadata, title };
+}
+
 /**
  * Write an IR session into the REAL v1.18 schema: project + session +
  * message + part. No silent error swallowing — a failed insert throws.
@@ -536,17 +625,17 @@ function writeToDb(db: DbHandle, ir: MigratedSession, newId: string, cwd: string
   // (verified against real v1.18 rows — assistant messages never chain to
   // another assistant). A linear chain renders as a blank session.
   let currentUserId: string | undefined;
-  let partSeq = 0;
-  // Time-ordered ids (hex ms prefix + random tail), mirroring the app's
-  // monotonic id convention so string order matches creation order.
+  // Part ids must sort in insertion order: MessageV2.hydrate() orders parts by
+  // id STRING, so a per-message zero-padded sequence suffix keeps step-start
+  // first and step-finish last.
+  let partCounter = 0;
   const idRand = (n: number): string => randomUUID().replace(/-/g, '').slice(0, n);
   const newMsgId = (time: number): string => `msg_${time.toString(16).padStart(10, '0')}${idRand(14)}`;
-  const newPartId = (time: number): string => `prt_${time.toString(16).padStart(10, '0')}${idRand(14)}`;
+  const newPartId = (time: number): string => `prt_${time.toString(16).padStart(10, '0')}${String(partCounter++).padStart(4, '0')}${idRand(10)}`;
   const insertPart = (messageId: string, data: Record<string, unknown>, time: number): void => {
     db.prepare('INSERT INTO part (id, message_id, session_id, time_created, time_updated, data) VALUES (?, ?, ?, ?, ?, ?)').run(
       newPartId(time), messageId, newId, time, now, JSON.stringify(data),
     );
-    partSeq++;
   };
 
   ir.messages.forEach((m, idx) => {
@@ -612,18 +701,24 @@ function writeToDb(db: DbHandle, ir: MigratedSession, newId: string, cwd: string
     );
     insertPart(id, { type: 'step-start', snapshot }, time);
     for (const b of m.content) {
-      if (b.type === 'thinking') insertPart(id, { type: 'reasoning', text: b.thinking }, time);
+      if (b.type === 'thinking') insertPart(id, { type: 'reasoning', text: b.thinking, time: { start: time } }, time);
       else if (b.type === 'text') insertPart(id, { type: 'text', text: b.text }, time);
       else if (b.type === 'tool_use') {
         const output = pendingToolOutput.get(b.id);
+        const mappedTool = mapToolPart(b.name, (b.input ?? {}) as Record<string, unknown>, output);
+        // ToolStateCompleted schema: output, title and metadata are REQUIRED
+        // fields; a part missing any of them fails the API part union and the
+        // conversation renders blank.
         insertPart(id, {
           type: 'tool',
-          tool: b.name,
+          tool: mappedTool.tool,
           callID: b.id,
           state: {
             status: 'completed',
-            input: (b.input ?? {}) as Record<string, unknown>,
-            ...(output !== undefined ? { output } : {}),
+            title: mappedTool.title,
+            input: mappedTool.input,
+            output: output ?? '',
+            metadata: mappedTool.metadata,
             time: { start: time, end: time },
           },
         }, time);
@@ -637,7 +732,6 @@ function writeToDb(db: DbHandle, ir: MigratedSession, newId: string, cwd: string
       cost: 0,
     }, time);
   });
-  void partSeq;
   return newId;
 }
 
