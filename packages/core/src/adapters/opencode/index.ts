@@ -701,7 +701,7 @@ function writeToDb(db: DbHandle, ir: MigratedSession, newId: string, cwd: string
     );
     insertPart(id, { type: 'step-start', snapshot }, time);
     for (const b of m.content) {
-      if (b.type === 'thinking') insertPart(id, { type: 'reasoning', text: b.thinking, time: { start: time } }, time);
+      if (b.type === 'thinking') insertPart(id, { type: 'reasoning', text: b.thinking, time: { start: time, end: time } }, time);
       else if (b.type === 'text') insertPart(id, { type: 'text', text: b.text }, time);
       else if (b.type === 'tool_use') {
         const output = pendingToolOutput.get(b.id);
