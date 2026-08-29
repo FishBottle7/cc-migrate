@@ -701,7 +701,14 @@ function writeToDb(db: DbHandle, ir: MigratedSession, newId: string, cwd: string
     );
     insertPart(id, { type: 'step-start', snapshot }, time);
     for (const b of m.content) {
-      if (b.type === 'thinking') insertPart(id, { type: 'reasoning', text: b.thinking, time: { start: time, end: time } }, time);
+      if (b.type === 'thinking') {
+        // The IR does not carry per-block thinking durations (DSH streams
+        // reasoning chunks without per-chunk wall-clock). Synthesize a
+        // plausible span from text length (~200 chars/s streaming rate) so
+        // the TUI shows "Thought · Ns" instead of 0s.
+        const durMs = Math.min(600_000, Math.max(1_000, Math.round(b.thinking.length / 200) * 1000));
+        insertPart(id, { type: 'reasoning', text: b.thinking, time: { start: time, end: time + durMs } }, time);
+      }
       else if (b.type === 'text') insertPart(id, { type: 'text', text: b.text }, time);
       else if (b.type === 'tool_use') {
         const output = pendingToolOutput.get(b.id);
