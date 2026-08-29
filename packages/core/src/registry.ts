@@ -48,6 +48,16 @@ export interface WriteOptions {
    * context, and replaying the source's would fight it.
    */
   keepSynthetic?: boolean;
+  /**
+   * System-prompt source choice (docs/agents/codex.md §7.2 选择规范). There is
+   * ONE canonical system-prompt slot per target; never stack the source
+   * prompt on top of the target's own.
+   *  - `'source'` (default): carry `ir.systemPrompt` into the target's native
+   *    canonical slot when it has one (codex `session_meta.base_instructions`
+   *    {provenance: custom}). Targets without a channel ignore it.
+   *  - `'target'`: write nothing — the target opens with its own prompt.
+   */
+  systemPromptSource?: 'source' | 'target';
 }
 
 export interface WriteResult {
