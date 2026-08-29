@@ -179,7 +179,7 @@ export class OpenCodeAdapter implements Adapter {
     const root = opts?.root;
     const rootExplicit = !!(root && root.trim());
     const targetCwd = opts?.targetCwd ?? ir.cwd ?? '';
-    const newId = opts?.sessionId ?? `sess_${randomUUID().replace(/-/g, '').slice(0, 16)}`;
+    const newId = opts?.sessionId ?? `ses_${randomUUID().replace(/-/g, '').slice(0, 24)}`;
     const flatten = opts?.flatten ?? true;
 
     const dbPath = resolveDbPath(root);
@@ -525,13 +525,20 @@ function writeToDb(db: DbHandle, ir: MigratedSession, newId: string, cwd: string
     }
   });
 
-  let prevId: string | undefined;
+  // The TUI rebuilds the conversation as a TREE rooted at each user message:
+  // every assistant step of a turn carries parentID = that turn's user id
+  // (verified against real v1.18 rows — assistant messages never chain to
+  // another assistant). A linear chain renders as a blank session.
+  let currentUserId: string | undefined;
   let partSeq = 0;
-  const newMsgId = () => `msg_${randomUUID().replace(/-/g, '').slice(0, 24)}`;
-  const newPartId = () => `prt_${randomUUID().replace(/-/g, '').slice(0, 24)}`;
+  // Time-ordered ids (hex ms prefix + random tail), mirroring the app's
+  // monotonic id convention so string order matches creation order.
+  const idRand = (n: number): string => randomUUID().replace(/-/g, '').slice(0, n);
+  const newMsgId = (time: number): string => `msg_${time.toString(16).padStart(10, '0')}${idRand(14)}`;
+  const newPartId = (time: number): string => `prt_${time.toString(16).padStart(10, '0')}${idRand(14)}`;
   const insertPart = (messageId: string, data: Record<string, unknown>, time: number): void => {
     db.prepare('INSERT INTO part (id, message_id, session_id, time_created, time_updated, data) VALUES (?, ?, ?, ?, ?, ?)').run(
-      newPartId(), messageId, newId, time, now, JSON.stringify(data),
+      newPartId(time), messageId, newId, time, now, JSON.stringify(data),
     );
     partSeq++;
   };
@@ -539,8 +546,8 @@ function writeToDb(db: DbHandle, ir: MigratedSession, newId: string, cwd: string
   ir.messages.forEach((m, idx) => {
     if (consumedToolMsgs.has(idx) && m.role === 'tool') return; // merged into tool part
     if (m.role === 'system') return; // system prompts are opencode config, not chat rows
-    const id = newMsgId();
     const time = m.timestamp ?? now;
+    const id = newMsgId(time);
 
     if (m.role === 'user') {
       const data: Record<string, unknown> = {
@@ -556,7 +563,7 @@ function writeToDb(db: DbHandle, ir: MigratedSession, newId: string, cwd: string
       for (const b of m.content) {
         if (b.type === 'text') insertPart(id, { type: 'text', text: b.text }, time);
       }
-      prevId = id;
+      currentUserId = id;
       return;
     }
 
@@ -576,13 +583,13 @@ function writeToDb(db: DbHandle, ir: MigratedSession, newId: string, cwd: string
         id, newId, time, now, JSON.stringify(data),
       );
       insertPart(id, { type: 'text', text: `[tool result] ${text}` }, time);
-      prevId = id;
       return;
     }
 
     // assistant
+    const hasToolCall = m.content.some((b) => b.type === 'tool_use');
     const data: Record<string, unknown> = {
-      ...(prevId ? { parentID: prevId } : {}),
+      ...(currentUserId ? { parentID: currentUserId } : {}),
       role: 'assistant',
       mode: 'build',
       agent: 'build',
@@ -592,6 +599,7 @@ function writeToDb(db: DbHandle, ir: MigratedSession, newId: string, cwd: string
       modelID,
       providerID,
       time: { created: time, completed: time },
+      finish: hasToolCall ? 'tool-calls' : 'stop',
     };
     db.prepare('INSERT INTO message (id, session_id, time_created, time_updated, data) VALUES (?, ?, ?, ?, ?)').run(
       id, newId, time, now, JSON.stringify(data),
@@ -614,7 +622,6 @@ function writeToDb(db: DbHandle, ir: MigratedSession, newId: string, cwd: string
         }, time);
       }
     }
-    prevId = id;
   });
   void partSeq;
   return newId;
