@@ -98,7 +98,7 @@ async function main(argv: string[]) {
         const root = (flags.root ?? flags.dstRoot ?? (defaultDshRoot as unknown as () => string | null)()) as string;
         if (!root) { console.error('cannot resolve DSH sessions root'); process.exit(1); }
         const res = await (reconcileWorkspaces as any)(root);
-        console.log(`reconciled ${res.scanned} sessions, registered ${res.registered} orphan(s)`);
+        console.log(`reconciled ${res.scanned} sessions, registered ${res.registered} orphan(s), pruned ${res.pruned ?? 0} dangling`);
         if (res.errors?.length) for (const e of res.errors) console.error('  ' + e);
         return;
       }
