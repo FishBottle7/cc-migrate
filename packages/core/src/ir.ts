@@ -98,6 +98,25 @@ export interface MigratedSidechain {
   messages: MigratedMessage[];
   /** typed lossless tool-invocation bucket, same contract as the session-level one */
   toolCalls?: MigratedToolCall[];
+  /**
+   * Mini-session extension (dsh 第二轮盘点): a session-backed sidechain can
+   * carry the same optional buckets as MigratedSession so the child log
+   * round-trips losslessly. Adapters for flat sidechains ignore them.
+   * `sidechains` nests grandchildren (DSH subagent delegation trees).
+   */
+  originSessionId?: string;
+  title?: string;
+  createdAt?: number;
+  cwd?: string;
+  goals?: MigratedGoal[];
+  planModes?: MigratedPlanMode[];
+  todos?: MigratedTodo[];
+  compaction?: MigratedCompaction[];
+  unmappedEvents?: MigratedUnmappedEvent[];
+  /** adapter-namespaced session-level native payload, same contract as MigratedSession.meta */
+  meta?: Record<string, unknown>;
+  /** nested delegation tree (subagent's own subagents) */
+  sidechains?: MigratedSidechain[];
 }
 
 /**
@@ -137,6 +156,8 @@ export interface SessionMeta {
   sourcePath?: string;
   /** Absolute working directory the session ran under (source). */
   cwd?: string;
+  /** True when the source store flags the session as archived (DSH workspace.json). */
+  archived?: boolean;
 }
 
 export interface MigratedGoal {
@@ -272,6 +293,26 @@ function isValidSidechain(v: unknown): boolean {
   if (!Array.isArray(s.messages)) return false;
   for (const msg of s.messages as unknown[]) {
     if (!isMigratedMessage(msg)) return false;
+  }
+  if (s.toolCalls !== undefined) {
+    if (!Array.isArray(s.toolCalls)) return false;
+    for (const tc of s.toolCalls as unknown[]) if (!isValidToolCall(tc)) return false;
+  }
+  if (s.unmappedEvents !== undefined && !Array.isArray(s.unmappedEvents)) return false;
+  if (s.goals !== undefined && !Array.isArray(s.goals)) return false;
+  if (s.planModes !== undefined && !Array.isArray(s.planModes)) return false;
+  if (s.todos !== undefined && !Array.isArray(s.todos)) return false;
+  if (s.compaction !== undefined) {
+    if (!Array.isArray(s.compaction)) return false;
+    for (const c of s.compaction as unknown[]) {
+      if (typeof c !== 'object' || c === null || Array.isArray(c)) return false;
+      if (typeof (c as { summary?: unknown }).summary !== 'string') return false;
+    }
+  }
+  if (s.meta !== undefined && (typeof s.meta !== 'object' || s.meta === null || Array.isArray(s.meta))) return false;
+  if (s.sidechains !== undefined) {
+    if (!Array.isArray(s.sidechains)) return false;
+    for (const nested of s.sidechains as unknown[]) if (!isValidSidechain(nested)) return false;
   }
   return true;
 }

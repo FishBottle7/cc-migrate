@@ -12,6 +12,7 @@ export * from './adapters/claude/index.js';
 export * from './adapters/codex/index.js';
 export { projectKey, encodeSegment, defaultDshRoot, readFirstFrameLine } from './adapters/dsh/format.js';
 export { ensureWorkspaceRegistration, reconcileWorkspaces } from './adapters/dsh/workspace.js';
+export { readDshAttachment, defaultDshAttachmentRoot } from './adapters/dsh/attachments.js';
 export { claudeProjectDirName } from './adapters/claude/path.js';
 export { defaultCodexHome, sessionIndexPath } from './adapters/codex/paths.js';
 export { ZcodeAdapter, zcodeProjectId, o0Trim, classifyUserMessage } from './adapters/zcode/index.js';

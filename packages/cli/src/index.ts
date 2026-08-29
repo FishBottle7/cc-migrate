@@ -31,6 +31,7 @@ interface Flags {
   root?: string;
   flatten?: boolean;
   keepSynthetic?: boolean;
+  systemPromptSource?: 'source' | 'target';
   /** preview: 打印全文（默认仅前 120 行 —— 终端渲染 MB 级文本极慢） */
   full?: boolean;
 }
@@ -48,7 +49,14 @@ function parseFlags(argv: string[]): { flags: Flags; positionals: string[] } {
     else if (tok === '--flatten') f.flatten = value('flatten') !== 'false';
     else if (tok === '--no-flatten') f.flatten = false;
     else if (tok === '--keep-runtime-context') f.keepSynthetic = true;
-    else if (tok === '--full') f.full = true;
+    else if (tok === '--system-prompt') {
+      const v = value('system-prompt');
+      if (v !== 'source' && v !== 'target') {
+        console.error(`--system-prompt must be "source" or "target", got "${v}"`);
+        process.exit(1);
+      }
+      f.systemPromptSource = v;
+    } else if (tok === '--full') f.full = true;
     else positionals.push(tok);
   }
   return { flags: f, positionals };
@@ -67,7 +75,8 @@ async function main(argv: string[]) {
       const adapter = registry.get(a as never);
       const metas = await listSessions(adapter, flags.root ?? flags.srcRoot);
       for (const m of metas) {
-        console.log(`${m.sessionId}\t${m.title ?? ''}\t${m.createdAt ? new Date(m.createdAt).toISOString() : ''}\t${m.sourcePath ?? ''}`);
+        const archived = m.archived ? '[archived] ' : '';
+        console.log(`${archived}${m.sessionId}\t${m.title ?? ''}\t${m.createdAt ? new Date(m.createdAt).toISOString() : ''}\t${m.sourcePath ?? ''}`);
       }
       return;
     }
@@ -102,6 +111,7 @@ async function main(argv: string[]) {
         targetCwd: flags.targetCwd ?? ir.cwd,
         flatten: flags.flatten,
         keepSynthetic: flags.keepSynthetic,
+        ...(flags.systemPromptSource ? { systemPromptSource: flags.systemPromptSource } : {}),
         ...(disambiguateTitle ? { disambiguateTitle: true } : {}),
       });
       console.log(`migrated ${a}:${b} -> ${c}:${res.sessionId}`);

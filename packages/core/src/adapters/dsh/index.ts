@@ -9,14 +9,22 @@
  * This adapter does NOT depend on `@deepseek-ai/dsh` internals — it re-derives
  * enough of the format to read/write resumable sessions using only `node:zlib`.
  *
- * IR protocol status (docs/ir-protocol.md「dsh 待适配清单」— all landed):
+ * IR protocol status (docs/ir-protocol.md「dsh 待适配清单」— all landed;
+ * 第二轮盘点 2026-08-29 见 docs/session-formats-audit.md §1「深度盘点 #2」):
  *  1. read: `tool/call` + `tool/result` events → typed `toolCalls` records
  *     (status derived from result presence/isError; raw arguments preserved).
  *  2. write: `ir.toolCalls` → re-emitted `tool/call` events (a running record
  *     is a lone call event — native shape for interrupted calls).
- *  3. per-message native fields ride MigratedMessage.meta.dsh (gap #2); the
+ *  3. per-message native fields ride MigratedMessage.meta.dsh (IR gap #2); the
  *     session header rides session-level MigratedSession.meta.dsh (v3.1) —
- *     extensions no longer carries DSH state.
+ *     extensions no longer carries DSH state. headerRaw is CONSUMED by write()
+ *     (delegationDepth/agentPreset/origin/parentSession/seedLength survive).
+ *  4. assistant/message `usage`/`interrupted` and tool/result event-level
+ *     `error`/`meta` round-trip via meta.dsh (round 2).
+ *  5. subagent trees nest (MigratedSidechain.sidechains) with full child
+ *     buckets; write-back relinks parents and never clobbers an existing log.
+ *  6. listSessions titles via session_projcache.json → last `session/title`
+ *     log-scan fallback; archive state via workspace.json; `_no-cwd` layout.
  */
 
 /**
@@ -42,6 +50,17 @@ interface DshMessageNative {
    * (compaction): it stays in the DSH log but the model never sees it again.
    * Targets decide how to express that (OpenCode: compaction boundary pair). */
   shadowed?: boolean;
+  /** assistant/message event-level `usage` (token accounting travels with the
+   * message; SessionEventMap documents no separate usage record). */
+  usage?: unknown;
+  /** assistant/message event-level `interrupted: true` — a turn cancelled
+   * mid-stream finalizes its delivered text/reasoning prefix as this event. */
+  interrupted?: true;
+  /** tool/result event-level `error` identity ({name, code}). */
+  resultError?: unknown;
+  /** tool/result event-level tool-private `meta` payload (e.g. dsh-tool-fs
+   * result-time contextual diff) — opaque to the core, restored verbatim. */
+  resultMeta?: unknown;
 }
 
 function withDshNative(msg: MigratedMessage, native: DshMessageNative): MigratedMessage {
@@ -80,7 +99,7 @@ function dshImageToFileBlock(rec: Record<string, unknown>): ContentBlock | undef
 }
 
 import { promises as fs } from 'node:fs';
-import { join } from 'node:path';
+import { join, dirname } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import type { Adapter, WriteOptions, WriteResult } from '../../registry.js';
 import type {
@@ -88,6 +107,7 @@ import type {
   FileBlock,
   MigratedMessage,
   MigratedSession,
+  MigratedSidechain,
   MigratedToolCall,
   MessageRole,
   SessionMeta,
@@ -186,8 +206,19 @@ export class DshAdapter implements Adapter {
     return validateSession(ir);
   }
 
-  private async collectSubagentSidechains(root: string, parentId: string): Promise<import('../../ir.js').MigratedSidechain[]> {
-    const sidechains: Array<import('../../ir.js').MigratedSidechain & { _createdAt: number }> = [];
+  /** Aggregate subagent sidechains: one cheap first-frame pass over every
+   * project dir (incl. `_no-cwd`) indexes children by header.parentSession,
+   * then the delegation tree is walked from `parentId`. Grandchildren nest
+   * under their parent's sidechain; each child carries its full mini-session
+   * buckets and its original header under meta.dsh.headerRaw. */
+  private async collectSubagentSidechains(root: string, parentId: string): Promise<MigratedSidechain[]> {
+    interface ChildRef {
+      id: string;
+      header: Record<string, unknown>;
+      createdAt: number;
+      log: string;
+    }
+    const byParent = new Map<string, ChildRef[]>();
     let projects: string[];
     try {
       projects = await fs.readdir(root);
@@ -212,7 +243,7 @@ export class DshAdapter implements Adapter {
         } catch {
           continue;
         }
-        // 廉价预筛：只解压首帧读 header 行；不是本会话的子代理就跳过，
+        // 廉价预筛：只解压首帧读 header 行；不是任何人的子代理就跳过，
         // 绝不为他人的会话付全量解压的代价（全量解压留给命中者）。
         let firstLine: string | null;
         try {
@@ -227,38 +258,67 @@ export class DshAdapter implements Adapter {
         } catch {
           continue;
         }
-        if (header.parentSession !== parentId) continue;
-        let plaintext: string;
-        try {
-          plaintext = decompressSessionBuffer(buf);
-        } catch {
-          continue;
-        }
-        const childId = typeof header.id === 'string' && header.id ? header.id : sessDir;
+        if (typeof header.parentSession !== 'string' || !header.parentSession) continue;
+        const id = typeof header.id === 'string' && header.id ? header.id : sessDir;
         const createdAt = typeof header.createdAt === 'number' && Number.isSafeInteger(header.createdAt) ? header.createdAt : 0;
-        const agentPreset = typeof header.agentPreset === 'string' ? header.agentPreset : undefined;
-        // decode full session for messages
-        const lines = plaintext.split('\n').filter((l) => l.trim().length > 0);
-        if (lines.length === 0) continue;
-        let events: DshEvent[];
-        try {
-          events = lines.slice(1).map((l) => JSON.parse(l) as DshEvent);
-        } catch {
-          continue;
-        }
-        events.sort((a, b) => (a.seq ?? 0) - (b.seq ?? 0));
-        const childIr = buildIrFromEvents(header as unknown as { cwd?: string; createdAt?: number; id?: string }, events);
-        sidechains.push({
-          agentId: childId,
-          kind: 'subagent',
-          agentType: agentPreset,
-          messages: childIr.messages,
-          _createdAt: createdAt,
-        } as import('../../ir.js').MigratedSidechain & { _createdAt: number });
+        const list = byParent.get(header.parentSession) ?? [];
+        list.push({ id, header, createdAt, log });
+        byParent.set(header.parentSession, list);
       }
     }
-    sidechains.sort((a, b) => a._createdAt - b._createdAt);
-    return sidechains.map(({ _createdAt: _c, ...rest }) => rest);
+    const visited = new Set<string>([parentId]);
+    const build = async (pid: string): Promise<MigratedSidechain[]> => {
+      const refs = (byParent.get(pid) ?? []).slice().sort((a, b) => a.createdAt - b.createdAt);
+      const out: MigratedSidechain[] = [];
+      for (const ref of refs) {
+        if (visited.has(ref.id)) continue; // cycle-defensive; DSH headers are acyclic
+        visited.add(ref.id);
+        let sc: MigratedSidechain;
+        try {
+          sc = await this.decodeSidechain(ref);
+        } catch {
+          continue; // corrupt child log — best-effort, keep the rest of the tree
+        }
+        const kids = await build(ref.id);
+        if (kids.length > 0) sc.sidechains = kids;
+        out.push(sc);
+      }
+      return out;
+    };
+    return build(parentId);
+  }
+
+  /** Fully decode one child log into a mini-session sidechain: messages plus
+   * every typed bucket (toolCalls/goals/planModes/todos/compaction/title/
+   * unmappedEvents) and the original header under meta.dsh.headerRaw —
+   * write-back restores the child's delegationDepth/agentPreset/seedLength. */
+  private async decodeSidechain(ref: { id: string; header: Record<string, unknown>; createdAt: number; log: string }): Promise<MigratedSidechain> {
+    const buf = await fs.readFile(ref.log);
+    const plaintext = decompressSessionBuffer(buf);
+    const lines = plaintext.split('\n').filter((l) => l.trim().length > 0);
+    if (lines.length === 0) throw new Error('empty child log');
+    const events = lines.slice(1).map((l) => JSON.parse(l) as DshEvent);
+    events.sort((a, b) => (a.seq ?? 0) - (b.seq ?? 0));
+    const childIr = buildIrFromEvents(ref.header as unknown as { cwd?: string; createdAt?: number; id?: string }, events);
+    const sc: MigratedSidechain = {
+      agentId: ref.id,
+      kind: 'subagent',
+      agentType: typeof ref.header.agentPreset === 'string' ? ref.header.agentPreset : undefined,
+      messages: childIr.messages,
+      ...(childIr.toolCalls?.length ? { toolCalls: childIr.toolCalls } : {}),
+      ...(childIr.goals?.length ? { goals: childIr.goals } : {}),
+      ...(childIr.planModes?.length ? { planModes: childIr.planModes } : {}),
+      ...(childIr.todos?.length ? { todos: childIr.todos } : {}),
+      ...(childIr.compaction?.length ? { compaction: childIr.compaction } : {}),
+      ...(childIr.unmappedEvents?.length ? { unmappedEvents: childIr.unmappedEvents } : {}),
+      ...(childIr.title ? { title: childIr.title } : {}),
+      ...(typeof ref.header.cwd === 'string' && ref.header.cwd ? { cwd: ref.header.cwd } : {}),
+      originSessionId: ref.id,
+      createdAt: ref.createdAt,
+      // buildIrFromEvents already stashed the child header (headerRaw)
+      meta: childIr.meta,
+    };
+    return sc;
   }
 
   /** Write an IR session into DSH's native resumable storage (new session id). */
@@ -281,16 +341,25 @@ export class DshAdapter implements Adapter {
         ? `${ir.title} (migrated)`
         : undefined;
 
-    // header frame — build object conditionally so no empty `cwd` leaks in
-    const headerObj: Record<string, unknown> = {
-      type: 'session',
-      version: 0,
-      id: newId,
-      createdAt,
-      delegationDepth: 0,
-      agentPreset: 'standard',
-    };
+    // header frame — start from the preserved headerRaw (v3.1 session meta) so
+    // delegationDepth/agentPreset/origin/parentSession/seedLength/version ride
+    // through the round-trip verbatim; identity fields are overridden for the
+    // new lifecycle (new id, wall-clock, effective cwd). Foreign-origin IRs
+    // (claude/codex/…) have no headerRaw and keep the legacy defaults.
+    const headerRaw = (ir.meta as { dsh?: { headerRaw?: Record<string, unknown> } } | undefined)?.dsh?.headerRaw;
+    const headerObj: Record<string, unknown> =
+      headerRaw && typeof headerRaw === 'object' && !Array.isArray(headerRaw)
+        ? { ...headerRaw }
+        : { type: 'session', version: 0, delegationDepth: 0, agentPreset: 'standard' };
+    headerObj.type = 'session';
+    headerObj.id = newId;
+    headerObj.createdAt = createdAt;
+    if (headerObj.version === undefined) headerObj.version = 0;
+    // retired fields make DSH refuse the header outright (fromHeaderLine throws)
+    delete headerObj.sandboxMode;
+    delete headerObj.approvalPolicy;
     if (cwd) headerObj.cwd = cwd;
+    else delete headerObj.cwd;
     const header = JSON.stringify(headerObj);
 
     // event rows -> surface messages (suffix title when migrating so export filename distinguishes).
@@ -312,7 +381,7 @@ export class DshAdapter implements Adapter {
     const frame1 = buildSessionFrame(header);
     const frame2 = buildEventsFrame(events);
 
-    const dir = join(sessionsRoot, projectKey(cwd), encodeSegment(newId));
+    const dir = join(sessionsRoot, dshProjectDirName(cwd), encodeSegment(newId));
     await fs.mkdir(dir, { recursive: true });
     // DSH uses concatenated frames: header (own frame) + event batches (own frames)
     const payload = Buffer.concat([frame1, frame2]);
@@ -336,40 +405,68 @@ export class DshAdapter implements Adapter {
       }
     }
 
-    // subagent sidechains -> independent child sessions
+    // subagent sidechains -> independent child sessions, written depth-first.
+    // Each child keeps its source id unless that destination is already taken
+    // (a dsh->dsh copy must never clobber the source log); nested sidechains
+    // (grandchildren) link to the WRITTEN parent id. Child headerRaw rides
+    // through verbatim (delegationDepth/seedLength/agentPreset/…); identity
+    // and linkage fields are overridden per written lifecycle.
     const subagents = (ir.sidechains ?? []).filter((s) => s.kind === 'subagent');
     const now = Date.now();
-    for (let idx = 0; idx < subagents.length; idx++) {
-      const sc = subagents[idx];
-      const rawId = sc.agentId;
-      const childId =
-        typeof rawId === 'string' &&
-        rawId.trim().length > 0 &&
-        rawId !== '.' &&
-        rawId !== '..' &&
-        !rawId.includes('/') &&
-        !rawId.includes('\\') &&
-        !rawId.includes(':')
-          ? rawId
+    let childCounter = 0;
+    const writeSidechain = async (sc: MigratedSidechain, parentWrittenId: string, parentDepth: number): Promise<void> => {
+      const scHeaderRaw = (sc.meta as { dsh?: { headerRaw?: Record<string, unknown> } } | undefined)?.dsh?.headerRaw;
+      const candidate =
+        typeof sc.agentId === 'string' &&
+        sc.agentId.trim().length > 0 &&
+        sc.agentId !== '.' &&
+        sc.agentId !== '..' &&
+        !sc.agentId.includes('/') &&
+        !sc.agentId.includes('\\') &&
+        !sc.agentId.includes(':')
+          ? sc.agentId
           : `session-${randomUUID()}`;
-      const childCreatedAt = now + idx + 1;
-      const childHeaderObj: Record<string, unknown> = {
-        type: 'session',
-        version: 0,
-        id: childId,
-        createdAt: childCreatedAt,
-        delegationDepth: 1,
-        parentSession: newId,
-        origin: 'subagent',
-        agentPreset: sc.agentType ?? 'standard',
-      };
+      const childId = await this.claimFreeSessionId(sessionsRoot, cwd, candidate);
+      const childCreatedAt = now + ++childCounter;
+      const rawDepth = scHeaderRaw?.delegationDepth;
+      const childHeaderObj: Record<string, unknown> =
+        scHeaderRaw && typeof scHeaderRaw === 'object' && !Array.isArray(scHeaderRaw)
+          ? { ...scHeaderRaw }
+          : { version: 0, agentPreset: sc.agentType ?? 'standard' };
+      childHeaderObj.type = 'session';
+      childHeaderObj.id = childId;
+      childHeaderObj.createdAt = childCreatedAt;
+      if (childHeaderObj.version === undefined) childHeaderObj.version = 0;
+      childHeaderObj.delegationDepth =
+        typeof rawDepth === 'number' && Number.isSafeInteger(rawDepth) && rawDepth >= 0
+          ? rawDepth
+          : parentDepth + 1;
+      // linkage is ours to own: the child always points at the WRITTEN parent
+      childHeaderObj.parentSession = parentWrittenId;
+      childHeaderObj.origin = 'subagent';
+      if (childHeaderObj.agentPreset === undefined) childHeaderObj.agentPreset = sc.agentType ?? 'standard';
+      delete childHeaderObj.sandboxMode;
+      delete childHeaderObj.approvalPolicy;
       if (cwd) childHeaderObj.cwd = cwd;
+      else delete childHeaderObj.cwd;
       const childHeader = JSON.stringify(childHeaderObj);
-      const childIr: MigratedSession = { schemaVersion: 2 as const, originTool: 'dsh', messages: sc.messages };
+      // Full mini-session buckets — a child log round-trips like a main log.
+      const childIr: MigratedSession = {
+        schemaVersion: 2 as const,
+        originTool: 'dsh',
+        messages: sc.messages,
+        ...(sc.toolCalls?.length ? { toolCalls: sc.toolCalls } : {}),
+        ...(sc.goals?.length ? { goals: sc.goals } : {}),
+        ...(sc.planModes?.length ? { planModes: sc.planModes } : {}),
+        ...(sc.todos?.length ? { todos: sc.todos } : {}),
+        ...(sc.compaction?.length ? { compaction: sc.compaction } : {}),
+        ...(sc.unmappedEvents?.length ? { unmappedEvents: sc.unmappedEvents } : {}),
+        ...(sc.title ? { title: sc.title } : {}),
+      };
       const childEvents = irToEvents(childIr, childCreatedAt);
       const cFrame1 = buildSessionFrame(childHeader);
       const cFrame2 = buildEventsFrame(childEvents);
-      const cDir = join(sessionsRoot, projectKey(cwd), encodeSegment(childId));
+      const cDir = join(sessionsRoot, dshProjectDirName(cwd), encodeSegment(childId));
       await fs.mkdir(cDir, { recursive: true });
       const cPayload = Buffer.concat([cFrame1, cFrame2]);
       const cPath = join(cDir, 'session.jsonl.zstd');
@@ -383,15 +480,31 @@ export class DshAdapter implements Adapter {
           // best-effort
         }
       }
+      for (const nested of sc.sidechains ?? []) {
+        const depth = typeof childHeaderObj.delegationDepth === 'number' ? childHeaderObj.delegationDepth : parentDepth + 1;
+        await writeSidechain(nested, childId, depth);
+      }
+    };
+    for (const sc of subagents) {
+      const baseDepth = typeof headerObj.delegationDepth === 'number' ? headerObj.delegationDepth : 0;
+      await writeSidechain(sc, newId, baseDepth);
     }
 
     return { tool: 'dsh', sessionId: newId, paths };
   }
 
-  /** Lightweight session listing from the DSH sessions root. */
+  /** Lightweight session listing from the DSH sessions root. Titles come from
+   * DSH's own projection cache (`session_projcache.json`, one JSON read);
+   * sessions it doesn't cover (e.g. migrated ones DSH never opened) fall back
+   * to scanning the log for the LAST `session/title` event. Archive state
+   * rides workspace.json's archivedSessionIds. `_no-cwd` sessions listed too. */
   async listSessions(root?: string): Promise<SessionMeta[]> {
     const sessionsRoot = root ?? defaultDshRoot();
     if (!sessionsRoot) return [];
+    const [titles, archived] = await Promise.all([
+      readProjcacheTitles(sessionsRoot),
+      readArchivedSessionIds(sessionsRoot),
+    ]);
     const metas: SessionMeta[] = [];
     let projects: string[];
     try {
@@ -400,7 +513,8 @@ export class DshAdapter implements Adapter {
       return [];
     }
     for (const proj of projects) {
-      if (!proj.startsWith('--') || !proj.endsWith('--')) continue;
+      const isProjectDir = proj === '_no-cwd' || (proj.startsWith('--') && proj.endsWith('--'));
+      if (!isProjectDir) continue;
       const projDir = join(sessionsRoot, proj);
       let sessions: string[];
       try {
@@ -413,15 +527,19 @@ export class DshAdapter implements Adapter {
         const log = join(sessDir, 'session.jsonl.zstd');
         try {
           const st = await fs.stat(log);
+          let title = titles.get(sid);
+          if (title === undefined) {
+            const buf = await fs.readFile(log);
+            title = scanTitleFromLog(buf);
+          }
           metas.push({
             tool: 'dsh',
             sessionId: sid,
-            // DSH stores the title as a `session/title` event inside the log;
-            // lightweight listing does not decode it, so title stays undefined
-            // and we expose the project dir key as cwd hint for display.
-            cwd: cwdFromProjectKey(proj),
+            ...(title !== undefined ? { title } : {}),
+            cwd: proj === '_no-cwd' ? undefined : cwdFromProjectKey(proj),
             createdAt: st.mtimeMs,
             sourcePath: log,
+            ...(archived.has(sid) ? { archived: true } : {}),
           });
         } catch {
           // skip non-artifact entries
@@ -463,6 +581,27 @@ export class DshAdapter implements Adapter {
       }
     }
     return null;
+  }
+
+  /** Return `preferred` when its artifact path is free; otherwise mint a fresh
+   * id. Writing over an existing log would clobber a real session (dsh->dsh
+   * copies share root+cwd, so a preserved source id collides by design). */
+  private async claimFreeSessionId(root: string, cwd: string, preferred: string): Promise<string> {
+    const logFor = (id: string): string => join(root, dshProjectDirName(cwd), encodeSegment(id), 'session.jsonl.zstd');
+    try {
+      await fs.access(logFor(preferred));
+    } catch {
+      return preferred;
+    }
+    for (let i = 0; i < 5; i++) {
+      const fresh = `session-${randomUUID()}`;
+      try {
+        await fs.access(logFor(fresh));
+      } catch {
+        return fresh;
+      }
+    }
+    throw new Error(`DSH: cannot find a free session dir for "${preferred}" under ${root}`);
   }
 }
 
@@ -729,16 +868,29 @@ function eventToMessage(type: string, data: DshEvent['data']): MigratedMessage |
       const native: DshMessageNative = { source };
       if (typeof maybe.id === 'string') native.id = maybe.id;
       if (dshContentHasImages(content)) native.rawContent = content;
-      // Harness-injected content (runtime-context snapshots, agent-instructions
-      // <system-reminder>, skill catalogs) is persisted as ordinary user/message
-      // events but carries source.kind === 'plugin'; human turns carry
-      // source.kind === 'user'. Mark for target-side policy (drop / keep flagged).
-      // COMPACTION CHECKPOINTS (plugin === 'compact', see
-      // @deepseek-ai/dsh-compaction/checkpoint) are CONVERSATION CONTENT — the
-      // in-stream summary travels as a message (IR gap #3 contract) and must
-      // survive migration, so they are NOT synthetic.
-      const isCompactionCheckpoint = source?.kind === 'plugin' && source?.plugin === 'compact';
-      const synthetic = source?.kind === 'plugin' && !isCompactionCheckpoint;
+      // Harness-injected content rides ordinary user/message events; the
+      // source kind is what separates human turns from injections. Verified
+      // against the dsh source's inject producers (packages/skill/tool-skill,
+      // context/agent-instructions, goal/goal-round-driver,
+      // subagent/continuation, compaction/checkpoint):
+      //   'plugin' — system-prompt snapshots / schedule / plan-mode /
+      //     user-approval / repeat-tool-reminder / tool-jobs / …
+      //   'skill-catalog' — the <available_skills> <system-reminder>
+      //   'skill-invocation' — a loaded <skill_content> block
+      //   'agent-instructions' — AGENTS.md injections
+      //   'goal' — goal continuation rounds
+      //   'subagent-report' / 'subagent-settled' / 'coordinator' — child
+      //     lifecycle relay / multi-agent notices
+      // All of those are SYNTHETIC. COMPACTION CHECKPOINTS (plugin ===
+      // 'compact', @deepseek-ai/dsh-compaction/checkpoint) are CONVERSATION
+      // CONTENT — the in-stream summary travels as a message (IR gap #3) and
+      // must survive migration, so they are NOT synthetic. Unknown kinds and
+      // missing sources stay non-synthetic: never drop what cannot be
+      // classified (new harness kinds keep appearing; human turns are always
+      // stamped kind:'user').
+      const sourceKind = typeof source?.kind === 'string' ? source.kind : undefined;
+      const isCompactionCheckpoint = sourceKind === 'plugin' && source?.plugin === 'compact';
+      const synthetic = sourceKind !== undefined && sourceKind !== 'user' && !isCompactionCheckpoint;
       if (isToolBridged) return withDshNative({ ...msg, role: 'tool' as const }, native);
       if (synthetic) return withDshNative({ ...msg, synthetic: true }, native);
       return withDshNative(msg, native);
@@ -754,6 +906,10 @@ function eventToMessage(type: string, data: DshEvent['data']): MigratedMessage |
       if (typeof m.id === 'string') native.id = m.id;
       if (typeof d.turn === 'number') native.turn = d.turn;
       if (typeof d.step === 'number') native.step = d.step;
+      // Event-level usage rides the message (SessionEventMap: no separate
+      // usage record) and interrupted marks a cancelled mid-stream prefix.
+      if (d.usage !== undefined && typeof d.usage === 'object' && d.usage !== null) native.usage = d.usage;
+      if (d.interrupted === true) native.interrupted = true;
       if (dshContentHasImages(m.content)) native.rawContent = m.content;
       // Canonical DSH ReasoningBlock carries no signature (llm/src/types.ts),
       // so IR thinking.signature stays undefined for dsh-origin sessions —
@@ -773,6 +929,10 @@ function eventToMessage(type: string, data: DshEvent['data']): MigratedMessage |
       if (typeof m.id === 'string') native.id = m.id;
       if (typeof d.turn === 'number') native.turn = d.turn;
       if (typeof d.step === 'number') native.step = d.step;
+      // Event-level error identity + tool-private meta live on the EVENT, not
+      // the message — without stashing them here, write-back loses both.
+      if (d.error !== undefined && typeof d.error === 'object' && d.error !== null) native.resultError = d.error;
+      if (d.meta !== undefined) native.resultMeta = d.meta;
       if (dshContentHasImages(m.content)) native.rawContent = m.content;
       return withDshNative({ ...msg, role: 'tool' as const }, native);
     }
@@ -901,6 +1061,10 @@ export function irToEvents(ir: MigratedSession, baseTime: number): DshEvent[] {
         ...(native.turn !== undefined || native.step !== undefined
           ? { turn: native.turn ?? 1, step: native.step ?? 1 }
           : { turn: 1, step: 1 }),
+        // Event-level error identity + tool-private meta were stashed on the
+        // message native at read time — re-emit or DSH loses the diff card.
+        ...(native.resultError !== undefined ? { error: native.resultError } : {}),
+        ...(native.resultMeta !== undefined ? { meta: native.resultMeta } : {}),
         message: {
           ...(native.id ? { id: native.id } : { id: `msg_${randomUUID()}` }),
           role: 'user',
@@ -945,6 +1109,9 @@ export function irToEvents(ir: MigratedSession, baseTime: number): DshEvent[] {
         ...(native.turn !== undefined || native.step !== undefined
           ? { turn: native.turn ?? 1, step: native.step ?? 1 }
           : { turn: 1, step: 1 }),
+        // Token accounting + interrupted-prefix marker travel on the event.
+        ...(native.usage !== undefined ? { usage: native.usage } : {}),
+        ...(native.interrupted === true ? { interrupted: true } : {}),
         message: {
           ...(native.id ? { id: native.id } : { id: `msg_${randomUUID()}` }),
           role: 'assistant' as const,
@@ -1237,4 +1404,87 @@ function cwdFromProjectKey(proj: string): string | undefined {
   // Real decoding is lossy for separators; we just return the inner key for display.
   const inner = proj.replace(/^--/, '').replace(/--$/, '');
   return inner.length ? inner : undefined;
+}
+
+/** DSH side-store path derived from a sessions root (`<dshHome>/sessions`). */
+function dshStoragesPath(sessionsRoot: string, file: string): string | null {
+  const dshHome = dirname(sessionsRoot);
+  if (!dshHome || dshHome === sessionsRoot) return null;
+  return join(dshHome, 'storages', file);
+}
+
+/** Project directory name for a cwd — DSH parks cwd-less sessions under
+ * `_no-cwd`, not under the projectKey of an empty string. */
+function dshProjectDirName(cwd: string): string {
+  return cwd ? projectKey(cwd) : '_no-cwd';
+}
+
+/** projcache title projection (`tables.sessions[id].rows.title.val`): one JSON
+ * read covers every session DSH has opened. Corrupt/missing file → empty map
+ * (callers fall back to per-log scans). */
+async function readProjcacheTitles(sessionsRoot: string): Promise<Map<string, string>> {
+  const out = new Map<string, string>();
+  const p = dshStoragesPath(sessionsRoot, 'session_projcache.json');
+  if (!p) return out;
+  let raw: string;
+  try {
+    raw = await fs.readFile(p, 'utf8');
+  } catch {
+    return out;
+  }
+  try {
+    const doc = JSON.parse(raw) as { tables?: { sessions?: Record<string, { rows?: { title?: { val?: unknown } } }> } };
+    for (const [id, rec] of Object.entries(doc.tables?.sessions ?? {})) {
+      const val = rec?.rows?.title?.val;
+      if (typeof val === 'string' && val) out.set(id, val);
+    }
+  } catch {
+    // corrupt cache — per-log fallback covers everything
+  }
+  return out;
+}
+
+/** Archived session ids from workspace.json's global.archivedSessionIds. */
+async function readArchivedSessionIds(sessionsRoot: string): Promise<Set<string>> {
+  const out = new Set<string>();
+  const p = dshStoragesPath(sessionsRoot, 'workspace.json');
+  if (!p) return out;
+  let raw: string;
+  try {
+    raw = await fs.readFile(p, 'utf8');
+  } catch {
+    return out;
+  }
+  try {
+    const doc = JSON.parse(raw) as { global?: { archivedSessionIds?: unknown } };
+    if (Array.isArray(doc.global?.archivedSessionIds)) {
+      for (const id of doc.global.archivedSessionIds) if (typeof id === 'string') out.add(id);
+    }
+  } catch {
+    // best-effort
+  }
+  return out;
+}
+
+/** Title of the LAST `session/title` event in a decompressed log — renames
+ * override earlier titles, so the last one wins. Substring-prefilters lines
+ * so only title-ish rows pay a JSON.parse. */
+function scanTitleFromLog(buf: Buffer): string | undefined {
+  let title: string | undefined;
+  try {
+    for (const line of decompressSessionBuffer(buf).split('\n')) {
+      if (!line.includes('"session/title"')) continue;
+      let ev: DshEvent;
+      try {
+        ev = JSON.parse(line) as DshEvent;
+      } catch {
+        continue;
+      }
+      const t = (ev.data as Record<string, unknown> | undefined)?.title;
+      if (ev.type === 'session/title' && typeof t === 'string' && t) title = t;
+    }
+  } catch {
+    return undefined;
+  }
+  return title;
 }

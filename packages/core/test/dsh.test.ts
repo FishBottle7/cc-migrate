@@ -20,6 +20,7 @@ import type { ContentBlock } from '../src/ir.js';
 import { fallbackIr } from '../src/demo.js';
 import { decompressSessionBuffer } from '../src/adapters/dsh/format.js';
 import { verifySessionLog } from '../src/adapters/dsh/verify.js';
+import { readDshAttachment } from '../src/adapters/dsh/attachments.js';
 
 /** Minimal loose shape for test fixture events. */
 interface DshEventLike {
@@ -389,6 +390,38 @@ test('synthetic flag: plugin-sourced injections marked, compaction checkpoints e
   assert.equal(meta1?.source?.plugin, '@deepseek-ai/dsh-system-prompt');
 });
 
+test('synthetic flag: every non-human source kind is injected (round-2 taxonomy)', () => {
+  const msg = (id: string, source: Record<string, unknown>, text: string) => ({
+    type: 'user/message', seq: 0, time: 1, surfaceOp: 'append',
+    data: { id, role: 'user', source, content: [{ type: 'text', text }] },
+  });
+  const raw = [
+    // skill catalog <system-reminder> (the <available_skills> block) — injected
+    msg('a', { kind: 'skill-catalog', form: 'catalog', entries: [] }, '<available_skills>…</available_skills>'),
+    // loaded <skill_content> block — injected
+    msg('b', { kind: 'skill-invocation', name: 'find-skills', form: 'instructions' }, '<skill_content>…</skill_content>'),
+    // AGENTS.md injections — injected
+    msg('c', { kind: 'agent-instructions', form: 'instructions', changes: [] }, '# AGENTS.md instructions'),
+    // goal continuation round — injected
+    msg('d', { kind: 'goal', goalId: 'g1', revision: 2, round: 3 }, 'continue round 3'),
+    // subagent lifecycle relay — injected
+    msg('e', { kind: 'subagent-settled', form: 'notice', summary: 'child done', senderSessionId: 's1' }, 'child done'),
+    msg('f', { kind: 'subagent-report', form: 'relay', senderSessionId: 's1' }, 'child report'),
+    // multi-agent coordinator relay — injected
+    msg('g', { kind: 'coordinator', form: 'relay', senderSessionId: 's2' }, 'teammate message'),
+  ];
+  const ir = buildIrFromEvents({ id: 's', createdAt: 1 }, raw as never);
+  assert.equal(ir.messages.length, 7);
+  for (const [i, m] of ir.messages.entries()) {
+    assert.equal(m.synthetic, true, `message #${i} (${(m.content[0] as { text?: string })?.text?.slice(0, 20)}) should be synthetic`);
+  }
+  // a source-less user/message stays non-synthetic (never drop what cannot be classified)
+  const noSource = buildIrFromEvents({ id: 's', createdAt: 1 }, [
+    { type: 'user/message', seq: 0, time: 1, surfaceOp: 'append', data: { id: 'x', role: 'user', content: [{ type: 'text', text: 'no source' }] } },
+  ] as never);
+  assert.equal(noSource.messages[0].synthetic, undefined);
+});
+
 test('write-back restores native id/source/turn/step from meta.dsh', async () => {
   const adapter = new DshAdapter();
   const root = await tempRoot();
@@ -519,4 +552,232 @@ test('toolCalls write-back: running record emits a lone tool/call; native round-
   assert.equal(back.toolCalls?.length, 1);
   assert.equal(back.toolCalls![0].status, 'running');
   assert.equal(back.toolCalls![0].callId, 'call_x');
+});
+
+/* ------------------------------------------------------------------ */
+/* 第二轮盘点 (2026-08-29): headerRaw / usage / interrupted /          */
+/* tool-result error+meta / 嵌套子代理 / 防覆盖 / 列表标题 / 附件       */
+/* ------------------------------------------------------------------ */
+
+test('write consumes meta.dsh.headerRaw: subagent header fields ride through verbatim', async () => {
+  const adapter = new DshAdapter();
+  const root = await tempRoot();
+  const events: DshEventLike[] = [
+    { seq: 0, type: 'user/message', surfaceOp: 'append', time: 1, data: { id: 'm1', role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: 'child prompt' }] } },
+  ];
+  const ir = buildIrFromEvents(
+    { id: 'src-child', createdAt: 1000, cwd: 'D:\\src', parentSession: 'src-parent', delegationDepth: 2, origin: 'subagent', agentPreset: 'explore', seedLength: 5 } as never,
+    events as never,
+  );
+  const res = await adapter.write(ir, { root, sessionId: 'child-new', targetCwd: 'D:\\proj' });
+  const buf = await fs.readFile(res.paths[0]);
+  const header = JSON.parse(decompressSessionBuffer(buf).split('\n')[0]);
+  assert.equal(header.id, 'child-new');
+  assert.equal(header.cwd, 'D:\\proj');
+  assert.equal(header.delegationDepth, 2, 'source delegationDepth preserved');
+  assert.equal(header.origin, 'subagent');
+  assert.equal(header.agentPreset, 'explore');
+  assert.equal(header.seedLength, 5);
+  assert.equal(header.parentSession, 'src-parent', 'standalone migration keeps the source parent link verbatim');
+  assert.equal(header.version, 0);
+});
+
+test('assistant/message usage + interrupted round-trip via meta.dsh', async () => {
+  const adapter = new DshAdapter();
+  const root = await tempRoot();
+  const events: DshEventLike[] = [
+    { seq: 0, type: 'turn/start', time: 1, data: { turn: 1 } },
+    { seq: 1, type: 'user/message', surfaceOp: 'append', time: 2, data: { id: 'm1', role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: 'q' }] } },
+    {
+      seq: 2, type: 'assistant/message', surfaceOp: 'append', time: 3,
+      data: { turn: 1, step: 1, interrupted: true, usage: { inputTokens: 10296, outputTokens: 212, cacheReadTokens: 1792 }, message: { id: 'a1', role: 'assistant', source: { kind: 'model', provider: 'p', model: 'm' }, content: [{ type: 'text', text: 'partial' }] } },
+    },
+  ];
+  const ir = buildIrFromEvents({ id: 's1', createdAt: 1 }, events as never);
+  const native = (ir.messages[1].meta as { dsh?: { usage?: unknown; interrupted?: unknown } }).dsh;
+  assert.deepEqual(native?.usage, { inputTokens: 10296, outputTokens: 212, cacheReadTokens: 1792 });
+  assert.equal(native?.interrupted, true);
+  const res = await adapter.write(ir, { root, targetCwd: 'D:\\proj' });
+  const buf = await fs.readFile(res.paths[0]);
+  const events2 = decompressSessionBuffer(buf).split('\n').filter((l) => l.trim()).slice(1).map((l) => JSON.parse(l)) as DshEventLike[];
+  const asst = events2.find((e) => e.type === 'assistant/message')!;
+  assert.deepEqual((asst.data as { usage?: unknown }).usage, { inputTokens: 10296, outputTokens: 212, cacheReadTokens: 1792 });
+  assert.equal((asst.data as { interrupted?: unknown }).interrupted, true);
+  // double round-trip: the next parse keeps them again
+  const ir2 = buildIrFromEvents({ id: 's1', createdAt: 1 }, events2 as never);
+  assert.equal(((ir2.messages[1].meta as { dsh?: { interrupted?: unknown } }).dsh)?.interrupted, true);
+});
+
+test('tool/result event-level error + meta round-trip via meta.dsh', async () => {
+  const adapter = new DshAdapter();
+  const root = await tempRoot();
+  const resultMeta = { diff: '--- a/f.ts\n+++ b/f.ts' };
+  const events: DshEventLike[] = [
+    { seq: 0, type: 'tool/call', time: 1, data: { turn: 1, step: 1, callId: 'call_1', name: 'edit', arguments: '{}' } },
+    {
+      seq: 1, type: 'tool/result', surfaceOp: 'append', time: 2,
+      data: { turn: 1, step: 1, error: { name: 'EditError', code: 'E_CONFLICT' }, meta: resultMeta, message: { id: 't1', role: 'user', source: { kind: 'tool', callId: 'call_1' }, content: [{ type: 'tool-result', toolCallId: 'call_1', content: [{ type: 'text', text: 'boom' }], isError: true }] } },
+    },
+  ];
+  const ir = buildIrFromEvents({ id: 's1', createdAt: 1 }, events as never);
+  const toolMsg = ir.messages.find((m) => m.role === 'tool')!;
+  const native = (toolMsg.meta as { dsh?: { resultError?: unknown; resultMeta?: unknown } }).dsh;
+  assert.deepEqual(native?.resultError, { name: 'EditError', code: 'E_CONFLICT' });
+  assert.deepEqual(native?.resultMeta, resultMeta);
+  const res = await adapter.write(ir, { root, targetCwd: 'D:\\proj' });
+  const buf = await fs.readFile(res.paths[0]);
+  const events2 = decompressSessionBuffer(buf).split('\n').filter((l) => l.trim()).slice(1).map((l) => JSON.parse(l)) as DshEventLike[];
+  const tr = events2.find((e) => e.type === 'tool/result')!;
+  assert.deepEqual((tr.data as { error?: unknown }).error, { name: 'EditError', code: 'E_CONFLICT' });
+  assert.deepEqual((tr.data as { meta?: unknown }).meta, resultMeta);
+});
+
+test('nested subagent tree: grandchildren collected, full buckets, written with remapped parent links', async () => {
+  const adapter = new DshAdapter();
+  const root = await tempRoot();
+  const childEvents: DshEventLike[] = [
+    { seq: 0, type: 'tool/call', time: 1, data: { turn: 1, step: 1, callId: 'c9', name: 'read', arguments: '{"p":"x"}' } },
+    { seq: 1, type: 'user/message', surfaceOp: 'append', time: 2, data: { id: 'cm1', role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: 'child work' }] } },
+    { seq: 2, type: 'todo/write', time: 3, data: { todos: ['a'] } },
+  ];
+  const childIr = buildIrFromEvents(
+    { id: 'child-src', createdAt: 10, parentSession: 'parent-src', origin: 'subagent', delegationDepth: 1, agentPreset: 'explore', seedLength: 2 } as never,
+    childEvents as never,
+  );
+  await adapter.write(childIr, { root, sessionId: 'child-src', targetCwd: 'D:\\proj' });
+  const grandEvents: DshEventLike[] = [
+    { seq: 0, type: 'user/message', surfaceOp: 'append', time: 2, data: { id: 'gm1', role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: 'grandchild work' }] } },
+  ];
+  const grandIr = buildIrFromEvents(
+    { id: 'grand-src', createdAt: 20, parentSession: 'child-src', origin: 'subagent', delegationDepth: 2, agentPreset: 'deep' } as never,
+    grandEvents as never,
+  );
+  await adapter.write(grandIr, { root, sessionId: 'grand-src', targetCwd: 'D:\\proj' });
+  const parentEvents: DshEventLike[] = [
+    { seq: 0, type: 'user/message', surfaceOp: 'append', time: 1, data: { id: 'pm1', role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: 'parent' }] } },
+  ];
+  const parentIrSrc = buildIrFromEvents({ id: 'parent-src', createdAt: 5 } as never, parentEvents as never);
+  await adapter.write(parentIrSrc, { root, sessionId: 'parent-src', targetCwd: 'D:\\proj' });
+
+  const parsed = await adapter.parse('parent-src', root);
+  assert.equal(parsed.sidechains?.length, 1);
+  const sc = parsed.sidechains![0];
+  assert.equal(sc.agentId, 'child-src');
+  assert.equal(sc.agentType, 'explore');
+  assert.equal(sc.toolCalls?.length, 1, 'child toolCalls bucket filled');
+  assert.deepEqual(sc.toolCalls![0].input, { p: 'x' });
+  assert.equal(sc.todos?.length, 1, 'child todos bucket filled');
+  assert.equal((sc.meta as { dsh?: { headerRaw?: { delegationDepth?: number } } }).dsh?.headerRaw?.delegationDepth, 1);
+  assert.equal(sc.sidechains?.length, 1, 'grandchild nested');
+  assert.equal(sc.sidechains![0].agentId, 'grand-src');
+  assert.equal(sc.sidechains![0].agentType, 'deep');
+
+  // write back: the source child/grandchild paths are occupied by the SOURCE
+  // logs (they were written above into the same root+cwd), so both land on
+  // fresh ids — linkage/depth/buckets must still hold on the fresh copies.
+  const res = await adapter.write(parsed, { root, sessionId: 'parent-new', targetCwd: 'D:\\proj' });
+  assert.ok(res.paths.length >= 3, 'parent + child + grandchild written');
+  const projDir = join(root, '--D-proj--');
+  const readHeader = async (dir: string): Promise<Record<string, unknown>> =>
+    JSON.parse(decompressSessionBuffer(await fs.readFile(join(projDir, dir, 'session.jsonl.zstd'))).split('\n')[0]);
+  // source logs untouched
+  assert.equal((await readHeader('child-src')).parentSession, 'parent-src');
+  const dirs = await fs.readdir(projDir);
+  const headers = new Map<string, Record<string, unknown>>();
+  for (const d of dirs) headers.set(d, await readHeader(d));
+  const freshChild = [...headers.entries()].find(([, h]) => h.parentSession === 'parent-new');
+  assert.ok(freshChild, 'fresh child dir written and relinked to written parent');
+  const [childDir, childHeader] = freshChild;
+  assert.notEqual(childDir, 'child-src');
+  assert.equal(childHeader.delegationDepth, 1);
+  assert.equal(childHeader.agentPreset, 'explore');
+  const grand = [...headers.entries()].find(([d, h]) => d !== childDir && h.parentSession === childDir);
+  assert.ok(grand, 'grandchild parentSession remapped to the fresh child id');
+  assert.equal(grand[1].delegationDepth, 2);
+  assert.equal(grand[1].agentPreset, 'deep');
+  // full circle: the written parent parses back with the nested tree + buckets
+  const reparsed = await adapter.parse('parent-new', root);
+  assert.equal(reparsed.sidechains?.length, 1);
+  assert.equal(reparsed.sidechains![0].toolCalls?.length, 1);
+  assert.equal(reparsed.sidechains![0].sidechains?.length, 1);
+});
+
+test('write never clobbers an existing child log at the same path (fresh id on collision)', async () => {
+  const adapter = new DshAdapter();
+  const root = await tempRoot();
+  const childEvents: DshEventLike[] = [
+    { seq: 0, type: 'user/message', surfaceOp: 'append', time: 2, data: { id: 'cm1', role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: 'child work' }] } },
+  ];
+  const childIr = buildIrFromEvents({ id: 'child-1', createdAt: 10, parentSession: 'p1', origin: 'subagent', delegationDepth: 1 } as never, childEvents as never);
+  await adapter.write(childIr, { root, sessionId: 'child-1', targetCwd: 'D:\\proj' });
+  const originalChild = await fs.readFile(join(root, '--D-proj--', 'child-1', 'session.jsonl.zstd'));
+
+  const parentEvents: DshEventLike[] = [
+    { seq: 0, type: 'user/message', surfaceOp: 'append', time: 1, data: { id: 'pm1', role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: 'parent' }] } },
+  ];
+  const parsed = buildIrFromEvents({ id: 'p1', createdAt: 5 } as never, parentEvents as never);
+  parsed.sidechains = [{
+    agentId: 'child-1',
+    kind: 'subagent',
+    messages: [{ role: 'user', content: [{ type: 'text', text: 'child work' }] }],
+    meta: { dsh: { headerRaw: { version: 0, id: 'child-1', createdAt: 10, parentSession: 'p1', origin: 'subagent', delegationDepth: 1 } } },
+  }];
+  const res = await adapter.write(parsed, { root, sessionId: 'p1-new', targetCwd: 'D:\\proj' });
+  // source child log untouched; the migrated child landed on a fresh id
+  assert.deepEqual(await fs.readFile(join(root, '--D-proj--', 'child-1', 'session.jsonl.zstd')), originalChild);
+  const projDir = join(root, '--D-proj--');
+  const others = (await fs.readdir(projDir)).filter((d) => d !== 'child-1' && d !== 'p1-new');
+  assert.equal(others.length, 1, 'exactly one fresh child dir');
+  const freshHeader = JSON.parse(decompressSessionBuffer(await fs.readFile(join(projDir, others[0], 'session.jsonl.zstd'))).split('\n')[0]);
+  assert.notEqual(freshHeader.id, 'child-1');
+  assert.equal(freshHeader.parentSession, 'p1-new');
+  assert.ok(res.paths.some((p) => p.includes(others[0])));
+});
+
+test('listSessions: title from projcache, log-scan fallback, archived flag, _no-cwd', async () => {
+  const adapter = new DshAdapter();
+  const tmp = await fs.mkdtemp(join(tmpdir(), 'sm-dsh-list-'));
+  const root = join(tmp, 'sessions');
+  const storages = join(tmp, 'storages');
+  await fs.mkdir(storages, { recursive: true });
+
+  // session A: title only in the log (e.g. a migrated session DSH never opened)
+  const irA = { schemaVersion: 2 as const, originTool: 'dsh' as const, title: 'Logged Title', messages: [{ role: 'user' as const, content: [{ type: 'text' as const, text: 'a' }] }] };
+  const resA = await adapter.write(irA as never, { root, sessionId: 'sess-a', targetCwd: 'D:\\proj' });
+  void resA;
+  // session B: title only in projcache
+  const irB = { schemaVersion: 2 as const, originTool: 'dsh' as const, messages: [{ role: 'user' as const, content: [{ type: 'text' as const, text: 'b' }] }] };
+  await adapter.write(irB as never, { root, sessionId: 'sess-b', targetCwd: 'D:\\proj' });
+  // session C: cwd-less (_no-cwd project dir)
+  const irC = { schemaVersion: 2 as const, originTool: 'dsh' as const, messages: [{ role: 'user' as const, content: [{ type: 'text' as const, text: 'c' }] }] };
+  await adapter.write(irC as never, { root, sessionId: 'sess-c', targetCwd: '' });
+  await fs.writeFile(
+    join(storages, 'session_projcache.json'),
+    JSON.stringify({ unit: { name: 'session_projcache', version: 3 }, global: null, tables: { sessions: { 'sess-b': { rows: { title: { ver: 1, seq: 1, val: 'Cached Title' } } } } } }),
+  );
+  await fs.writeFile(
+    join(storages, 'workspace.json'),
+    JSON.stringify({ global: { archivedSessionIds: ['sess-b'] }, tables: { workspaces: {} } }),
+  );
+
+  const metas = await adapter.listSessions(root);
+  const byId = new Map(metas.map((m) => [m.sessionId, m]));
+  assert.equal(byId.get('sess-a')?.title, 'Logged Title', 'title scanned from log when projcache misses');
+  assert.equal(byId.get('sess-b')?.title, 'Cached Title', 'title from projcache wins');
+  assert.equal(byId.get('sess-b')?.archived, true, 'archive state from workspace.json');
+  assert.equal(byId.get('sess-a')?.archived, undefined);
+  assert.ok(byId.has('sess-c'), '_no-cwd sessions are listed');
+  assert.equal(byId.get('sess-c')?.cwd, undefined, '_no-cwd has no cwd hint');
+});
+
+test('readDshAttachment resolves content-addressed bytes (sha256: ref and bare hex)', async () => {
+  const root = await fs.mkdtemp(join(tmpdir(), 'sm-dsh-att-'));
+  const hash = 'ab'.repeat(32);
+  const objPath = join(root, 'objects', 'ab', hash);
+  await fs.mkdir(join(root, 'objects', 'ab'), { recursive: true });
+  await fs.writeFile(objPath, 'PNGBYTES');
+  assert.deepEqual(await readDshAttachment(`sha256:${hash}`, root), Buffer.from('PNGBYTES'));
+  assert.deepEqual(await readDshAttachment(hash, root), Buffer.from('PNGBYTES'));
+  assert.equal(await readDshAttachment('sha256:' + 'cd'.repeat(32), root), null, 'missing object -> null');
+  assert.equal(await readDshAttachment('not-a-hash', root), null, 'malformed id -> null');
 });

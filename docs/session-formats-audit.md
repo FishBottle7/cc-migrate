@@ -106,6 +106,45 @@
 > - 旧版未提 `packChunks` 打包行（`text-chunks`）与读写兼容性。
 > - 旧版未提 `list` 仅读 header 行的规模优化与 `oppositeCompression` / `legacy flat-file` 拒绝。
 
+### 深度盘点 #2（2026-08-29 第二轮：源码目录树 + 36 会话全量实测）
+
+> 源码锚点新增：`packages/core/session/src/known-event-types.ts`（持久化事件目录，**生成文件**）、`packages/subagent/subagent/src/{child-agent,descriptor,list-children,depth,continuation}.ts`、`packages/attachment/attachment-local/src/{store,request-image}.ts`、`packages/api/session-controller/src/client/sessions/lineage.ts`。实测样本：本机 `~/.dsh` 36 个会话（13 个带 `parentSession`、11 个带 `origin`）。
+
+#### Subagent 关联机制（有，= header 三字段 + 子日志 descriptor 事件）
+
+- 派生时子会话 header 写 `parentSession`（父 id）+ `origin:'subagent'` + `delegationDepth`（父+1）（`child-agent.ts:148-153`）；`seedLength > 0` 时一并写入——它是**继承事件数**（seq 计数），`source.events.slice(header.seedLength)` 即"父历史 | 子增量"分界（`continuation.ts:974`），整流重写且不丢事件时逐字保留即可。
+- DSH 自己的子代列表与 UI lineage 树均按 `header.parentSession` 建树（`list-children.ts:88`、session-controller `lineage.ts:flattenLineage`）；生命周期见证字段为 `version,id,createdAt,cwd,parentSession,seedLength,delegationDepth,origin,agentPreset`（`list-children.ts:388`）。
+- 子会话日志内另有 log-only `subagent/descriptor` 事件（descriptor v3：`{version, mode:'one-shot'|'continuable', provider, label?, agentProvider?, agentModel?, …}`）——continuable 子代理冷恢复的组成快照，模型不可见、compaction 后仍存活。
+- **适配器结论**：`collectSubagentSidechains` 的 `parentSession === 当前 id` 判据与 DSH 原生同款，方向正确；漏的是孙代、子会话桶与 header 保真（见下）。
+
+#### 事件类型全表（catalog 51 种 vs 适配器显式映射 12 种）
+
+`KNOWN_SESSION_EVENT_TYPES`（known-event-types.ts:18，`pnpm run gen-persistence-catalog` 生成）共 **51 种**；适配器显式映射 9 种 + packed 3 种（`text-chunks`/`reasoning-chunks`/`tool-call-chunks` 存储行，不属 catalog），其余落 `unmappedEvents`——dsh→dsh 无损，跨工具迁移按契约丢弃。
+
+本机 36 会话实测出现 31 种 catalog 类型 + 3 种 packed；**21 种 catalog 类型实测未出现**（`plan/mode`、`agent-preset/selected`、`model/selection`、`feedback/record`、`hook/invoked`、`hook/result`、`schedule/change`、`subagent/model-selection-policy`、`team/*`×4、`tool-workflow/*`×4、`tool/code-dispatch*`×2、`web/deepseek-search-llm-request`、`session-log-deepseek/delivery-accepted`），同样靠 unmapped 兜底。unmapped 按实测数量排序：`assistant/chunk` 23817、`step/start`+`end` 4106、`llm/retry`(+`-started`) 1953、`agent/inbox/spliced` 502、`approval/*` 198、`request/header`+`context` 133、`turn/*` 440、`session/end-seed` 53、`compaction/prune` 53、`sandbox/mode` 37、`permission/preset` 26、`compaction/start`+`end` 24、`session/title-llm-request` 15、`subagent/descriptor` 11、`command/*` 4。
+
+#### 附属存储（适配器此前零接触）
+
+| 路径 | 内容 | 迁移价值 |
+|------|------|----------|
+| `storages/session_projcache.json` | 会话投影缓存 `tables.sessions[id].rows.{title,goal,tokenUsage,contextPressure,sessionStats}` | **标题的廉价来源**（GUI 列表即用它），一次文件读覆盖全部会话；未经 DSH 打开的会话（含迁移写入的）无条目 |
+| `storages/workspace.json` | 工作区注册表 + `global.archivedSessionIds`（归档状态）+ `workspaces[].sessionIds` 顺序 | 归档/工作区归属的权威读取源；写入侧已有 `ensureWorkspaceRegistration` |
+| `attachments/v1/objects/<sha256[0:2]>/<sha256>` | 图片字节按内容寻址；`attachmentId` 形如 `sha256:<64hex>`（`store.ts:22,53,115`），另有 `request-images/` 变体桶 | 跨工具迁移图像时可本地解出真字节，`dsh-attachment://` FileBlock 引用不再悬空 |
+| `profiles/` | web 预览资源，非会话数据 | 无 |
+
+#### 保真缺口清单（本轮盘点 → 处置）
+
+1. ✅已修 **`meta.dsh.headerRaw` 只存不读**：write() 硬编码 `delegationDepth:0, agentPreset:'standard'`，从不写 `parentSession/origin/seedLength/version`（与 buildIrFromEvents 尾注 "write-back prefers meta.dsh.headerRaw" 相悖）。独立迁移子代理会话时父子链断裂、非标准 preset 被归一。
+2. ✅已修 **`assistant/message` 的 `usage` 与 `interrupted` 读写全丢**（token 记账随消息走；`interrupted:true` 标记中断时已交付前缀）。
+3. ✅已修 **`tool/result` 事件级 `error`/`meta` 写回端不重发**（读端存进 toolCalls 桶 metadata，但事件字段消失——meta 承载 dsh-tool-fs 结果时 diff 卡片等工具私有载荷）。
+4. ✅已修 **孙代子代理整体丢失**：只扫直接子代、IR sidechain 无嵌套。
+5. ✅已修 **子会话只带 messages**：childIr 的 toolCalls/todos/goals/planModes/compaction/unmappedEvents/title 全部丢弃（IR `sidechain.toolCalls` 槽位从未填过）。
+6. ✅已修 **写回子会话沿用源 id 且同 root+cwd 时直接覆盖源日志**（破坏性）：目标路径已存在时改用新 id，孙代 `parentSession` 随 id 映射重指。
+7. ✅已修 **listSessions 从不读标题**（注释自认）且漏扫 `_no-cwd` 项目目录：现在 projcache 优先、日志扫最后一条 `session/title` 兜底（重命名覆盖 → 必须取最后），并暴露归档状态。
+8. ✅已修 **附件字节无解析器**（FileBlock 只有 `dsh-attachment://<id>` 引用）：新增 `readDshAttachment()`。
+9. 📋按契约记录（不修）：其余 unmapped 事件的 IR 语义化（approval 流、hook、team、workflow 等）——`unmappedEvents` 契约下跨工具丢弃是设计内行为；`subagent/descriptor` 经子会话 unmapped 桶无损往返，IR 不设专用槽。
+10. ✅已修（08-30 第二轮收尾）**`synthetic` 判据只认 `source.kind==='plugin'`，漏掉非 plugin 的注入 kind**：实测 36 会话中 76 条注入被当人类发言——skill-catalog 35（`<available_skills>` 目录 reminder）、subagent-settled 26、agent-instructions 7、goal 6、subagent-report 2。判据改为**白名单人类发言**（`source.kind==='user'` 或无 source），`{kind:'plugin', plugin:'compact'}` 压缩检查点仍是唯一豁免（对话内容，IR 缺口 #3）。源码锚点：`packages/skill/tool-skill/src/index.ts:259`（skill-catalog 戳记）、`packages/subagent/subagent/src/continuation.ts`、`packages/context/agent-instructions/src/state.ts:84`、`packages/goal/goal-round-driver/src/index.ts:178`。
+
 ---
 
 ## 2. Codex — `rollout-<ts>-<id>.jsonl`
@@ -153,6 +192,14 @@
 ---
 
 ## 3. Claude Code — `projects/<编码路径>/<uuid>.jsonl`
+
+> ⚠️ **2026-08-29 深度调查修正**：本节为 v2 浅层结论，权威细节已由深度调查重写至 **`docs/agents/claude.md`**（三方交叉：老版源码 sessionStorage.ts 全文 + 2.1.251 二进制逆向 + 27429 行真实数据枚举）。关键修正：
+> - **`last-prompt` 的 `leafUuid` 在新版（2.1.251）复活且读取端消费**——本节下文"无 leafUuid"系旧版 `reAppendSessionMetadata` 形状，已不成立；另有 `explicit`/`rewound` 变体。
+> - 记录类型远不止 user/assistant/summary：**A 类 transcript 消息**（user/assistant/attachment/system，`parentUuid` 构成 **DAG 不是链**——tool_result 由 `sourceToolAssistantUUID` 挂到对应 assistant 的 uuid，并行 tool_use 拆多条 assistant 同 `message.id`）+ **B/C 类 30+ 种元数据行**（新版新增 `permission-mode`/`cost-state`/`atis-latch`/`isolation-latch`/`file-history-delta`/`relocated`/`bridge-session`/`history-suppression`/`frame-link` 等）。
+> - **transcript 不含系统提示词**：resume 时由目标二进制 + 当次 flag 重新生成；迁移"带源方提示词"对 Claude 目标唯一正道是进程参数 `--append-system-prompt`，禁止双系统提示词叠加。
+> - 目录编码有 **200 字符截断 + hash 后缀**（`sanitizePath` 的 `MAX_SANITIZED_LENGTH=200`），长 cwd 场景"全替换为 -"规则不完整。
+> - 唯一不可迁移负载 = `redacted_thinking.data`；`thinking.signature` 是签名非加密，必须逐字节保留。
+> - resume 链重建含多个修复 pass（parallel tool_result 恢复、preservedSegment 重连、usage 清零、死枝剪枝），读端必须对齐，详见 `docs/agents/claude.md` §3。
 
 ### 存储位置
 
