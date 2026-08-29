@@ -310,3 +310,85 @@ test('irToEvents re-points replace surfaceOps and sourceEventSeqs at the renumbe
   assert.equal(rop.end, 1);
   assert.deepEqual(replaced.sourceEventSeqs, [1]);
 });
+test('synthetic flag: plugin-sourced injections marked, compaction checkpoints exempt', () => {
+  const raw = [
+    {
+      type: 'user/message', seq: 0, time: 1, surfaceOp: 'append',
+      data: { id: 'u1', role: 'user', source: { kind: 'user', rpcId: 'r1', clientTimeZone: 'Asia/Shanghai' }, content: [{ type: 'text', text: 'real question' }] },
+    },
+    {
+      // runtime-context snapshot from the system-prompt plugin -> synthetic
+      type: 'user/message', seq: 1, time: 2, surfaceOp: 'append',
+      data: { id: 'u2', role: 'user', source: { kind: 'plugin', plugin: '@deepseek-ai/dsh-system-prompt', form: 'snapshot' }, content: [{ type: 'text', text: 'Current runtime context. This snapshot supersedes earlier runtime-context snapshots.' }] },
+    },
+    {
+      // compaction checkpoint (plugin 'compact') is CONVERSATION CONTENT -> NOT synthetic
+      type: 'user/message', seq: 2, time: 3, surfaceOp: 'append',
+      data: { id: 'u3', role: 'user', source: { kind: 'plugin', plugin: 'compact', compactionId: 'c1' }, content: [{ type: 'text', text: 'This is an automatically generated checkpoint condensing an earlier span of the conversation to free up context.' }] },
+    },
+  ];
+  const ir = buildIrFromEvents({ id: 's', createdAt: 1 }, raw as never);
+  assert.equal(ir.messages.length, 3);
+  assert.equal(ir.messages[0].synthetic, undefined);
+  assert.equal(ir.messages[1].synthetic, true);
+  assert.equal(ir.messages[2].synthetic, undefined);
+  // native source objects preserved under meta.dsh for lossless write-back
+  const meta1 = (ir.messages[1].meta as { dsh?: { source?: Record<string, unknown> } })?.dsh;
+  assert.equal(meta1?.source?.plugin, '@deepseek-ai/dsh-system-prompt');
+});
+
+test('write-back restores native id/source/turn/step from meta.dsh', async () => {
+  const adapter = new DshAdapter();
+  const root = await tempRoot();
+  const sourceEvent = {
+    type: 'user/message', seq: 0, time: 5, surfaceOp: 'append',
+    data: { id: 'msg_orig_user', role: 'user', source: { kind: 'user', rpcId: 'rpc-77', clientTimeZone: 'Europe/Berlin' }, content: [{ type: 'text', text: 'q' }] },
+  };
+  const ir = buildIrFromEvents({ id: 's', createdAt: 5 }, [sourceEvent as never]);
+  const res = await adapter.write(ir, { root, targetCwd: 'D:\\proj-native' });
+  const buf = await fs.readFile(res.paths[0]);
+  const plain = decompressSessionBuffer(buf);
+  const events = plain.split('\n').filter((l) => l.trim()).slice(1).map((l) => JSON.parse(l)) as DshEventLike[];
+  const user = events.find((e) => e.type === 'user/message');
+  const d = user!.data as Record<string, unknown>;
+  // exact id + full source object restored (previously regenerated rpcId + hardcoded tz)
+  assert.equal(d.id, 'msg_orig_user');
+  assert.deepEqual(d.source, { kind: 'user', rpcId: 'rpc-77', clientTimeZone: 'Europe/Berlin' });
+});
+
+test('DSH ImageBlocks project to FileBlock (dsh-attachment url) and round-trip via rawContent', async () => {
+  const adapter = new DshAdapter();
+  const root = await tempRoot();
+  const imageAttachment = { attachmentId: 'att-123', mediaType: 'image/png', bytes: 100, width: 8, height: 8, name: 'shot.png' };
+  const raw = [
+    {
+      type: 'user/message', seq: 0, time: 1, surfaceOp: 'append',
+      data: { id: 'u-img', role: 'user', source: { kind: 'user' }, content: [{ type: 'image', attachment: imageAttachment }] },
+    },
+    {
+      type: 'tool/result', seq: 1, time: 2, surfaceOp: 'append',
+      data: { turn: 1, step: 1, message: { id: 't-img', role: 'user', source: { kind: 'tool', callId: 'call_1' }, content: [{ type: 'tool-result', toolCallId: 'call_1', content: [{ type: 'text', text: 'screenshot:' }, { type: 'image', attachment: imageAttachment }], isError: false }] } },
+    },
+  ];
+  const ir = buildIrFromEvents({ id: 's', createdAt: 1 }, raw as never);
+  // user image projected as FileBlock with attachment-store url
+  const userFile = ir.messages.find((m) => m.role === 'user' && m.content.some((b) => b.type === 'file'));
+  assert.ok(userFile, 'image should project to a FileBlock');
+  const fb = userFile.content[0] as { url?: string; filename?: string; mediaType?: string };
+  assert.equal(fb.url, 'dsh-attachment://att-123');
+  assert.equal(fb.filename, 'shot.png');
+  assert.equal(fb.mediaType, 'image/png');
+  // tool-result interior image becomes a FileBlock attachment, not flattened text
+  const toolMsg = ir.messages.find((m) => m.role === 'tool');
+  const tr = toolMsg?.content[0] as { type: string; attachments?: Array<{ url?: string }> };
+  assert.equal(tr.type, 'tool_result');
+  assert.equal(tr.attachments?.[0]?.url, 'dsh-attachment://att-123');
+  // lossless write-back: rawContent restores the original image blocks byte-faithfully
+  const res = await adapter.write(ir, { root, targetCwd: 'D:\\proj-img' });
+  const buf = await fs.readFile(res.paths[0]);
+  const plain = decompressSessionBuffer(buf);
+  const events = plain.split('\n').filter((l) => l.trim()).slice(1).map((l) => JSON.parse(l)) as DshEventLike[];
+  const userEv = events.find((e) => e.type === 'user/message')!;
+  const d = userEv.data as { content: Array<Record<string, unknown>> };
+  assert.deepEqual(d.content[0], { type: 'image', attachment: imageAttachment });
+});

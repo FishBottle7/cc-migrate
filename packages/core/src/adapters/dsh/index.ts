@@ -13,9 +13,61 @@
  * per-message association rules — see docs/ir-protocol.md「dsh 待适配清单」:
  *  1. read: emit MigratedToolCall records from tool-call + tool-result events
  *  2. write: consume ir.toolCalls (state wins over the block-level view)
- *  3. after MigratedMessage.meta lands: move message-level fields out of the
- *     'dsh.headerRaw' side-table into per-message association
+ *  3. per-message native fields now ride MigratedMessage.meta.dsh (gap #2);
+ *     'dsh.headerRaw' remains for the session header only.
  */
+
+/**
+ * Native per-message DSH payload stored under MigratedMessage.meta.dsh
+ * (IR gap #2 pattern, as zcode does with meta.zcode). `rawContent` carries
+ * the ORIGINAL DSH content array only when the IR block projection is lossy
+ * (DSH ImageBlock refs, non-text tool-result interiors) so write-back can
+ * restore it byte-faithfully; ids/sources/turn/step are always restored
+ * verbatim when present (they were previously regenerated with random ids
+ * and a hardcoded clientTimeZone).
+ */
+interface DshMessageNative {
+  id?: string;
+  source?: unknown;
+  turn?: number;
+  step?: number;
+  rawContent?: unknown[];
+}
+
+function withDshNative(msg: MigratedMessage, native: DshMessageNative): MigratedMessage {
+  const prev = (msg.meta as { dsh?: DshMessageNative } | undefined)?.dsh ?? {};
+  return { ...msg, meta: { ...(msg.meta ?? {}), dsh: { ...prev, ...native } } };
+}
+
+/** True when the raw DSH content array contains ImageBlock refs anywhere
+ * (top level or inside tool-result interiors) — i.e. the IR projection loses
+ * attachment bytes/dimensions and rawContent must be stashed. */
+function dshContentHasImages(content: unknown): boolean {
+  if (!Array.isArray(content)) return false;
+  return content.some((b) => {
+    if (typeof b !== 'object' || b === null) return false;
+    const rec = b as Record<string, unknown>;
+    if (rec.type === 'image') return true;
+    if (rec.type === 'tool-result' || rec.type === 'tool_result') return dshContentHasImages(rec.content);
+    return false;
+  });
+}
+
+/** Project a DSH ImageBlock ({type:'image', attachment:{attachmentId, mediaType, name?}})
+ * into an IR FileBlock. The bytes live in DSH's attachment service keyed by
+ * attachmentId — the reference rides FileBlock.url (gap #4 contract: "url when
+ * it references bytes stored elsewhere"). */
+function dshImageToFileBlock(rec: Record<string, unknown>): ContentBlock | undefined {
+  const att = rec.attachment;
+  if (typeof att !== 'object' || att === null || Array.isArray(att)) return undefined;
+  const a = att as Record<string, unknown>;
+  const id = typeof a.attachmentId === 'string' ? a.attachmentId : undefined;
+  if (!id) return undefined;
+  const out: ContentBlock = { type: 'file', url: `dsh-attachment://${id}` };
+  if (typeof a.name === 'string' && a.name) out.filename = a.name;
+  if (typeof a.mediaType === 'string' && a.mediaType) out.mediaType = a.mediaType;
+  return out;
+}
 
 import { promises as fs } from 'node:fs';
 import { join } from 'node:path';
@@ -23,6 +75,7 @@ import { randomUUID } from 'node:crypto';
 import type { Adapter, WriteOptions, WriteResult } from '../../registry.js';
 import type {
   ContentBlock,
+  FileBlock,
   MigratedMessage,
   MigratedSession,
   MessageRole,
@@ -503,29 +556,58 @@ function eventToMessage(type: string, data: DshEvent['data']): MigratedMessage |
       const isToolBridged = source?.kind === 'tool' || (Array.isArray(content) && content.some((b) => typeof b === 'object' && b !== null && ((b as Record<string, unknown>).type === 'tool-result' || (b as Record<string, unknown>).type === 'tool_result')));
       const msg = normalizeMessageLike(data);
       if (!msg) return null;
+      // Native fields for lossless write-back (gap #2): the exact id and the
+      // FULL source object (kind/plugin/rpcId/clientTimeZone/...) — previously
+      // these were regenerated with random ids and a hardcoded timezone.
+      const native: DshMessageNative = { source };
+      if (typeof maybe.id === 'string') native.id = maybe.id;
+      if (dshContentHasImages(content)) native.rawContent = content;
       // Harness-injected content (runtime-context snapshots, agent-instructions
       // <system-reminder>, skill catalogs) is persisted as ordinary user/message
       // events but carries source.kind === 'plugin'; human turns carry
       // source.kind === 'user'. Mark for target-side policy (drop / keep flagged).
-      if (source?.kind === 'plugin') return { ...msg, synthetic: true };
-      if (isToolBridged) return { ...msg, role: 'tool' as const };
-      return msg;
+      // COMPACTION CHECKPOINTS (plugin === 'compact', see
+      // @deepseek-ai/dsh-compaction/checkpoint) are CONVERSATION CONTENT — the
+      // in-stream summary travels as a message (IR gap #3 contract) and must
+      // survive migration, so they are NOT synthetic.
+      const isCompactionCheckpoint = source?.kind === 'plugin' && source?.plugin === 'compact';
+      const synthetic = source?.kind === 'plugin' && !isCompactionCheckpoint;
+      if (isToolBridged) return withDshNative({ ...msg, role: 'tool' as const }, native);
+      if (synthetic) return withDshNative({ ...msg, synthetic: true }, native);
+      return withDshNative(msg, native);
     }
     case 'assistant/message': {
       // DSH assistant/message shape: {turn,step,message:{id, role:"assistant", source:{kind:"model",...}, content:[]}}
-      const m = (data as unknown as Record<string, unknown>).message as { content?: unknown } | undefined;
+      const d = data as unknown as Record<string, unknown>;
+      const m = d.message as { id?: unknown; content?: unknown; source?: unknown } | undefined;
       if (!m || !Array.isArray(m.content) || m.content.length === 0) return null;
-      return normalizeMessageLike(m);
+      const msg = normalizeMessageLike(m);
+      if (!msg) return null;
+      const native: DshMessageNative = { source: m.source };
+      if (typeof m.id === 'string') native.id = m.id;
+      if (typeof d.turn === 'number') native.turn = d.turn;
+      if (typeof d.step === 'number') native.step = d.step;
+      if (dshContentHasImages(m.content)) native.rawContent = m.content;
+      // Canonical DSH ReasoningBlock carries no signature (llm/src/types.ts),
+      // so IR thinking.signature stays undefined for dsh-origin sessions —
+      // nothing to preserve here (gap #1 is zcode/claude-specific).
+      return withDshNative(msg, native);
     }
     case 'tool/result': {
       // Canonical DSH tool/result: {turn,step,message:{role,content,source:{kind:tool}}}
       // Preserve as role:'tool' so round-trip knows to emit tool/result.
-      const m = (data as Record<string, unknown>).message as { content?: unknown } | undefined;
+      const d = data as Record<string, unknown>;
+      const m = d.message as { id?: unknown; content?: unknown; source?: unknown } | undefined;
       if (!m || !Array.isArray(m.content)) return null;
       const msg = normalizeMessageLike(m);
       if (!msg) return null;
       // normalize to tool role
-      return { ...msg, role: 'tool' as const };
+      const native: DshMessageNative = { source: m.source };
+      if (typeof m.id === 'string') native.id = m.id;
+      if (typeof d.turn === 'number') native.turn = d.turn;
+      if (typeof d.step === 'number') native.step = d.step;
+      if (dshContentHasImages(m.content)) native.rawContent = m.content;
+      return withDshNative({ ...msg, role: 'tool' as const }, native);
     }
     default:
       return null;
@@ -542,10 +624,28 @@ function normalizeMessageLike(v: unknown): MigratedMessage | null {
   const normalizedForIR: unknown[] = rawContent.map((b: unknown) => {
     if (typeof b !== 'object' || b === null) return b;
     const rec = b as Record<string, unknown>;
+    // DSH ImageBlock ({type:'image', attachment:ImageAttachmentRef}) projects to
+    // an IR FileBlock; the attachment-store reference rides FileBlock.url and
+    // the untouched original rides meta.dsh.rawContent for lossless write-back.
+    if (rec.type === 'image') {
+      const file = dshImageToFileBlock(rec);
+      if (file) return file;
+    }
     if ((rec.type === 'tool-result' || rec.type === 'tool_result') && Array.isArray(rec.content)) {
-      const inner = rec.content as unknown[];
-      const text = inner.map((c) => typeof c === 'object' && c !== null && typeof (c as Record<string, unknown>).text === 'string' ? String((c as Record<string, unknown>).text) : '').join('');
-      return { type: 'tool_result', toolUseId: String(rec.toolCallId ?? rec.toolUseId ?? rec.id ?? ''), content: text, isError: Boolean(rec.isError) };
+      // Pass the interior through (with images pre-projected) so the shared
+      // normalizer builds text + FileBlock attachments — previously non-text
+      // tool-result content was flattened away by text-joining (gap #4).
+      const inner = (rec.content as unknown[]).map((piece) => {
+        if (typeof piece === 'object' && piece !== null && !Array.isArray(piece)) {
+          const p = piece as Record<string, unknown>;
+          if (p.type === 'image') {
+            const file = dshImageToFileBlock(p);
+            if (file) return file;
+          }
+        }
+        return piece;
+      });
+      return { type: 'tool_result', toolUseId: String(rec.toolCallId ?? rec.toolUseId ?? rec.id ?? ''), content: inner, isError: Boolean(rec.isError) };
     }
     if (rec.type === 'reasoning' && typeof rec.text === 'string') {
       return { type: 'thinking', thinking: rec.text };
@@ -601,27 +701,44 @@ export function irToEvents(ir: MigratedSession, baseTime: number): DshEvent[] {
   // verbatim; only missing timestamps fall back to baseTime with a per-bucket
   // counter. This keeps cross-bucket ordering true to the original event stream
   // (goal@1000 before message@2000) and lets the final sort restore it.
+  // Per-message native restoration (gap #2): when the IR carries meta.dsh the
+  // original id/source/turn/step AND any lossy-projected raw content array are
+  // restored verbatim; otherwise synthesized values keep legacy behavior.
+  const nativeOf = (msg: MigratedMessage): DshMessageNative =>
+    (msg.meta as { dsh?: DshMessageNative } | undefined)?.dsh ?? {};
   let msgFallback = baseTime;
   for (const msg of ir.messages) {
     const t = msg.timestamp;
     const time = typeof t === 'number' && Number.isFinite(t) ? t : msgFallback++;
     const seq = typeof msg.seq === 'number' && Number.isSafeInteger(msg.seq) ? msg.seq : FALLBACK_SEQ_BASE + fallbackIdx++;
+    const native = nativeOf(msg);
     if (msg.role === 'tool') {
       // Rebuild DSH tool/result shape: {turn,step,message:{source,role,content}}
       // preserve the nested tool-result interior expected by DSH surface.
       const toolBlocks = msg.content.filter((b) => b.type === 'tool_result');
       const toolData: Record<string, unknown> = {
-        turn: 1,
-        step: 1,
+        ...(native.turn !== undefined || native.step !== undefined
+          ? { turn: native.turn ?? 1, step: native.step ?? 1 }
+          : { turn: 1, step: 1 }),
         message: {
+          ...(native.id ? { id: native.id } : { id: `msg_${randomUUID()}` }),
           role: 'user',
-          source: { kind: 'tool', callId: (toolBlocks[0] as { toolUseId?: string })?.toolUseId ?? `call_${randomUUID()}` },
-          content: msg.content.map((b) => {
-            if (b.type === 'tool_result') return { type: 'tool-result', toolCallId: b.toolUseId, content: [{ type: 'text', text: b.content }], isError: !!b.isError };
-            if (b.type === 'text') return { type: 'text', text: b.text };
-            return { type: 'text', text: (b as { thinking?: string }).thinking ?? '' };
+          ...(native.source !== undefined ? { source: native.source } : { source: { kind: 'tool', callId: (toolBlocks[0] as { toolUseId?: string })?.toolUseId ?? `call_${randomUUID()}` } }),
+          ...(native.rawContent ? { content: native.rawContent } : {
+            content: msg.content.map((b) => {
+              if (b.type === 'tool_result') {
+                const inner: unknown[] = [{ type: 'text', text: b.content }];
+                for (const att of b.attachments ?? []) {
+                  const nativeImage = dshImageFromBlock(att);
+                  if (nativeImage) inner.push(nativeImage);
+                  else inner.push({ type: 'text', text: `[file: ${att.filename ?? att.url ?? 'attachment'}]` });
+                }
+                return { type: 'tool-result', toolCallId: b.toolUseId, content: inner, isError: !!b.isError };
+              }
+              if (b.type === 'text') return { type: 'text', text: b.text };
+              return { type: 'text', text: (b as { thinking?: string }).thinking ?? '' };
+            }),
           }),
-          id: `msg_${randomUUID()}`,
         },
       };
       raw.push({ time, type: 'tool/result', surfaceOp: 'append', data: toolData as unknown as DshEvent['data'], _msg: msg, _seq: seq });
@@ -632,24 +749,28 @@ export function irToEvents(ir: MigratedSession, baseTime: number): DshEvent[] {
       // See assertMessageEventShape in dsh-session (≈ line 1252). Plain {role,content} fails with
       // "lacks an identified message".
       const data = {
-        id: `msg_${randomUUID()}`,
+        ...(native.id ? { id: native.id } : { id: `msg_${randomUUID()}` }),
         role: 'user' as const,
-        source: { kind: 'user', rpcId: randomUUID(), clientTimeZone: 'Asia/Shanghai' },
-        content: dshContentFromBlocks(msg.content),
+        ...(native.source !== undefined ? { source: native.source } : { source: { kind: 'user', rpcId: randomUUID(), clientTimeZone: 'Asia/Shanghai' } }),
+        content: native.rawContent ?? dshContentFromBlocks(msg.content),
       } as unknown as DshEvent['data'];
       raw.push({ time, type: 'user/message', surfaceOp: 'append', data, _msg: msg, _seq: seq });
     } else {
       // DSH validates assistant/message data as {turn,step,message:{id, role:"assistant", source:{kind:"model",provider,model}, content:[]}}
       const provider = (ir.model?.provider as string) ?? 'abrdns';
       const model = (ir.model?.id as string) ?? 'GLM-5.3-Flash';
+      const nativeSource = native.source as Record<string, unknown> | undefined;
       const data = {
-        turn: 1,
-        step: 1,
+        ...(native.turn !== undefined || native.step !== undefined
+          ? { turn: native.turn ?? 1, step: native.step ?? 1 }
+          : { turn: 1, step: 1 }),
         message: {
-          id: `msg_${randomUUID()}`,
+          ...(native.id ? { id: native.id } : { id: `msg_${randomUUID()}` }),
           role: 'assistant' as const,
-          source: { kind: 'model', provider, model },
-          content: dshContentFromBlocks(msg.content),
+          // per-message source first (exact provider/model/requestId), else
+          // session-level, else legacy defaults
+          source: nativeSource ?? { kind: 'model', provider, model },
+          content: native.rawContent ?? dshContentFromBlocks(msg.content),
         },
       } as unknown as DshEvent['data'];
       raw.push({ time, type: 'assistant/message', surfaceOp: 'append', data, _msg: msg, _seq: seq });
@@ -859,6 +980,19 @@ function messageToDshData(_msg: MigratedMessage): DshEvent['data'] {
   return { role: _msg.role, content: blocksToNative(_msg.content) };
 }
 
+/** Inverse of dshImageToFileBlock: an IR FileBlock carrying a
+ * `dsh-attachment://<id>` url becomes a DSH ImageBlock. Returns undefined for
+ * foreign files that cannot map (callers fall back to a text placeholder). */
+function dshImageFromBlock(b: FileBlock): Record<string, unknown> | undefined {
+  const url = b.url ?? '';
+  if (!url.startsWith('dsh-attachment://')) return undefined;
+  const attachmentId = url.slice('dsh-attachment://'.length);
+  if (!attachmentId) return undefined;
+  const attachment: Record<string, unknown> = { attachmentId, mediaType: b.mediaType ?? 'image/png' };
+  if (b.filename) attachment.name = b.filename;
+  return { type: 'image', attachment };
+}
+
 function dshContentFromBlocks(blocks: ContentBlock[]): unknown[] {
   return blocks.map((b) => {
     switch (b.type) {
@@ -870,6 +1004,12 @@ function dshContentFromBlocks(blocks: ContentBlock[]): unknown[] {
       case 'tool_use':
         // DSH tool-call block inside assistant content
         return { type: 'tool-call', id: b.id, name: b.name, arguments: typeof b.input === 'string' ? b.input : JSON.stringify(b.input ?? {}) };
+      case 'file': {
+        // DSH ImageBlock projection (gap #4); non-mappable files degrade to text.
+        const image = dshImageFromBlock(b);
+        if (image) return image;
+        return { type: 'text', text: `[file: ${b.filename ?? b.url ?? b.mediaType ?? 'attachment'}]` };
+      }
       case 'tool_result':
         // Should not appear inside user/assistant content — tool/result is its own event type.
         // Fall back to a text wrapper so the block is not silently dropped.
