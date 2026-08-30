@@ -1,22 +1,43 @@
 /**
  * OpenCode adapter — reads/writes the canonical `opencode.db` SQLite store.
  *
- * Source-anchored from `opencode-dev`:
+ * Source-anchored from `opencode-dev` + a REAL v1.18.21 store (sampled):
  *  - DB path: packages/core/src/database/database.ts:43 `path()` — xdgData/opencode/opencode.db
  *    with channel isolation + $OPENCODE_DB / $OPENCODE_TEST_HOME overrides (global.ts:18).
- *  - Schema: packages/core/src/database/schema.gen.ts + src/session/sql.ts
- *    Authority is `session_message` ordered table; storage/*.json is v1-legacy.
+ *  - Schema: in v1.18.21 stores the authority is `message` (envelope) + `part`
+ *    (content blocks); `session_message` exists but is EMPTY (verified). Newer
+ *    builds dual-write both via SessionProjector, so reading message/part
+ *    covers both eras.
+ *  - Task subagents are NATIVE CHILD SESSIONS: `session.parent_id = <parent>`,
+ *    `agent = subagent_type`, `title = "<description> (@<agent> subagent)"`;
+ *    the parent's task tool part links back via
+ *    `state.metadata = { parentSessionId, sessionId, model, truncated }` and
+ *    carries the final result wrapped in
+ *    `<task id="ses_…" state="completed|error"><task_result|task_error>…</…></task>`
+ *    (tool/task.ts renderOutput). The FULL intermediate process lives in the
+ *    child session's own message/part rows — never folded into the parent.
+ *    Some v1.18 stores shipped with `parent_id` NULL (backfillable from task
+ *    part metadata — see .db-rescue/); the parse side self-heals via metadata.
+ *  - Compaction: boundary = user row whose part list carries
+ *    `{type:'compaction', auto, tail_start_id?}`; the paired summary assistant
+ *    (`summary:true, mode:'compaction', agent:'compaction'`) parents to it.
  *  - History: src/session/history.ts SessionHistory.load / loadForRunner (compaction-aware).
  *
  * This adapter:
- *  - Opens SQLite with Node's `node:sqlite` (Node 22.12+: `DatabaseSync`), falling back to
- *    `better-sqlite3` if present, otherwise degrades to file-mirror mode for test portability.
- *  - On parse: SELECT session + session_message WHERE session_id=? ORDER BY seq ASC, decodes
- *    each row's data (Omit<Encoded,id/type>) + type/id into MigratedMessage[], and extracts
- *    `assistant.tool==='task'` nested transcripts into MigratedSidechain[] (flatten for
- *    interactive targets).
- *  - On write: transactional INSERT into project + session + session_message (seq 0..N-1,
- *    id=msg_...), seq/unique handling, and sidechain flatten/pmapped back.
+ *  - On parse: walks the session TREE — main session + every child session
+ *    row — into MigratedSession.messages + MigratedSidechain[] with the full
+ *    intermediate transcripts (never just prompt+output), unwraps task
+ *    outputs into tool_result content (raw wrapper kept as rawResult), and
+ *    projects compaction boundaries into ir.compaction.
+ *  - On write: transactional INSERT into project + session + message + part.
+ *    flatten=false (native, the same-tool default) rebuilds each sidechain as
+ *    a child session row and links the parent's task part via
+ *    state.metadata.sessionId; flatten=true (the cross-tool "展平为顶层消息"
+ *    default) folds sidechain transcripts into top-level messages.
+ *  - Tool parts map the NATIVE four-state union: completed (output/title/
+ *    metadata — output keeps even-empty real results), error (state.error ⇄
+ *    IR tool_result isError), pending (a call with NO result in the IR —
+ *    never fabricated as completed+'', which would drift on every re-parse).
  *  - When no real opencode.db exists (tests with --root <tmp>`), falls back to a JSONL
  *    mirror at `<root>/opencode-mirror/<sessionId>.jsonl` so tests remain hermetic and
  *    do not require better-sqlite3.
@@ -27,7 +48,7 @@ import { join, dirname } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { existsSync } from 'node:fs';
 import type { Adapter, WriteOptions, WriteResult } from '../../registry.js';
-import type { ContentBlock, MigratedMessage, MigratedSession, MigratedSidechain, SessionMeta } from '../../ir.js';
+import type { ContentBlock, FileBlock, MigratedCompaction, MigratedMessage, MigratedSession, MigratedSidechain, SessionMeta } from '../../ir.js';
 import { validateSession } from '../../ir.js';
 import { blocksToText, normalizeContent } from '../../content.js';
 
@@ -137,12 +158,6 @@ async function openDb(dbPath: string, opts?: { readOnly?: boolean }): Promise<Db
   return openDbSync(dbPath, opts);
 }
 
-function mirrorDirFor(root: string | undefined): string | null {
-  if (!root) return null;
-  const t = root.endsWith('.db') ? dirname(root) : root;
-  return join(t, 'opencode-mirror');
-}
-
 export class OpenCodeAdapter implements Adapter {
   readonly tool = 'opencode' as const;
 
@@ -180,6 +195,9 @@ export class OpenCodeAdapter implements Adapter {
     const rootExplicit = !!(root && root.trim());
     const targetCwd = opts?.targetCwd ?? ir.cwd ?? '';
     const newId = opts?.sessionId ?? `ses_${randomUUID().replace(/-/g, '').slice(0, 24)}`;
+    // flatten semantics (CLI wizard wording): true = 展平为顶层消息 (cross-tool
+    // default), false = 压回 task 工具块/保留隐藏语义 (same-tool default →
+    // native child-session reconstruction).
     const flatten = opts?.flatten ?? true;
 
     const dbPath = resolveDbPath(root);
@@ -261,7 +279,12 @@ export class OpenCodeAdapter implements Adapter {
       const db = await openDb(dbPath!, { readOnly: true });
       if (db) {
         try {
-          const rows = db.prepare('SELECT id, title, time_created, directory FROM session ORDER BY time_created DESC').all() as OpRow[];
+          // TOP-LEVEL sessions only: task subagents are native child session
+          // rows (session.parent_id) and OpenCode's own UI groups them under
+          // their parent — listing them as peers would flatten 955 subagent
+          // sessions into the picker of a real store. Orphaned children whose
+          // parent row vanished stay visible (nothing silently unlistable).
+          const rows = db.prepare('SELECT id, title, time_created, directory FROM session WHERE parent_id IS NULL OR parent_id NOT IN (SELECT id FROM session) ORDER BY time_created DESC').all() as OpRow[];
           return rows.map((r) => ({
             tool: 'opencode' as const,
             sessionId: String(r.id ?? ''),
@@ -319,8 +342,15 @@ export class OpenCodeAdapter implements Adapter {
  *  - message data assist: {parentID, role:'assistant', mode:'build', agent:'build',
  *                           path:{cwd, root}, cost, tokens, modelID, providerID,
  *                           time:{created, completed}, finish?}
+ *  - compaction: boundary user row with a `{type:'compaction', auto,
+ *    tail_start_id?}` part + assistant summary row `{summary:true,
+ *    mode:'compaction', agent:'compaction', parentID:<boundary>}`.
+ *  - task subagent: child session row (session.parent_id) + parent task part
+ *    `state.metadata = {parentSessionId, sessionId, model, truncated}`;
+ *    output wrapped `<task id=… state=…><task_result>…</task_result></task>`.
  *  - part data types: text{text} | reasoning{text} | tool{tool,callID,
- *    state:{status,input,output,time}} | step-start | step-finish | patch | ...
+ *    state:{status,input,output,title,metadata,time}} | step-start |
+ *    step-finish | patch | file{mime,filename,url} | compaction | ...
  *  - sessions attach to project_id='global' (worktree '/') in practice;
  *    per-directory projects exist too (worktree forward-slashed, vcs 'git',
  *    sandboxes '[]', id 40-hex).
@@ -358,45 +388,140 @@ function ensureGlobalProject(db: DbHandle): void {
   ).run(now, now);
 }
 
-function parseFromDb(db: DbHandle, sessionId: string): MigratedSession {
-  let sessionRow: OpRow | undefined;
-  try {
-    sessionRow = db.prepare('SELECT id, title, time_created, directory, version FROM session WHERE id=?').get(sessionId) as OpRow | undefined;
-  } catch {
-    sessionRow = undefined;
-  }
-  if (!sessionRow) throw new Error(`OpenCode: session "${sessionId}" not found in opencode.db`);
-  const cwd = sessionRow.directory ? String(sessionRow.directory) : undefined;
-  const createdAt = typeof sessionRow.time_created === 'number' ? sessionRow.time_created : undefined;
-  const title = sessionRow.title ? String(sessionRow.title) : undefined;
+/* ------------------------------------------------------------------ */
+/* Parse: session tree walk                                            */
+/* ------------------------------------------------------------------ */
 
-  const msgRows = db.prepare('SELECT id, data, time_created, time_updated FROM message WHERE session_id=? ORDER BY time_created ASC, rowid ASC').all(sessionId) as OpRow[];
+interface OpSessionRow {
+  id: string;
+  parent_id?: string | null;
+  title?: string | null;
+  agent?: string | null;
+  time_created?: number | null;
+  directory?: string | null;
+}
+
+const SESSION_COLS = 'id, parent_id, title, agent, time_created, directory';
+
+function getSessionRow(db: DbHandle, id: string): OpSessionRow | undefined {
+  return db.prepare(`SELECT ${SESSION_COLS} FROM session WHERE id=?`).get(id) as OpSessionRow | undefined;
+}
+
+function childSessionRows(db: DbHandle, parentId: string): OpSessionRow[] {
+  return db.prepare(`SELECT ${SESSION_COLS} FROM session WHERE parent_id=? ORDER BY time_created ASC, rowid ASC`).all(parentId) as unknown as OpSessionRow[];
+}
+
+function parseRowData(v: unknown): Record<string, unknown> {
+  if (typeof v === 'string') {
+    try { return JSON.parse(v) as Record<string, unknown>; } catch { return {}; }
+  }
+  return ((v as Record<string, unknown>) ?? {});
+}
+
+function loadPartsByMessage(db: DbHandle, sessionId: string): Map<string, Array<Record<string, unknown>>> {
   const partRows = db.prepare('SELECT message_id, data FROM part WHERE session_id=? ORDER BY rowid ASC').all(sessionId) as OpRow[];
-  const partsByMessage = new Map<string, Array<Record<string, unknown>>>();
+  const map = new Map<string, Array<Record<string, unknown>>>();
   for (const pr of partRows) {
-    let d: Record<string, unknown>;
-    try { d = typeof pr.data === 'string' ? JSON.parse(pr.data) : (pr.data as Record<string, unknown>) ?? {}; } catch { continue; }
+    const d = parseRowData(pr.data);
     const key = String(pr.message_id ?? '');
-    const list = partsByMessage.get(key) ?? [];
+    const list = map.get(key) ?? [];
     list.push(d);
-    partsByMessage.set(key, list);
+    map.set(key, list);
+  }
+  return map;
+}
+
+interface OpTaskLink {
+  callId: string;
+  /** task part state.metadata.sessionId — the native child session reference */
+  childRef?: string;
+  subagentType?: string;
+  parentMessageRowId: string;
+}
+
+interface WalkResult {
+  messages: MigratedMessage[];
+  sidechains: MigratedSidechain[];
+  compactions: MigratedCompaction[];
+  model?: MigratedSession['model'];
+}
+
+/**
+ * Walk ONE session's message/part rows into IR messages, then recurse into
+ * its native sub-sessions as sidechains. Children come from
+ * `session.parent_id` plus self-healing via task part
+ * `state.metadata.sessionId` (v1.18 stores shipped with parent_id NULL —
+ * backfillable only from the task part metadata).
+ */
+function walkSession(db: DbHandle, sessionId: string, seen: Set<string>): WalkResult {
+  if (seen.has(sessionId)) return { messages: [], sidechains: [], compactions: [] };
+  seen.add(sessionId);
+
+  const msgRows = db.prepare('SELECT id, data, time_created FROM message WHERE session_id=? ORDER BY time_created ASC, rowid ASC').all(sessionId) as OpRow[];
+  const partsByMessage = loadPartsByMessage(db, sessionId);
+
+  // Compaction summary assistants pair to their boundary user row via
+  // parentID (message-v2.ts filterCompacted contract) and are consumed into
+  // the projected summary carrier — never emitted as ordinary assistants.
+  const summaryRowByParent = new Map<string, string>();
+  const summaryPartsByParent = new Map<string, Array<Record<string, unknown>>>();
+  const summaryRowIds = new Set<string>();
+  for (const r of msgRows) {
+    const rowId = String(r.id ?? '');
+    const d = parseRowData(r.data);
+    if (d.summary === true && typeof d.parentID === 'string' && d.parentID) {
+      summaryRowIds.add(rowId);
+      summaryRowByParent.set(d.parentID, rowId);
+      summaryPartsByParent.set(d.parentID, partsByMessage.get(rowId) ?? []);
+    }
   }
 
   const messages: MigratedMessage[] = [];
-  const sidechains: MigratedSidechain[] = [];
+  const compactions: MigratedCompaction[] = [];
+  const taskLinks = new Map<string, OpTaskLink>();
   let model: MigratedSession['model'];
 
   for (const r of msgRows) {
-    let data: Record<string, unknown>;
-    try { data = typeof r.data === 'string' ? JSON.parse(r.data) : (r.data as Record<string, unknown>) ?? {}; } catch { data = {}; }
+    const rowId = String(r.id ?? '');
+    const data = parseRowData(r.data);
     const role = String(data.role ?? 'assistant') as MigratedMessage['role'];
     const ts = typeof r.time_created === 'number' ? r.time_created : undefined;
-    const parts = partsByMessage.get(String(r.id ?? '')) ?? [];
+    const parts = partsByMessage.get(rowId) ?? [];
+
+    if (summaryRowIds.has(rowId)) continue;
 
     if (role === 'user') {
+      const compactionPart = parts.find((p) => p.type === 'compaction');
+      if (compactionPart) {
+        const summaryText = (summaryPartsByParent.get(rowId) ?? [])
+          .filter((p) => p.type === 'text' && typeof p.text === 'string')
+          .map((p) => String(p.text))
+          .join('\n');
+        const ocMeta: Record<string, unknown> = { auto: compactionPart.auto === true, boundaryMessageId: rowId };
+        if (typeof compactionPart.tail_start_id === 'string' && compactionPart.tail_start_id) ocMeta.tailStartId = compactionPart.tail_start_id;
+        const summaryId = summaryRowByParent.get(rowId);
+        if (summaryId) ocMeta.summaryMessageId = summaryId;
+        if (summaryText) {
+          // Canonical conversation carrier: the summary text travels as an
+          // ordinary user message (targets that ignore compaction[] still see
+          // it); the native boundary/summary rows are rebuilt from the
+          // compaction entry on write.
+          messages.push({ role: 'user', content: [{ type: 'text', text: summaryText }], timestamp: ts });
+          compactions.push({ summary: summaryText, anchorIndex: messages.length - 1, meta: { opencode: ocMeta } });
+          continue;
+        }
+        // Boundary without a summary pair (failed compaction): keep the typed
+        // record without an anchor — the conversational stream has nothing to
+        // carry it on.
+        compactions.push({ summary: '', meta: { opencode: ocMeta } });
+      }
       const content: ContentBlock[] = [];
       for (const p of parts) {
         if (p.type === 'text' && typeof p.text === 'string') content.push({ type: 'text', text: p.text });
+        else if (p.type === 'file') {
+          const f = fileFromPart(p);
+          if (f) content.push(f);
+        }
       }
       if (content.length) messages.push({ role: 'user', content, timestamp: ts });
       continue;
@@ -413,36 +538,45 @@ function parseFromDb(db: DbHandle, sessionId: string): MigratedSession {
         content.push({ type: 'text', text: p.text });
       } else if (p.type === 'reasoning' && typeof p.text === 'string') {
         content.push({ type: 'thinking', thinking: p.text });
+      } else if (p.type === 'file') {
+        const f = fileFromPart(p);
+        if (f) content.push(f);
       } else if (p.type === 'tool') {
         const callID = String(p.callID ?? randomUUID());
         const state = (p.state ?? {}) as Record<string, unknown>;
         const input = (state.input ?? {}) as Record<string, unknown>;
         content.push({ type: 'tool_use', id: callID, name: String(p.tool ?? 'tool'), input });
-        // opencode stores tool output inside the part — re-emit as IR tool_result
-        if (state.output !== undefined && state.output !== null) {
-          const outText = typeof state.output === 'string' ? state.output : JSON.stringify(state.output);
-          toolResults.push({ role: 'tool', content: [{ type: 'tool_result', toolUseId: callID, content: outText }], timestamp: ts });
+        const isTask = String(p.tool ?? '') === 'task';
+        if (isTask) {
+          const meta = (state.metadata ?? {}) as Record<string, unknown>;
+          taskLinks.set(callID, {
+            callId: callID,
+            childRef: typeof meta.sessionId === 'string' && meta.sessionId ? meta.sessionId : undefined,
+            subagentType: typeof input.subagent_type === 'string' ? input.subagent_type : undefined,
+            parentMessageRowId: rowId,
+          });
         }
-        // hidden task subagent: flatten the transcript into a sidechain
-        if (String(p.tool ?? '') === 'task') {
-          const taskInput = input as Record<string, unknown>;
-          const out = state.output;
-          if (out !== undefined && out !== null) {
-            const scMessages: MigratedMessage[] = [
-              { role: 'user', content: [{ type: 'text', text: String(taskInput.prompt ?? taskInput.description ?? '(task)') }], timestamp: ts },
-              ...normalizeOutputToMessages(out),
-            ];
-            sidechains.push({
-              agentId: callID,
-              kind: 'subagent',
-              agentType: typeof taskInput.subagent_type === 'string' ? taskInput.subagent_type : undefined,
-              parentMessageId: String(r.id ?? ''),
-              messages: scMessages,
-            });
-          }
+        // opencode stores tool output inside the part — re-emit as IR tool_result.
+        // Empty-string outputs are REAL (bash with empty stdout) and travel as
+        // tool_result content ''; error parts carry their text in state.error
+        // (isError); pending/running parts are calls without any result — no
+        // tool_result is projected for them.
+        if (state.output !== undefined && state.output !== null) {
+          const raw = typeof state.output === 'string' ? state.output : JSON.stringify(state.output);
+          const unwrapped = isTask ? unwrapTaskOutput(raw) : undefined;
+          const block: { type: 'tool_result'; toolUseId: string; content: string; isError?: boolean; rawResult?: unknown } = {
+            type: 'tool_result',
+            toolUseId: callID,
+            content: unwrapped ? unwrapped.text : raw,
+          };
+          // keep the renderOutput wrapper (task id/state) as structured source payload
+          if (unwrapped && unwrapped.text !== raw) block.rawResult = raw;
+          toolResults.push({ role: 'tool', content: [block as ContentBlock], timestamp: ts });
+        } else if (typeof state.error === 'string' && state.error) {
+          toolResults.push({ role: 'tool', content: [{ type: 'tool_result', toolUseId: callID, content: state.error, isError: true }], timestamp: ts });
         }
       }
-      // step-start / step-finish / patch / file / compaction: structural metadata, skipped
+      // step-start / step-finish / patch: structural metadata, skipped
     }
     if (content.length) {
       messages.push({ role: 'assistant', content, timestamp: ts, provider: typeof data.providerID === 'string' ? data.providerID : undefined, model: typeof data.modelID === 'string' ? data.modelID : undefined });
@@ -450,34 +584,96 @@ function parseFromDb(db: DbHandle, sessionId: string): MigratedSession {
     }
   }
 
+  // Native sub-sessions → sidechains (recursion covers grandchildren).
+  const sidechains: MigratedSidechain[] = [];
+  const linkByChild = new Map<string, OpTaskLink>();
+  for (const link of taskLinks.values()) {
+    if (link.childRef && !linkByChild.has(link.childRef)) linkByChild.set(link.childRef, link);
+  }
+  const childIds: string[] = [];
+  const childSeen = new Set<string>();
+  for (const row of childSessionRows(db, sessionId)) {
+    if (!childSeen.has(row.id)) { childSeen.add(row.id); childIds.push(row.id); }
+  }
+  for (const childRef of linkByChild.keys()) {
+    if (childSeen.has(childRef)) continue;
+    if (getSessionRow(db, childRef)) { childSeen.add(childRef); childIds.push(childRef); }
+  }
+  for (const childId of childIds) {
+    const row = getSessionRow(db, childId);
+    if (!row) continue;
+    const sub = walkSession(db, childId, seen);
+    const link = linkByChild.get(childId);
+    const ocMeta: Record<string, unknown> = { parentSessionId: sessionId };
+    if (link) ocMeta.callId = link.callId;
+    const sc: MigratedSidechain = {
+      agentId: childId,
+      kind: 'subagent',
+      agentType: ((row.agent ? String(row.agent) : undefined) ?? link?.subagentType) || undefined,
+      title: row.title ? String(row.title) : undefined,
+      createdAt: typeof row.time_created === 'number' ? row.time_created : undefined,
+      parentMessageId: link?.parentMessageRowId,
+      messages: sub.messages,
+      meta: { opencode: ocMeta },
+    };
+    if (sub.sidechains.length) sc.sidechains = sub.sidechains;
+    if (sub.compactions.length) sc.compaction = sub.compactions;
+    sidechains.push(sc);
+  }
+
+  return { messages, sidechains, compactions, model };
+}
+
+function parseFromDb(db: DbHandle, sessionId: string): MigratedSession {
+  let sessionRow: OpSessionRow | undefined;
+  try {
+    sessionRow = getSessionRow(db, sessionId);
+  } catch {
+    sessionRow = undefined;
+  }
+  if (!sessionRow) throw new Error(`OpenCode: session "${sessionId}" not found in opencode.db`);
+  const seen = new Set<string>();
+  const walk = walkSession(db, String(sessionRow.id ?? sessionId), seen);
   const ir: MigratedSession = {
     schemaVersion: 2,
     originTool: 'opencode',
     originSessionId: String(sessionRow.id ?? sessionId),
-    title,
-    createdAt,
-    cwd,
-    model,
-    messages,
+    title: sessionRow.title ? String(sessionRow.title) : undefined,
+    createdAt: typeof sessionRow.time_created === 'number' ? sessionRow.time_created : undefined,
+    cwd: sessionRow.directory ? String(sessionRow.directory) : undefined,
+    messages: walk.messages,
   };
-  if (sidechains.length) ir.sidechains = sidechains;
+  if (walk.model) ir.model = walk.model;
+  if (walk.compactions.length) ir.compaction = walk.compactions;
+  if (walk.sidechains.length) ir.sidechains = walk.sidechains;
   return validateSession(ir);
 }
 
-/** Convert an opencode task tool output into IR messages (for sidechains). */
-function normalizeOutputToMessages(output: unknown): MigratedMessage[] {
-  if (typeof output === 'string') {
-    return [{ role: 'assistant', content: [{ type: 'text', text: output }] }];
-  }
-  if (Array.isArray(output)) {
-    return [{ role: 'assistant', content: normalizeContent(output as unknown[]) }];
-  }
-  if (output && typeof output === 'object') {
-    const o = output as Record<string, unknown>;
-    if (typeof o.text === 'string') return [{ role: 'assistant', content: [{ type: 'text', text: o.text }] }];
-    return [{ role: 'assistant', content: [{ type: 'text', text: JSON.stringify(o) }] }];
-  }
-  return [];
+/* ------------------------------------------------------------------ */
+/* Task output wrap/unwrap (tool/task.ts renderOutput wire format)     */
+/* ------------------------------------------------------------------ */
+
+const TASK_OUTPUT_RE = /^<task id="([^"]*)" state="([a-z]+)">\n<task_(result|error)>\n([\s\S]*)\n<\/task_\3>\n<\/task>$/;
+
+function unwrapTaskOutput(raw: string | undefined): { text: string; taskId?: string; isError?: boolean } {
+  if (!raw) return { text: '' };
+  const m = TASK_OUTPUT_RE.exec(raw);
+  if (!m) return { text: raw };
+  return { text: m[4], taskId: m[1], isError: m[3] === 'error' };
+}
+
+function wrapTaskOutput(taskId: string, text: string, isError: boolean): string {
+  const tag = isError ? 'task_error' : 'task_result';
+  return `<task id="${taskId}" state="${isError ? 'error' : 'completed'}">\n<${tag}>\n${text}\n</${tag}>\n</task>`;
+}
+
+function fileFromPart(p: Record<string, unknown>): ContentBlock | undefined {
+  const out: FileBlock = { type: 'file' };
+  if (typeof p.filename === 'string' && p.filename) out.filename = p.filename;
+  if (typeof p.mime === 'string' && p.mime) out.mediaType = p.mime;
+  if (typeof p.url === 'string' && p.url) out.url = p.url;
+  else if (typeof p.data === 'string' && p.data) out.data = p.data;
+  return out.filename || out.mediaType || out.url || out.data ? out : undefined;
 }
 
 /* ------------------------------------------------------------------ */
@@ -569,92 +765,121 @@ function mapToolPart(tool: string, input: Record<string, unknown>, output: strin
   return { tool: name, input: mapped, metadata, title };
 }
 
+/* ------------------------------------------------------------------ */
+/* Write: IR -> message/part rows                                      */
+/* ------------------------------------------------------------------ */
+
+const zeroTokens = { total: 0, input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } };
+
+interface WriteShared {
+  db: DbHandle;
+  now: number;
+  dir: string;
+  path: { cwd: string; root: string };
+  modelID: string;
+  providerID: string;
+  keepSynthetic: boolean;
+  /** The TUI renders assistant content ONLY inside step boundaries. */
+  snapshot: string;
+  newMsgId(time: number): string;
+  /** Part ids must sort in insertion order: MessageV2.hydrate() orders parts
+   *  by id STRING, so a shared zero-padded counter keeps step-start first and
+   *  step-finish last across the whole write (main + child sessions). */
+  newPartId(time: number): string;
+}
+
+function makeWriteShared(db: DbHandle, opts: { now: number; dir: string; modelID: string; providerID: string; keepSynthetic: boolean }): WriteShared {
+  let partCounter = 0;
+  const idRand = (n: number): string => randomUUID().replace(/-/g, '').slice(0, n);
+  const hexTime = (time: number): string => time.toString(16).padStart(10, '0');
+  return {
+    db,
+    now: opts.now,
+    dir: opts.dir,
+    path: { cwd: opts.dir, root: opts.dir },
+    modelID: opts.modelID,
+    providerID: opts.providerID,
+    keepSynthetic: opts.keepSynthetic,
+    snapshot: '0'.repeat(40),
+    newMsgId: (time) => `msg_${hexTime(time)}${idRand(14)}`,
+    newPartId: (time) => `prt_${hexTime(time)}${String(partCounter++).padStart(4, '0')}${idRand(10)}`,
+  };
+}
+
+function filePartFromBlock(b: Extract<ContentBlock, { type: 'file' }>): Record<string, unknown> {
+  const fp: Record<string, unknown> = { type: 'file' };
+  if (b.filename) fp.filename = b.filename;
+  if (b.mediaType) fp.mime = b.mediaType;
+  if (b.url) fp.url = b.url;
+  else if (b.data) fp.url = `data:${b.mediaType ?? 'application/octet-stream'};base64,${b.data}`;
+  return fp;
+}
+
 /**
- * Write an IR session into the REAL v1.18 schema: project + session +
- * message + part. No silent error swallowing — a failed insert throws.
+ * Write an array of IR messages into ONE session's message/part rows.
+ * Shared by the main session and every reconstructed child session.
  */
-function writeToDb(db: DbHandle, ir: MigratedSession, newId: string, cwd: string, _flatten: boolean, keepSynthetic: boolean): string {
-  const now = Date.now();
-  const dir = fwdSlash(cwd || '/');
-  // Attach to the app's own project row when present, else 'global' (the
-  // convention every production session row uses), else create one.
-  ensureGlobalProject(db);
-  const projectId = resolveProjectRow(db, dir);
-
-  db.prepare(
-    'INSERT INTO session (id, project_id, workspace_id, parent_id, slug, directory, path, title, version, share_url, summary_additions, summary_deletions, summary_files, summary_diffs, metadata, cost, tokens_input, tokens_output, tokens_reasoning, tokens_cache_read, tokens_cache_write, revert, permission, agent, model, time_created, time_updated, time_compacting, time_archived) VALUES (?, ?, NULL, NULL, ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, NULL, NULL, 0, 0, 0, 0, 0, 0, NULL, NULL, NULL, NULL, ?, ?, NULL, NULL)',
-  ).run(
-    newId,
-    projectId,
-    `migrated-${newId.replace(/[^a-z0-9]/gi, '').slice(-10).toLowerCase()}`,
-    dir,
-    dir,
-    ir.title ?? '(migrated)',
-    OPENCODE_APP_VERSION,
-    ir.createdAt ?? now,
-    now,
-  );
-
-  const modelID = ir.model?.id ?? 'glm-5.3-flash';
-  const providerID = ir.model?.provider ?? 'opencode';
-  const path = { cwd: dir, root: dir };
-  const zeroTokens = { total: 0, input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } };
-  // The TUI renders assistant content ONLY inside step boundaries: every real
-  // assistant message opens with a step-start part and closes with a
-  // step-finish part (reason + tokens + cost + snapshot). Without them the
-  // conversation renders blank even though storage reads back fine.
-  const snapshot = '0'.repeat(40);
+function writeMessages(
+  scope: WriteShared,
+  sessionRowId: string,
+  messages: MigratedMessage[],
+  opts: {
+    compaction?: MigratedCompaction[];
+    resolveTask?: (callId: string, input: Record<string, unknown>) => { childId: string } | undefined;
+  } = {},
+): void {
+  const { db, now, path, modelID, providerID, keepSynthetic, snapshot } = scope;
+  const insertMessage = (id: string, time: number, data: Record<string, unknown>): void => {
+    db.prepare('INSERT INTO message (id, session_id, time_created, time_updated, data) VALUES (?, ?, ?, ?, ?)').run(id, sessionRowId, time, now, JSON.stringify(data));
+  };
+  const insertPart = (messageId: string, data: Record<string, unknown>, time: number): void => {
+    db.prepare('INSERT INTO part (id, message_id, session_id, time_created, time_updated, data) VALUES (?, ?, ?, ?, ?, ?)').run(scope.newPartId(time), messageId, sessionRowId, time, now, JSON.stringify(data));
+  };
 
   // Pair tool-role IR messages into the preceding assistant's tool parts
   // (opencode stores tool output inside the part, not as separate rows).
-  const pendingToolOutput = new Map<string, string>();
+  const pendingToolOutput = new Map<string, { text: string; isError?: boolean; raw?: unknown }>();
   const consumedToolMsgs = new Set<number>();
-  ir.messages.forEach((m, idx) => {
+  messages.forEach((m, idx) => {
     if (m.role !== 'tool') return;
     for (const b of m.content) {
       if (b.type === 'tool_result' && b.toolUseId) {
         const prev = pendingToolOutput.get(b.toolUseId);
-        pendingToolOutput.set(b.toolUseId, prev ? `${prev}\n${b.content}` : b.content);
+        pendingToolOutput.set(b.toolUseId, prev
+          ? { text: `${prev.text}\n${b.content}`, isError: prev.isError || b.isError, raw: prev.raw ?? b.rawResult }
+          : { text: b.content, isError: b.isError, raw: b.rawResult });
         consumedToolMsgs.add(idx);
       }
     }
   });
+
+  // Compaction checkpoints map to OpenCode's NATIVE compaction boundary: a
+  // user message carrying a `compaction` part plus an assistant `summary: true`
+  // message. The `auto` flag round-trips through the opencode namespace
+  // (falling back to the DSH sourceCommandId rule for claude-sourced anchors).
+  const compactionByAnchor = new Map<number, { summary: string; auto: boolean }>();
+  for (const c of opts.compaction ?? []) {
+    if (typeof c.anchorIndex !== 'number') continue;
+    const anchor = messages[c.anchorIndex];
+    if (!anchor) continue;
+    const ocMeta = (c.meta as { opencode?: { auto?: unknown } } | undefined)?.opencode;
+    const anchorOc = (anchor.meta as { opencode?: { auto?: unknown } } | undefined)?.opencode;
+    const dshSource = (anchor.meta as { dsh?: { source?: Record<string, unknown> } } | undefined)?.dsh?.source;
+    compactionByAnchor.set(c.anchorIndex, {
+      summary: c.summary,
+      auto: typeof ocMeta?.auto === 'boolean' ? ocMeta.auto
+        : typeof anchorOc?.auto === 'boolean' ? anchorOc.auto
+        : !(dshSource && typeof dshSource.sourceCommandId === 'string'),
+    });
+  }
 
   // The TUI rebuilds the conversation as a TREE rooted at each user message:
   // every assistant step of a turn carries parentID = that turn's user id
   // (verified against real v1.18 rows — assistant messages never chain to
   // another assistant). A linear chain renders as a blank session.
   let currentUserId: string | undefined;
-  // Part ids must sort in insertion order: MessageV2.hydrate() orders parts by
-  // id STRING, so a per-message zero-padded sequence suffix keeps step-start
-  // first and step-finish last.
-  let partCounter = 0;
-  const idRand = (n: number): string => randomUUID().replace(/-/g, '').slice(0, n);
-  const newMsgId = (time: number): string => `msg_${time.toString(16).padStart(10, '0')}${idRand(14)}`;
-  const newPartId = (time: number): string => `prt_${time.toString(16).padStart(10, '0')}${String(partCounter++).padStart(4, '0')}${idRand(10)}`;
-  const insertPart = (messageId: string, data: Record<string, unknown>, time: number): void => {
-    db.prepare('INSERT INTO part (id, message_id, session_id, time_created, time_updated, data) VALUES (?, ?, ?, ?, ?, ?)').run(
-      newPartId(time), messageId, newId, time, now, JSON.stringify(data),
-    );
-  };
 
-  // DSH compaction checkpoints (IR gap #3 bucket) map to OpenCode's NATIVE
-  // compaction boundary: a user message carrying a `compaction` part plus an
-  // assistant `summary: true` message. OpenCode keeps the shadowed
-  // pre-compaction messages in storage but filterCompacted() excludes them
-  // from model replay — exactly DSH's "原文还在日志里,模型只见摘要+后文".
-  const compactionByAnchor = new Map<number, { summary: string; auto: boolean }>();
-  for (const [i, c] of (ir.compaction ?? []).entries()) {
-    if (typeof c.anchorIndex !== 'number') continue;
-    const anchor = ir.messages[c.anchorIndex];
-    const nativeSource = (anchor?.meta as { dsh?: { source?: Record<string, unknown> } } | undefined)?.dsh?.source;
-    compactionByAnchor.set(c.anchorIndex, {
-      summary: c.summary,
-      auto: !(nativeSource && typeof nativeSource.sourceCommandId === 'string'),
-    });
-  }
-
-  ir.messages.forEach((m, idx) => {
+  messages.forEach((m, idx) => {
     if (consumedToolMsgs.has(idx) && m.role === 'tool') return; // merged into tool part
     if (m.role === 'system') return; // system prompts are opencode config, not chat rows
     // Harness-injected messages (DSH runtime context / <system-reminder>):
@@ -664,10 +889,13 @@ function writeToDb(db: DbHandle, ir: MigratedSession, newId: string, cwd: string
     // LLM replay — lossless storage without polluting the model context.
     if (m.synthetic && !keepSynthetic) return;
     const time = m.timestamp ?? now;
-    const id = newMsgId(time);
+    const id = scope.newMsgId(time);
 
     if (m.role === 'user') {
       // Compaction checkpoint -> boundary pair (native OpenCode semantics).
+      // tail_start_id is intentionally NOT re-emitted: message ids are
+      // regenerated on write and a preserved source id would dangle — the
+      // app recomputes it on the session's next compaction.
       if (compactionByAnchor.has(idx)) {
         const entry = compactionByAnchor.get(idx)!;
         const boundaryData: Record<string, unknown> = {
@@ -677,14 +905,12 @@ function writeToDb(db: DbHandle, ir: MigratedSession, newId: string, cwd: string
           model: { providerID, modelID },
           summary: { diffs: [] },
         };
-        db.prepare('INSERT INTO message (id, session_id, time_created, time_updated, data) VALUES (?, ?, ?, ?, ?)').run(
-          id, newId, time, now, JSON.stringify(boundaryData),
-        );
+        insertMessage(id, time, boundaryData);
         insertPart(id, { type: 'compaction', auto: entry.auto }, time);
         currentUserId = id;
         // summary assistant parented to the boundary user (message-v2.ts
         // filterCompacted: info.summary && info.finish && parentID match)
-        const summaryId = newMsgId(time + 1);
+        const summaryId = scope.newMsgId(time + 1);
         const summaryData: Record<string, unknown> = {
           parentID: id,
           role: 'assistant',
@@ -699,9 +925,7 @@ function writeToDb(db: DbHandle, ir: MigratedSession, newId: string, cwd: string
           finish: 'stop',
           summary: true,
         };
-        db.prepare('INSERT INTO message (id, session_id, time_created, time_updated, data) VALUES (?, ?, ?, ?, ?)').run(
-          summaryId, newId, time + 1, now, JSON.stringify(summaryData),
-        );
+        insertMessage(summaryId, time + 1, summaryData);
         insertPart(summaryId, { type: 'step-start', snapshot }, time + 1);
         insertPart(summaryId, { type: 'text', text: entry.summary }, time + 1);
         insertPart(summaryId, { type: 'step-finish', reason: 'stop', snapshot, tokens: zeroTokens, cost: 0 }, time + 1);
@@ -714,11 +938,10 @@ function writeToDb(db: DbHandle, ir: MigratedSession, newId: string, cwd: string
         model: { providerID, modelID },
         summary: { diffs: [] },
       };
-      db.prepare('INSERT INTO message (id, session_id, time_created, time_updated, data) VALUES (?, ?, ?, ?, ?)').run(
-        id, newId, time, now, JSON.stringify(data),
-      );
+      insertMessage(id, time, data);
       for (const b of m.content) {
         if (b.type === 'text') insertPart(id, { type: 'text', text: b.text, ignored: m.synthetic ? true : undefined, synthetic: m.synthetic ? true : undefined }, time);
+        else if (b.type === 'file') insertPart(id, filePartFromBlock(b), time);
       }
       currentUserId = id;
       return;
@@ -736,9 +959,7 @@ function writeToDb(db: DbHandle, ir: MigratedSession, newId: string, cwd: string
         model: { providerID, modelID },
         summary: { diffs: [] },
       };
-      db.prepare('INSERT INTO message (id, session_id, time_created, time_updated, data) VALUES (?, ?, ?, ?, ?)').run(
-        id, newId, time, now, JSON.stringify(data),
-      );
+      insertMessage(id, time, data);
       insertPart(id, { type: 'text', text: `[tool result] ${text}` }, time);
       return;
     }
@@ -758,9 +979,7 @@ function writeToDb(db: DbHandle, ir: MigratedSession, newId: string, cwd: string
       time: { created: time, completed: time },
       finish: hasToolCall ? 'tool-calls' : 'stop',
     };
-    db.prepare('INSERT INTO message (id, session_id, time_created, time_updated, data) VALUES (?, ?, ?, ?, ?)').run(
-      id, newId, time, now, JSON.stringify(data),
-    );
+    insertMessage(id, time, data);
     insertPart(id, { type: 'step-start', snapshot }, time);
     for (const b of m.content) {
       if (b.type === 'thinking') {
@@ -772,25 +991,58 @@ function writeToDb(db: DbHandle, ir: MigratedSession, newId: string, cwd: string
         insertPart(id, { type: 'reasoning', text: b.thinking, time: { start: time, end: time + durMs } }, time);
       }
       else if (b.type === 'text') insertPart(id, { type: 'text', text: b.text }, time);
+      else if (b.type === 'file') insertPart(id, filePartFromBlock(b), time);
       else if (b.type === 'tool_use') {
-        const output = pendingToolOutput.get(b.id);
-        const mappedTool = mapToolPart(b.name, (b.input ?? {}) as Record<string, unknown>, output);
-        // ToolStateCompleted schema: output, title and metadata are REQUIRED
-        // fields; a part missing any of them fails the API part union and the
-        // conversation renders blank.
-        insertPart(id, {
-          type: 'tool',
-          tool: mappedTool.tool,
-          callID: b.id,
-          state: {
+        const outInfo = pendingToolOutput.get(b.id);
+        const mappedTool = mapToolPart(b.name, (b.input ?? {}) as Record<string, unknown>, outInfo?.text);
+        let output = outInfo?.text ?? '';
+        let metadata = mappedTool.metadata;
+        const isTask = mappedTool.tool === 'task' || String(b.name).toLowerCase() === 'task';
+        let taskChildId: string | undefined;
+        if (isTask) {
+          const child = opts.resolveTask?.(b.id, mappedTool.input);
+          if (child) {
+            taskChildId = child.childId;
+            // Native task-part linkage: metadata.sessionId points at the
+            // reconstructed child session row; the output re-wraps in
+            // renderOutput format with the NEW child id (the source wrapper,
+            // kept as rawResult upstream, references the OLD session id).
+            metadata = {
+              parentSessionId: sessionRowId,
+              sessionId: child.childId,
+              model: { modelID, providerID },
+              truncated: false,
+            };
+          }
+        }
+        // Native ToolState union (schema v1/session.ts): completed REQUIRES
+        // output/title/metadata; error carries `error`; pending is
+        // {status,input,raw}. A call without any IR result must NOT be
+        // fabricated as completed+'' — that would re-parse into a phantom
+        // empty tool_result and drift the transcript on every round-trip.
+        let state: Record<string, unknown>;
+        if (!outInfo) {
+          state = { status: 'pending', input: mappedTool.input, raw: '' };
+        } else if (outInfo.isError) {
+          state = {
+            status: 'error',
+            input: mappedTool.input,
+            error: isTask && taskChildId ? wrapTaskOutput(taskChildId, unwrapTaskOutput(output).text, true) : output,
+            ...(isTask && taskChildId ? { metadata } : {}),
+            time: { start: time, end: time },
+          };
+        } else {
+          if (isTask && taskChildId) output = wrapTaskOutput(taskChildId, unwrapTaskOutput(output).text, false);
+          state = {
             status: 'completed',
             title: mappedTool.title,
             input: mappedTool.input,
-            output: output ?? '',
-            metadata: mappedTool.metadata,
+            output,
+            metadata,
             time: { start: time, end: time },
-          },
-        }, time);
+          };
+        }
+        insertPart(id, { type: 'tool', tool: mappedTool.tool, callID: b.id, state }, time);
       }
     }
     insertPart(id, {
@@ -801,6 +1053,136 @@ function writeToDb(db: DbHandle, ir: MigratedSession, newId: string, cwd: string
       cost: 0,
     }, time);
   });
+}
+
+/** Map a source subagent type onto OpenCode's lowercase agent vocabulary. */
+function mapAgentType(agentType?: string): string | null {
+  const t = (agentType ?? '').trim().toLowerCase();
+  if (!t) return null;
+  return t === 'general-purpose' ? 'general' : t;
+}
+
+function firstUserText(messages: MigratedMessage[]): string {
+  const u = messages.find((m) => m.role === 'user');
+  if (!u) return '';
+  return u.content.filter((b) => b.type === 'text').map((b) => b.text).join('\n');
+}
+
+function matchByPrompt(input: Record<string, unknown>, queue: MigratedSidechain[]): MigratedSidechain | undefined {
+  const prompt = typeof input.prompt === 'string' ? input.prompt : '';
+  if (!prompt) return undefined;
+  return queue.find((sc) => firstUserText(sc.messages) === prompt);
+}
+
+/**
+ * Write an IR session into the REAL v1.18 schema: project + session +
+ * message + part. No silent error swallowing — a failed insert throws.
+ *
+ * Sidechains (flatten=false, the hidden-semantics path): every sidechain
+ * becomes a native CHILD SESSION row (session.parent_id) whose transcript is
+ * written in full, and the matching task tool part in the parent gets
+ * state.metadata.sessionId pointing at it — the exact shape opencode's own
+ * task tool produces. Sidechains no task call claims are still written as
+ * standalone child sessions so the transcript survives. Matching order:
+ * meta.opencode.callId → agentId → first-user-prompt equality → FIFO (the
+ * zcode adapter's proven chain).
+ */
+function writeToDb(db: DbHandle, ir: MigratedSession, newId: string, cwd: string, flatten: boolean, keepSynthetic: boolean): string {
+  const now = Date.now();
+  const dir = fwdSlash(cwd || '/');
+  // Attach to the app's own project row when present, else 'global' (the
+  // convention every production session row uses), else create one.
+  ensureGlobalProject(db);
+  const projectId = resolveProjectRow(db, dir);
+
+  const modelID = ir.model?.id ?? 'glm-5.3-flash';
+  const providerID = ir.model?.provider ?? 'opencode';
+  const scope = makeWriteShared(db, { now, dir, modelID, providerID, keepSynthetic });
+
+  const insertSessionRow = (p: { id: string; parentId?: string; title: string; agent?: string | null; createdAt: number }): void => {
+    const slug = `migrated-${p.id.replace(/[^a-z0-9]/gi, '').slice(-10).toLowerCase()}`;
+    db.prepare(
+      'INSERT INTO session (id, project_id, workspace_id, parent_id, slug, directory, path, title, version, share_url, summary_additions, summary_deletions, summary_files, summary_diffs, metadata, cost, tokens_input, tokens_output, tokens_reasoning, tokens_cache_read, tokens_cache_write, revert, permission, agent, model, time_created, time_updated, time_compacting, time_archived) VALUES (?, ?, NULL, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, NULL, NULL, 0, 0, 0, 0, 0, 0, NULL, NULL, ?, NULL, ?, ?, NULL, NULL)',
+    ).run(p.id, projectId, p.parentId ?? null, slug, dir, dir, p.title, OPENCODE_APP_VERSION, p.agent ?? null, p.createdAt, now);
+  };
+
+  const freshSessionId = (): string => {
+    for (let i = 0; i < 8; i++) {
+      const id = `ses_${randomUUID().replace(/-/g, '').slice(0, 24)}`;
+      if (!db.prepare('SELECT 1 AS x FROM session WHERE id=?').get(id)) return id;
+    }
+    return `ses_${randomUUID().replace(/-/g, '').slice(0, 24)}${now.toString(36)}`;
+  };
+
+  const created = new Map<MigratedSidechain, string>();
+  const buildMatcher = (sidechains: MigratedSidechain[], parentRowId: string): {
+    resolve: (callId: string, input: Record<string, unknown>) => { childId: string } | undefined;
+    drain: () => void;
+  } => {
+    const queue = [...sidechains];
+    const byKey = new Map<string, MigratedSidechain>();
+    for (const sc of queue) {
+      const oc = (sc.meta as { opencode?: { callId?: unknown } } | undefined)?.opencode;
+      if (oc && typeof oc.callId === 'string' && oc.callId) byKey.set(oc.callId, sc);
+      if (sc.agentId) byKey.set(sc.agentId, sc);
+    }
+    const ensureChildSession = (sc: MigratedSidechain): string => {
+      const have = created.get(sc);
+      if (have) return have;
+      const childId = freshSessionId();
+      const firstTs = sc.messages.find((m) => typeof m.timestamp === 'number' && m.timestamp)?.timestamp;
+      insertSessionRow({
+        id: childId,
+        parentId: parentRowId,
+        title: sc.title ?? (sc.agentType ? `${sc.agentType} (subagent)` : 'subagent (migrated)'),
+        agent: mapAgentType(sc.agentType),
+        createdAt: sc.createdAt ?? firstTs ?? now,
+      });
+      created.set(sc, childId);
+      // nested delegation tree: the child's own task calls resolve against
+      // its sidechains, creating grandchild session rows under it.
+      const nested = buildMatcher(sc.sidechains ?? [], childId);
+      writeMessages(scope, childId, sc.messages, { compaction: sc.compaction, resolveTask: sc.sidechains?.length ? nested.resolve : undefined });
+      nested.drain();
+      return childId;
+    };
+    const resolve = (callId: string, input: Record<string, unknown>): { childId: string } | undefined => {
+      const linked = byKey.get(callId);
+      const sc = (linked && queue.includes(linked) ? linked : undefined)
+        ?? matchByPrompt(input, queue)
+        ?? queue[0];
+      if (!sc) return undefined;
+      const at = queue.indexOf(sc);
+      if (at >= 0) queue.splice(at, 1);
+      return { childId: ensureChildSession(sc) };
+    };
+    const drain = (): void => {
+      while (queue.length) ensureChildSession(queue.shift()!);
+    };
+    return { resolve, drain };
+  };
+
+  insertSessionRow({ id: newId, title: ir.title ?? '(migrated)', createdAt: ir.createdAt ?? now });
+
+  if (flatten) {
+    // 展平为顶层消息: sidechain transcripts are appended to the MAIN session's
+    // timeline with fresh monotonic timestamps (the message table is read in
+    // time_created order — original sub-session times would interleave back
+    // into earlier turns). This view is intentionally lossy on re-parse.
+    writeMessages(scope, newId, ir.messages, { compaction: ir.compaction });
+    let t = now;
+    for (const m of ir.messages) {
+      if (typeof m.timestamp === 'number' && m.timestamp > t) t = m.timestamp;
+    }
+    t += 1;
+    for (const sc of ir.sidechains ?? []) {
+      writeMessages(scope, newId, sc.messages.map((m) => ({ ...m, timestamp: t++ })), { compaction: sc.compaction });
+    }
+  } else {
+    const matcher = buildMatcher(ir.sidechains ?? [], newId);
+    writeMessages(scope, newId, ir.messages, { compaction: ir.compaction, resolveTask: (ir.sidechains ?? []).length ? matcher.resolve : undefined });
+    matcher.drain();
+  }
   return newId;
 }
 
@@ -808,9 +1190,12 @@ function writeToDb(db: DbHandle, ir: MigratedSession, newId: string, cwd: string
 /* Mirror helpers (JSONL hermetic fallback)                              */
 /* ------------------------------------------------------------------ */
 
+const MIRROR_MESSAGE_ROLES = new Set(['user', 'assistant', 'tool', 'system', 'developer']);
+
 function opencodeMessageFromMigrated(msg: MigratedMessage): Record<string, unknown> {
-  const type = msg.role === 'user' ? 'user' : msg.role === 'assistant' ? 'assistant' : 'system';
-  return { type, content: msg.content, timestamp: msg.timestamp };
+  // keep tool/developer roles verbatim so a mirror round-trip stays lossless
+  // (older mirrors folded tool into system — new mirrors no longer do).
+  return { type: MIRROR_MESSAGE_ROLES.has(msg.role) ? msg.role : 'system', content: msg.content, timestamp: msg.timestamp };
 }
 
 async function parseFromMirror(mirrorPath: string): Promise<MigratedSession> {
@@ -818,8 +1203,8 @@ async function parseFromMirror(mirrorPath: string): Promise<MigratedSession> {
   const lines = text.split('\n').filter((l) => l.trim());
   const records = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
   const header = records.find((r) => r.type === 'mirror-header') as { id?: string; cwd?: string; title?: string; createdAt?: number; model?: unknown } | undefined;
-  const msgs = records.filter((r) => r.type !== 'mirror-header').map((r) => {
-    const role = (r.type === 'user' ? 'user' : r.type === 'assistant' ? 'assistant' : 'system') as MigratedMessage['role'];
+  const msgs = records.filter((r) => r.type !== 'mirror-header' && r.type !== 'mirror-sidechain').map((r) => {
+    const role = (MIRROR_MESSAGE_ROLES.has(String(r.type)) ? String(r.type) : 'system') as MigratedMessage['role'];
     const content = normalizeContent((Array.isArray(r.content) ? r.content : []) as unknown[]);
     const ts = typeof r.timestamp === 'number' ? r.timestamp : undefined;
     return { role, content, timestamp: ts } as MigratedMessage;
@@ -850,6 +1235,10 @@ async function parseFromMirror(mirrorPath: string): Promise<MigratedSession> {
   return validateSession(ir);
 }
 
+/**
+ * The mirror is the lossless IR dump (sidechains stay sidechain records
+ * regardless of flatten) — flatten only changes native DB reconstruction.
+ */
 async function writeToMirror(mirrorPath: string, ir: MigratedSession, newId: string, cwd: string, _flatten: boolean): Promise<void> {
   const header = { type: 'mirror-header', id: newId, cwd, title: ir.title, createdAt: ir.createdAt ?? Date.now(), model: ir.model };
   const lines: string[] = [JSON.stringify(header)];
@@ -861,6 +1250,3 @@ async function writeToMirror(mirrorPath: string, ir: MigratedSession, newId: str
   }
   await fs.writeFile(mirrorPath, lines.join('\n') + '\n', 'utf8');
 }
-
-// sidechain helper unused externally
-void existsSync;

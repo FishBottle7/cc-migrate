@@ -75,7 +75,10 @@ SessionHistory.load(db, sessionID)
 
 ## IR 映射
 
-- `MigratedSession.messages` ↔ `session_message` 行（`type`/`seq`/`data`）；`tool_use`/`tool_result` 归一到 `ContentBlock[]`，写回时按 `assistant.content.tool.state` 四态展开
-- `cwd` ↔ `session.directory`；`model` ↔ `session.model:{id,providerID,variant?}`
-- 旁链：隐式（`session.parent_id` 自引），IR `sidechains` 暂不主用，预留
-- 未确定项（待一次真实写采样锁定）：`data` 列的精确 `Encoded` 去 `id`/`type` 形状、`agent`/`model` 序列化、`event_sequence.seq` 与 `session_message.seq` 的一致性细节
+- `MigratedSession.messages` ↔ `message`+`part` 行（v1.18.21 实库采样：`session_message` 为空，正文权威是 message/part；新版经 SessionProjector 双写，读 message/part 两种年代都覆盖）
+- `tool` part 四态映射（`schema/v1/session.ts` ToolState union）：`completed`（output/title/metadata 必填）⇄ IR `tool_use`+配对 `tool_result`（**空串 output 是真实数据**，照发 tool_result）；`error`（`state.error`）⇄ `tool_result{isError:true}`；`pending`（无结果调用）⇄ 只有 `tool_use`、不伪造结果；`running` 写端不用
+- task 子会话（原生形态，已实现往返）：子会话 = `session` 行 `parent_id`+`agent`+`title="<description> (@<agent> subagent)"`；父会话 task part `state.metadata={parentSessionId,sessionId,model,truncated}` 指向它，`output` 为 `<task id=… state=…><task_result>…</task_result></task>` 包装（读端解包进 tool_result，原文进 `rawResult`）。**完整中间过程在子会话自己的 message/part 行里**（实库样本 22 行），IR `sidechains[]`（agentId=子会话id，`meta.opencode.callId` 保留 task 关联键）承载全量转录；写端 flatten=false 原生重建子会话行+task part 回链（匹配链 callId→agentId→prompt→FIFO），flatten=true 展平为主会话顶层消息。v1.18 实库曾有 `parent_id` 全 NULL 的 bug（`.db-rescue/` 抢救记录），读端用 task part metadata 自愈
+- `listSessions` 只列顶层（`parent_id IS NULL`，孤儿 parent 保留可见）——对齐 TUI 按 parentID 归组的行为
+- compaction：边界 = 唯一 part 为 `{type:'compaction',auto,tail_start_id?}` 的 user 行 + summary assistant（`summary:true,mode:'compaction',agent:'compaction',parentID=边界`）⇄ IR `compaction[]`（summary 文本投影为锚点 user 消息；`meta.opencode.auto` 往返；无 summary 配对的边界只留类型化记录、写端不落行）。`tail_start_id` 读端保留在 meta、写端不重建（msg id 会重生成，写回必成悬空）
+- `cwd` ↔ `session.directory`；`model` ↔ `session.model:{id,providerID,variant?}`；`file` part（mime/filename/url，data URL 图片）⇄ IR `FileBlock`
+- 未确定项（待一次真实写采样锁定）：`data` 列的精确 `Encoded` 去 `id`/`type` 形状、`event_sequence.seq` 与 `session_message.seq` 的一致性细节
