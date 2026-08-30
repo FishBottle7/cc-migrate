@@ -1,7 +1,7 @@
 <script setup lang="ts">
-import { computed, ref } from 'vue';
+import { computed, provide, ref } from 'vue';
 import type { SessionMeta } from '@session-migrate/core';
-import { buildNodes, countNodes, type SessionNode } from './sessionTree.js';
+import { SP_FOLDED_SUBS, buildNodes, countNodes, type SessionNode } from './sessionTree.js';
 import SpSessionRow from './SpSessionRow.vue';
 
 const props = defineProps<{
@@ -80,8 +80,10 @@ function toggleGroup(key: string) {
   collapsed.value = replaceToggle(collapsed.value, key);
 }
 
-/** 子会话折叠（SpSessionRow 消费；子会话默认展开）。 */
+/** 子会话折叠（SpSessionRow 经 inject 消费；子会话默认展开）。
+ *  走 provide 而不是 prop：集合换新时只有自自身状态变化的节点重渲染。 */
 const foldedSubs = ref(new Set<string>());
+provide(SP_FOLDED_SUBS, foldedSubs);
 function toggleSub(id: string) {
   foldedSubs.value = replaceToggle(foldedSubs.value, id);
 }
@@ -151,7 +153,6 @@ function toggleSub(id: string) {
               :node="root"
               :depth="0"
               :selected-id="props.selectedId"
-              :folded="foldedSubs"
               @select="(m) => emit('select', m)"
               @toggle="toggleSub"
             />
@@ -262,7 +263,7 @@ function toggleSub(id: string) {
   height: 8px;
   color: var(--fg-2);
   transform: rotate(90deg);
-  transition: transform var(--t-fast) var(--ease-out);
+  transition: transform var(--t-fast) var(--ease-spring);
 }
 .g-chev.closed {
   transform: rotate(0deg);
@@ -311,7 +312,7 @@ function toggleSub(id: string) {
   padding: 1px 8px;
   font-variant-numeric: tabular-nums;
 }
-/* 组容器折叠 clip：grid 0fr↔1fr 高度过渡 + 内容淡入淡出；
+/* 组容器折叠 clip：grid 0fr↔1fr 高度过渡（180ms 收短减负）+ 内容淡入下落；
    关闭后 visibility 出焦点序（延迟到高度动画结束） */
 .sp-group-clip {
   display: grid;
@@ -319,15 +320,15 @@ function toggleSub(id: string) {
   min-height: 0;
   visibility: visible;
   transition:
-    grid-template-rows 220ms var(--ease-out),
+    grid-template-rows 180ms var(--ease-out),
     visibility 0s 0s;
 }
 .sp-group-clip.closed {
   grid-template-rows: 0fr;
   visibility: hidden;
   transition:
-    grid-template-rows 220ms var(--ease-out),
-    visibility 0s 220ms;
+    grid-template-rows 180ms var(--ease-out),
+    visibility 0s 180ms;
 }
 .sp-group-items {
   min-height: 0;
@@ -337,10 +338,14 @@ function toggleSub(id: string) {
   gap: 6px;
   padding-left: 12px;
   opacity: 1;
-  transition: opacity 160ms var(--ease-out);
+  transform: translateY(0);
+  transition:
+    opacity 150ms var(--ease-out),
+    transform 180ms var(--ease-out);
 }
 .sp-group-clip.closed .sp-group-items {
   opacity: 0;
+  transform: translateY(-6px);
 }
 .sp-list--sk {
   display: flex;

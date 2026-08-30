@@ -5,21 +5,26 @@
  * 自身行 + 可折叠的子会话容器。折叠/展开动效走 grid-template-rows
  * 0fr↔1fr + 透明度 —— 本 App 关闭硬件加速（软件渲染），FLIP transform
  * 重排大列表会卡（见 SessionPreview 头注），高度/透明度是最廉价的合法动效。
+ * 折叠集合经 inject 下发、每节点只包一层 computed：点一次折叠只重渲染
+ * 状态真正变化的那一个节点，而不是整棵树。
  */
+import { computed, inject, ref } from 'vue';
 import type { SessionNode } from './sessionTree.js';
-import { fmtTime, truncate } from './sessionTree.js';
+import { SP_FOLDED_SUBS, fmtTime, truncate } from './sessionTree.js';
 
 const props = defineProps<{
   node: SessionNode;
   depth: number;
   selectedId?: string | null;
-  folded: Set<string>;
 }>();
 
 const emit = defineEmits<{
   select: [meta: SessionNode['meta']];
   toggle: [id: string];
 }>();
+
+const foldedSubs = inject(SP_FOLDED_SUBS, ref(new Set<string>()));
+const selfFolded = computed(() => foldedSubs.value.has(props.node.meta.sessionId));
 </script>
 
 <template>
@@ -35,10 +40,10 @@ const emit = defineEmits<{
           v-if="props.node.children.length"
           type="button"
           class="sp-sub-toggle"
-          :title="props.folded.has(props.node.meta.sessionId) ? '展开子会话' : '收起子会话'"
+          :title="selfFolded ? '展开子会话' : '收起子会话'"
           @click.stop="emit('toggle', props.node.meta.sessionId)"
         >
-          <svg class="chev" :class="{ closed: props.folded.has(props.node.meta.sessionId) }" viewBox="0 0 8 8" aria-hidden="true">
+          <svg class="chev" :class="{ closed: selfFolded }" viewBox="0 0 8 8" aria-hidden="true">
             <path d="M2 1l4 3-4 3" />
           </svg>
         </button>
@@ -54,8 +59,8 @@ const emit = defineEmits<{
       <span class="sp-bar" aria-hidden="true" />
     </button>
 
-    <!-- 子会话容器：grid 0fr↔1fr 高度折叠 + 淡入淡出 -->
-    <div v-if="props.node.children.length" class="sp-clip" :class="{ closed: props.folded.has(props.node.meta.sessionId) }">
+    <!-- 子会话容器：grid 0fr↔1fr 高度折叠 + 内容淡入下落 -->
+    <div v-if="props.node.children.length" class="sp-clip" :class="{ closed: selfFolded }">
       <div class="sp-clip-inner">
         <SpSessionRow
           v-for="child in props.node.children"
@@ -63,7 +68,6 @@ const emit = defineEmits<{
           :node="child"
           :depth="props.depth + 1"
           :selected-id="props.selectedId"
-          :folded="props.folded"
           @select="(m) => emit('select', m)"
           @toggle="(id) => emit('toggle', id)"
         />
@@ -168,7 +172,7 @@ const emit = defineEmits<{
   width: 8px;
   height: 8px;
   transform: rotate(90deg);
-  transition: transform var(--t-fast) var(--ease-out);
+  transition: transform var(--t-fast) var(--ease-spring);
 }
 .chev.closed {
   transform: rotate(0deg);
@@ -206,22 +210,23 @@ const emit = defineEmits<{
   color: var(--fg-1);
 }
 
-/* 折叠 clip：grid 0fr↔1fr 高度过渡 + 内容淡入淡出 + 关闭后 visibility 出焦点序 */
+/* 折叠 clip：grid 0fr↔1fr 高度过渡（180ms 收短减负）+ 内容淡入下落；
+   关闭后 visibility 出焦点序（延迟到高度动画结束） */
 .sp-clip {
   display: grid;
   grid-template-rows: 1fr;
   min-height: 0;
   visibility: visible;
   transition:
-    grid-template-rows 220ms var(--ease-out),
+    grid-template-rows 180ms var(--ease-out),
     visibility 0s 0s;
 }
 .sp-clip.closed {
   grid-template-rows: 0fr;
   visibility: hidden;
   transition:
-    grid-template-rows 220ms var(--ease-out),
-    visibility 0s 220ms;
+    grid-template-rows 180ms var(--ease-out),
+    visibility 0s 180ms;
 }
 .sp-clip-inner {
   min-height: 0;
@@ -231,9 +236,13 @@ const emit = defineEmits<{
   flex-direction: column;
   gap: 6px;
   opacity: 1;
-  transition: opacity 160ms var(--ease-out);
+  transform: translateY(0);
+  transition:
+    opacity 150ms var(--ease-out),
+    transform 180ms var(--ease-out);
 }
 .sp-clip.closed .sp-clip-inner {
   opacity: 0;
+  transform: translateY(-6px);
 }
 </style>

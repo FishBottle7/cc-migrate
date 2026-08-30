@@ -3,6 +3,10 @@
  * 渲染在 SessionPicker（工作区分组 + 递归 SpSessionRow）。
  */
 import type { SessionMeta } from '@session-migrate/core';
+import type { InjectionKey, Ref } from 'vue';
+
+/** 子会话折叠集合（provide/inject 下发——走 prop 会让整棵树跟着集合换新而全量重渲染）。 */
+export const SP_FOLDED_SUBS: InjectionKey<Ref<Set<string>>> = Symbol('spFoldedSubs');
 
 export interface SessionNode {
   meta: SessionMeta;
