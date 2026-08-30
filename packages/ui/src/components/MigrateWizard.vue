@@ -315,6 +315,28 @@ function errMsg(e: unknown): string {
   return m.length > 300 ? m.slice(0, 300) + '…' : m;
 }
 
+/* ── 流程轨收起/展开（收起时只剩序号节点） ─────────────────── */
+
+const RAIL_KEY = 'sm.rail.collapsed';
+const railCollapsed = ref(
+  (() => {
+    try {
+      return localStorage.getItem(RAIL_KEY) === '1';
+    } catch {
+      return false;
+    }
+  })(),
+);
+
+function toggleRail(): void {
+  railCollapsed.value = !railCollapsed.value;
+  try {
+    localStorage.setItem(RAIL_KEY, railCollapsed.value ? '1' : '0');
+  } catch {
+    /* 无 localStorage 时仅会话内生效 */
+  }
+}
+
 /* ── 会话/预览分栏拖拽 ─────────────────────────────────────── */
 
 const SPLIT_KEY = 'sm.split.left';
@@ -360,9 +382,9 @@ function startDrag(e: MouseEvent) {
 </script>
 
 <template>
-  <div class="wizard">
-    <!-- ── 左侧进度轨 ── -->
-    <aside class="wz-rail">
+  <div class="wizard" :class="{ 'rail-collapsed': railCollapsed }">
+    <!-- ── 流程轨（可收起；收起后只剩序号节点） ── -->
+    <aside class="wz-rail" :class="{ 'is-collapsed': railCollapsed }">
       <div class="brand">
         <span class="seal" aria-hidden="true">迁</span>
         <span class="brand-text">
@@ -381,6 +403,7 @@ function startDrag(e: MouseEvent) {
             'is-done': stepIndex(step) > i,
             'is-clickable': i < stepIndex(step) && step !== 'done',
           }"
+          :title="railCollapsed ? s.label : undefined"
           @click="railClick(s, i)"
         >
           <span class="rs-node sm-mono">
@@ -397,10 +420,17 @@ function startDrag(e: MouseEvent) {
         </li>
       </ol>
 
-      <footer class="rail-foot">
-        <span class="rf-dot" aria-hidden="true" />
-        本地处理 · 数据不出本机
-      </footer>
+      <button
+        class="rail-toggle"
+        type="button"
+        :title="railCollapsed ? '展开流程' : '收起流程'"
+        :aria-expanded="!railCollapsed"
+        @click="toggleRail"
+      >
+        <svg viewBox="0 0 12 12" aria-hidden="true">
+          <path d="M7.5 2.5L4 6l3.5 3.5" />
+        </svg>
+      </button>
     </aside>
 
     <!-- ── 右侧步骤舞台 ── -->
@@ -633,22 +663,46 @@ function startDrag(e: MouseEvent) {
   grid-template-columns: 232px 1fr;
   height: 100%;
   min-height: 0;
+  /* 收起/展开：轨宽 + 舞台一起流动重排（一次性动画） */
+  transition: grid-template-columns 280ms var(--ease-out);
+}
+/* 收起态：流程轨窄化到只剩序号节点，节点锚定在原位 */
+.wizard.rail-collapsed {
+  grid-template-columns: 62px 1fr;
 }
 
-/* ── 进度轨 ───────────────────────────────────────────────── */
+/* ── 流程轨：不画底色与分割线，直接悬浮在纸面上（简约） ───── */
 .wz-rail {
   display: flex;
   flex-direction: column;
   gap: 36px;
-  padding: 22px 18px 18px 22px;
-  border-right: 1px solid var(--line-0);
-  background: linear-gradient(180deg, rgba(118, 99, 224, 0.05), transparent 32%), #fbfaff;
+  padding: 22px 14px 16px 18px;
+  min-width: 0;
+  overflow: hidden;
   user-select: none;
+}
+/* 收起只做视觉隐没、不撤占位：序号节点的 x/y 保持原位不跳 */
+.is-collapsed .brand {
+  opacity: 0;
+  transform: translateX(-8px);
+  pointer-events: none;
+}
+.is-collapsed .rs-text {
+  opacity: 0;
+  transform: translateX(-6px);
+  pointer-events: none;
 }
 .brand {
   display: flex;
   align-items: center;
   gap: 11px;
+  /* 高度钉死：收起过程中内部文字无论被压多窄都不改变盒子占位，
+     序号节点的纵向位置因此一像素不动 */
+  flex: none;
+  height: 36px;
+  transition:
+    opacity 200ms ease,
+    transform 200ms var(--ease-out);
 }
 .seal {
   flex: none;
@@ -667,6 +721,8 @@ function startDrag(e: MouseEvent) {
   flex-direction: column;
   gap: 2px;
   min-width: 0;
+  /* 挤压时整段滑出裁剪，绝不逐字换行撑高 */
+  white-space: nowrap;
 }
 .brand-text b {
   font-size: 12px;
@@ -743,6 +799,10 @@ function startDrag(e: MouseEvent) {
   gap: 3px;
   padding-top: 3px;
   min-width: 0;
+  white-space: nowrap;
+  transition:
+    opacity 200ms ease,
+    transform 200ms var(--ease-out);
 }
 .rs-label {
   font-size: 13px;
@@ -792,21 +852,43 @@ function startDrag(e: MouseEvent) {
   background: rgba(47, 158, 99, 0.08);
 }
 
-.rail-foot {
+/* 收起/展开开关（贴在轨底，替代原说明行） */
+.rail-toggle {
   margin-top: auto;
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  font-size: 11px;
+  flex: none;
+  width: 26px;
+  height: 26px;
+  display: grid;
+  place-items: center;
+  appearance: none;
+  background: transparent;
+  border: none;
+  border-radius: 7px;
   color: var(--fg-2);
-  letter-spacing: 0.02em;
+  cursor: pointer;
+  transition:
+    background var(--t-fast) ease,
+    color var(--t-fast) ease;
 }
-.rf-dot {
-  width: 6px;
-  height: 6px;
-  border-radius: 50%;
-  background: var(--ok);
-  box-shadow: 0 0 6px rgba(47, 158, 99, 0.5);
+.rail-toggle:hover {
+  background: var(--ink-2);
+  color: var(--fg-0);
+}
+.rail-toggle svg {
+  width: 12px;
+  height: 12px;
+  transition: transform 280ms var(--ease-out);
+}
+/* 收起时箭头旋向另一侧（同一支箭头旋转，不换图） */
+.wz-rail.is-collapsed .rail-toggle svg {
+  transform: rotate(180deg);
+}
+.rail-toggle path {
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.6;
+  stroke-linecap: round;
+  stroke-linejoin: round;
 }
 
 /* ── 舞台 ─────────────────────────────────────────────────── */
