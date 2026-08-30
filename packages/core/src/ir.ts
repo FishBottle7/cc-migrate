@@ -140,7 +140,7 @@ export interface MigratedSidechain {
   compaction?: MigratedCompaction[];
   unmappedEvents?: MigratedUnmappedEvent[];
   /** Non-conversation session-level rows (claude system subtype rows etc.) — see SessionEvents. */
-  sessionEvents?: SessionEvents[];
+  sessionEvents?: SessionEvent[];
   /** adapter-namespaced session-level native payload, same contract as MigratedSession.meta */
   meta?: Record<string, unknown>;
   /** nested delegation tree (subagent's own subagents) */
@@ -217,6 +217,14 @@ export interface MigratedUnmappedEvent {
   data: unknown;
   surfaceOp?: string;
   sourceEventSeqs?: number[];
+  /**
+   * Source-harness "unknown-but-skippable" envelope marker (DSH
+   * `ignorable:true`). PRESERVE on round-trip; a write side MUST emit any
+   * event type unknown to the TARGET harness with this flag set — targets
+   * (e.g. DSH) refuse logs that contain unknown unmarked types
+   * (SessionFormatUnsupportedError).
+   */
+  ignorable?: boolean;
 }
 
 /**
@@ -251,15 +259,15 @@ export interface MigratedPrLink {
 }
 
 /**
- * Non-conversation session-level rows from the source harness — claude system
- * records whose subtype has no conversational projection (turn_duration,
- * stop_hook_summary, microcompact_boundary, model_refusal_*, informational,
- * away_summary, …) and any other non-transcript row without a typed slot.
- * Same shape as `unmappedEvents`; `seq` = source file line index. Rows WITH a
- * conversational projection are not duplicated here (local_command → synthetic
- * user message; compact_boundary → compaction[] + meta).
+ * One non-conversation session-level row from the source harness — claude
+ * system records whose subtype has no conversational projection
+ * (turn_duration, stop_hook_summary, microcompact_boundary, model_refusal_*,
+ * informational, away_summary, …) and any other non-transcript row without a
+ * typed slot. Same shape as `unmappedEvents`; `seq` = source file line index.
+ * Rows WITH a conversational projection are not duplicated here (local_command
+ * → synthetic user message; compact_boundary → compaction[] + meta).
  */
-export type SessionEvents = MigratedUnmappedEvent[];
+export type SessionEvent = MigratedUnmappedEvent;
 
 export interface MigratedSession {
   schemaVersion: 2;
@@ -309,7 +317,7 @@ export interface MigratedSession {
    */
   unmappedEvents?: MigratedUnmappedEvent[];
   /** Non-conversation session-level rows (claude system subtype rows etc.) — see SessionEvents. */
-  sessionEvents?: SessionEvents[];
+  sessionEvents?: SessionEvent[];
   /** Source tag (claude `tag` metadata row). */
   tag?: string;
   /** Source permission mode (claude `permission-mode` metadata row). */
@@ -450,6 +458,25 @@ export function validateSession(ir: MigratedSession): MigratedSession {
   }
   if (ir.tag !== undefined && typeof ir.tag !== 'string') throw new Error('validateSession: tag must be a string');
   if (ir.permissionMode !== undefined && typeof ir.permissionMode !== 'string') throw new Error('validateSession: permissionMode must be a string');
+  if (ir.systemPrompt !== undefined && typeof ir.systemPrompt !== 'string') {
+    throw new Error('validateSession: systemPrompt must be a string');
+  }
+  if (ir.extensions !== undefined) {
+    if (typeof ir.extensions !== 'object' || ir.extensions === null || Array.isArray(ir.extensions)) {
+      throw new Error('validateSession: extensions must be an object');
+    }
+    // Guard only namespaces registered with an object contract (v3.2: claude —
+    // `{ recordsRaw: unknown[] }`). zcode's legacy `syntheticMessages` bucket is
+    // an array; constrain it when zcode is migrated to the object shape.
+    const claude = (ir.extensions as Record<string, unknown>).claude;
+    if (claude !== undefined && (typeof claude !== 'object' || claude === null || Array.isArray(claude))) {
+      throw new Error('validateSession: extensions.claude must be an object');
+    }
+    const claudeRecordsRaw = (claude as { recordsRaw?: unknown } | undefined)?.recordsRaw;
+    if (claudeRecordsRaw !== undefined && !Array.isArray(claudeRecordsRaw)) {
+      throw new Error('validateSession: extensions.claude.recordsRaw must be an array');
+    }
+  }
   if (ir.model !== undefined) {
     if (typeof ir.model !== 'object' || ir.model === null || Array.isArray(ir.model)) {
       throw new Error('validateSession: model must be an object { id }');

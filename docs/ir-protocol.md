@@ -50,6 +50,23 @@
 
 `meta` 的契约要点：键是适配器命名空间；写回端只消费自己命名空间的键，未知键忽略。rawParts 还原时排在投影块之后（模型可见回放只来自 text/reasoning/tool part，块序已保真；raw 序只影响引擎记账部分）。extensions 里的 `zcode.messageExtras` / `zcode.compactions` / `zcode.compactionSummaries` 已随 #1/#2/#3 落地**废除**。
 
+## v3.2 登记（2026-08-30，claude 适配器重写驱动）
+
+全部为可选字段，旧适配器忽略即可。登记范围 = `docs/agents/claude.md` §8 缺口 #6/#7/#8 的落地形状（`packages/core/src/ir.ts` 头注释 v3.2 节同步）。
+
+| 槽位 | 类型 | 语义 | 读写端 |
+|------|------|------|--------|
+| `ContentBlock.tool_result.rawResult?: unknown` | 块实体 | claude `user.toolUseResult` 结构化工具结果原文（Bash `{stdout,stderr,interrupted,isImage,noOutputExpected}`、拒绝时字符串、各工具结构体）——模型可见 `tool_result.content` 之外的无损信息。**挂在块实体上，禁止按 toolUseId 旁表**；保持 `unknown` 原样透传（形状由各工具自定义，validateSession 不加强约束） | claude 读（`toolUseResult` → rawResult）+ 写（写前 sanitize：字符串/对象原样；禁止伪造）；zcode 可将融合 output 映射进来 |
+| `MigratedSession.tag?` / `permissionMode?: string` | 会话 | claude `tag` / `permission-mode` 元数据行（B 类 last-wins） | claude 读写 |
+| `MigratedSession.prLink?` | `{ prNumber, prUrl, prRepository, timestamp? }` | claude `pr-link` 元数据行 | claude 读写 |
+| `MigratedSession.worktreeSession?: unknown` / `costState?: unknown` | 会话 | claude `worktree-state` / `cost-state` 行原样透传（opaque） | claude 读写 |
+| `MigratedSession.sessionEvents?: MigratedUnmappedEvent[]`（alias `SessionEvent`） | 会话桶 | **非对话行桶（缺口 #7）**：claude system subtype 行（turn_duration / stop_hook_summary / model_refusal /…）原样存 `data`，`seq` = 源文件行号。**投影规则**：`local_command` 不进桶——投影为 user 文本 + `synthetic:true`（唯一参与回放的 subtype）；`compact_boundary` 走 compaction 桶（缺口 #3 形状）；其余全部入桶、写端直通重放 | claude 读 + 写端直通 |
+| `MigratedSidechain.sessionEvents?` | 同上 | 旁链同款桶 | claude |
+| `extensions.claude.recordsRaw?: unknown[]` | 保底 | **全文件原始行**（逐行 JSON 对象，含被 DAG 剪除的死枝/rewind 段/boundary 前折叠段）——字节级还原与跨工具投影之外的兜底（缺口 #7）。validateSession 守卫：`extensions` 出现时必须为对象；`extensions.claude` 必须为对象；`recordsRaw` 出现时必须为数组；`rawResult` 保持 `unknown`（toolUseResult 原样透传） | claude 读 + 写端不消费（防伪造） |
+| `MigratedSession.systemPrompt` | 语义冻结（#8） | 源端无原生持久化提示词则**恒空**（claude transcript 不含系统提示词）；目标端有原生通道（claude = 进程 flag `--append-system-prompt`）走原生槽位，**写端显式忽略 IR 值**；禁止把源提示词写进会话正文再叠加目标端系统提示词（双叠劣化 agent 表现）。validateSession：出现时必须为 string，空串合法 | claude 写端 `void ir.systemPrompt`；全体适配器遵守 |
+
+**claude 压缩语义补充（与通用 compaction 契约的差异）**：claude `compact_boundary.parentUuid=null` 截断父链——**活跃链只含 boundary 之后的行**，被折叠段不进 `messages[]`（`/resume` 原生行为即如此）；无损由 `extensions.claude.recordsRaw`（全文件原始行）兜底，preservedMessages/preservedSegment 保留段按 §3/§4 算法 relink 回活跃链。
+
 ## v3.1 登记（2026-08-29，codex 适配器开发前调查驱动）
 
 全部为**可选字段**——旧适配器读到时忽略即可，不破坏任何现有读写；但**写端**需按约定消费。依据：codex-main 源码深查（2026-08 版，本机实测 cli 0.146.0），完整字段映射见 `docs/agents/codex.md`。改动明细另见 `packages/core/src/ir.ts` 头注释。
@@ -110,9 +127,9 @@ messages[] 里**全量保留**（含被遮蔽消息）——无损原则；"哪�
 | 3 | ~~compaction 无位置锚~~ | ✅ 已落地：摘要投影进 messages[] + `anchorIndex`（zcode 写回还原原生 summary 行） | — | — |
 | 4 | ~~tool_result 多块/图像内容~~ | ✅ 已落地：`FileBlock` + `tool_result.attachments`（claude/zcode 读写；dsh/codex 写端文本降级） | — | — |
 | 5 | step-start / step-finish / timeline 等 part | **决策（修订版）**：part 行原文全部保留在 `meta.zcode.rawParts`（探针证实 step-finish 携带每步 tokens/cost/reason，旧「零信息」判断对它不成立；step-start 确为空对象，保留无成本）；但**不投影进块流**——引擎 D2 回放层本就不把它们喂给模型上下文，投影只会伪造目标工具里不存在的对话内容 | — | zcode（已按此实现） |
-| 6 | **claude 结构化工具结果原文**：claude `user.toolUseResult`（Bash 的 `{stdout,stderr,interrupted,isImage,noOutputExpected}`、拒绝时字符串、各工具结构体）是模型可见 `tool_result.content` 之外的无损信息，IR 的 tool_result 无槽位 | 🔜 **claude 适配器重写将引入**（调查依据 `docs/agents/claude.md` §8#1） | `ContentBlock.tool_result.rawResult?: unknown`（挂在块实体上，禁止按 toolUseId 旁表） | claude（读写）；zcode 可将融合 output 映射进来 |
-| 7 | **claude 非对话行**：system subtype 行（turn_duration/stop_hook_summary/local_command/model_refusal/compact_boundary…）、30+ 种会话级元数据行（last-prompt/custom-title/ai-title/tag/mode/permission-mode/cost-state/worktree-state/pr-link…）、attachment 行（21+ 种，external 门控）在 IR 无槽位 | 🔜 claude 重写时引入（`docs/agents/claude.md` §2.3-§2.5、§8#4-#7）。回放规则：`local_command` 投影 user text + `synthetic:true`（模型可见）；`isMeta` user 消息 → `synthetic:true`（UI 隐藏但**进模型上下文**，与 dsh `source.kind='plugin'` 对齐）；attachment 中的 file → FileBlock | 高频有语义的提为 `MigratedSession` 可选字段（`tag`/`permissionMode`/`prLink`/`worktreeSession`/`costState` 等）；其余原样进 `extensions.claude.recordsRaw`（ir-v3 预留位，分支/DAG/rewind 死枝的字节级还原靠 raw 层）；泛化 `sessionEvents` 桶定名后登记 | claude（读写）；其余按 v3.1 模式忽略 |
-| 8 | **系统提示词无契约**：`IR.systemPrompt` 语义未定义——zcode 从不读（引擎按 profile 注入）；claude 根本没有持久化通道（transcript 不含系统提示词，resume 全由目标二进制 + 当次 flag 重新生成，调查见 `docs/agents/claude.md` §5） | 🔜 **登记规则**：源端无原生提示词则留空（claude 恒空）；目标端有原生通道（claude=进程 flag `--append-system-prompt`、dsh=header/agentPreset、zcode=profileSnapshot）走原生槽位；无通道的目标端才注入 IR 值。**禁止把源提示词写进会话正文再叠加目标端自己的系统提示词——双系统提示词叠加会劣化 agent 表现** | `ir.systemPrompt` 语义冻结进共识；claude 写端显式忽略 | 全体适配器 |
+| 6 | ~~claude 结构化工具结果原文~~ | ✅ 已落地（v3.2）：`ContentBlock.tool_result.rawResult?: unknown`（claude 读写；挂在块实体上，禁止按 toolUseId 旁表） | — | — |
+| 7 | ~~claude 非对话行~~ | ✅ 已落地（v3.2）：`sessionEvents` 桶（system subtype 行）+ 类型化字段（`tag`/`permissionMode`/`prLink`/`worktreeSession`/`costState`）+ `extensions.claude.recordsRaw` 保底；`local_command` 投影 user text + `synthetic:true`；`isMeta` → `synthetic:true`；attachment file → FileBlock | — | — |
+| 8 | ~~系统提示词无契约~~ | ✅ 已落地（v3.2）：`ir.systemPrompt` 语义冻结——源端无原生提示词则留空（claude 恒空）；目标端有原生通道走原生槽位（claude = 进程 flag `--append-system-prompt`）；claude 写端显式忽略 IR 值；禁止写进会话正文双叠 | — | 全体适配器 |
 
 > 残留小项：sidechain 子会话里无块投影的 assistant 载体行（timeline-event 宿主等）目前仍整体丢弃（主会话同类行已进 `zcode.syntheticMessages` 原始档案桶，且档案桶不参与写回——它保存的是读端原始行，重新物化超出 IR 契约）。待 sidechain 获得独立 extensions/meta 槽位时一并收敛。
 
@@ -134,7 +151,7 @@ messages[] 里**全量保留**（含被遮蔽消息）——无损原则；"哪�
 - 错误信息带完整定位路径（`message[i].content[j]...`）
 - 兼作**金丝雀**：加深后若现有 6 适配器有产出过不了块级校验，先修适配器再叠新功能
 
-### 第二层：扩展槽位最小形状（随 claude 重写落地，依赖上表 #6/#7 进代码）
+### 第二层：扩展槽位最小形状（✅ 已随 claude 重写落地，见 v3.2 登记）
 
 - `extensions` 守卫：已知命名空间（`claude` 等）出现时必须是对象；`recordsRaw` 必须是数组；**`rawResult` 保持 `unknown` 不加强约束**（toolUseResult 原样透传，形状由各工具自己定义）
 - `systemPrompt`（ir.ts:224，语义已冻结于上表 #8）：出现时必须为 string，空串合法（= claude 源恒空的语义）
@@ -160,7 +177,7 @@ messages[] 里**全量保留**（含被遮蔽消息）——无损原则；"哪�
 |--------|------|
 | dsh | ✅ **全部落地**（meta.dsh 消息级+会话级，headerRaw 写回消费 / usage+interrupted / tool-result 事件级 error+meta / FileBlock 图像投影 + tool_result attachments / compaction 折叠 + 锚 / synthetic 判定 / toolCalls 桶读写 / 嵌套子代理（孙代+子会话全桶+深度保真+防覆盖）/ 列表标题 projcache→日志兜底 + 归档 + `_no-cwd` / 附件字节解析 `readDshAttachment`） |
 | zcode | ✅ 已落地（toolCalls / signature / meta / FileBlock / compaction 锚，读写两端） |
-| claude | ⚠️ **待重写**——现有实现只线性读 user/assistant、丢 DAG 并行 tool_result（`sourceToolAssistantUUID` 挂接 + 同 `message.id` 兄弟恢复缺失）、丢 system/attachment/30+ 种元数据行、`path.ts` 缺 200 截断 + hash；按 `docs/agents/claude.md` 重做，消费上表 #6-#8 槽位 |
+| claude | ✅ **已重写**（2026-08-30，消费 #6/#7/#8 槽位）：读侧 DAG 链重建（`parentUuid` 主链 + `sourceToolAssistantUUID` 回指 + 同 `message.id` 兄弟并行 tool_result 恢复 + compact 边界 preservedMessages/preservedSegment relink + 死枝剪除 + trailing 深度先序）；三类记录全收（transcript 消息 / B 类元数据行 last-wins / C 类结构化行 + `sessionEvents` 桶）；`isMeta`→`synthetic`；`local_command`→user 文本+synthetic；attachment 67 类型投影 + 原样 meta；`toolUseResult`→`rawResult`；`path.ts` 200 截断 + hash；listSessions §1.0 过滤（uuid 门 + 首行 isSidechain + head teamName + mtime 去重）；subagent（agentId+isSidechain 过滤→leaf→链，teammate 前缀聚合）；写侧 native 盖章（insertMessageChain 盖章顺序、每条 tool_result 独立 user 记录 + `sourceToolAssistantUUID` 回指、last-prompt 带 leafUuid 不带 cwd、toolUseResult 写前 sanitize、compaction boundary 对回放、防覆盖拒绝） |
 | pi | ✅ 兼容——新桶均为可选字段，忽略即可；pi 已带 FileBlock 文本降级 |
 | codex | ✅ **全部落地**（11 类 rollout 记录全量读写 / response_item 17 变体 1:1 消息投影 + native payload 重建（reasoning summary+content、function/custom/local_shell/tool_search/web_search/image_generation、agent_message+inter_agent_communication 模型可见、developer 角色保留）/ turn_context+world_state 挂轮首消息、孤行归档重放 / compacted→compaction 桶（RH+窗口字段+锚）/ event_msg 全量→unmappedEvents（seq=行号）写回重放 / additional_tools、compaction_trigger、other 归档重放 / session_meta 继承链 + source/thread_source/git/agent_* 原生保真 / session_index append-only 写回 / .zst + `_<rolloutId>` revert 变体 + archived_sessions / **harness 注入行官方分类**：`content_item_kinds` 主通道 + codex rollback.rs 冻结文本标记 fallback——goal resume、system reminder、AGENTS.md、user_shell_command 等不再误判为用户提示词 / `meta.codex.sourceDir/sourceFile` 源文件夹捕获 / **paginated history_mode 按源保真 + history_base 跨文件链式拼接**（byte 精确截断、防环递归，写端自足单文件）+ `SessionMeta.parentSessionId` 子代理树 / `deferredCreation` 空会话 / 标题=首条真实用户 prompt） |
 | opencode | ✅ 已落地（写端消费 compaction 桶 → 原生边界对；synthetic 默认丢弃 / `--keep-runtime-context` 惰性保留；TUI 工具/思考渲染契约对齐） |

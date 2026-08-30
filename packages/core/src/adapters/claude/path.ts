@@ -51,6 +51,22 @@ export function claudeProjectDirName(cwd: string): string {
 }
 
 /**
+ * Best-effort inverse of {@link claudeProjectDirName} for listing displays.
+ * The encoding is one-way (every non-alphanumeric becomes `-`), so this cannot
+ * recover `:` `\` `.` `/` etc. — it restores only the alphanumeric skeleton:
+ * `D--codes-dshPlugins-cc-migrate` → `D--codes-dshPlugins-cc-migrate` (verbatim
+ * first char, single dashes elsewhere). Callers should prefer a cwd stamp from
+ * the session head (first record's `cwd` field) and fall back to this.
+ */
+export function decodeProjectDirName(dirName: string): string {
+  if (!dirName) return '';
+  const m = dirName.match(/^(.*?)-(?:[0-9a-z]+)$/i);
+  // ≥200 chars + `-` + hash suffix: strip the suffix, keep the truncated stem
+  const stem = m && dirName.length > MAX_SANITIZED_LENGTH ? m[1] : dirName;
+  return stem;
+}
+
+/**
  * Default Claude projects root. `CLAUDE_CONFIG_DIR` overrides the whole config
  * home (src/utils/envUtils.ts:7), so the projects root is `$CLAUDE_CONFIG_DIR/projects`.
  */

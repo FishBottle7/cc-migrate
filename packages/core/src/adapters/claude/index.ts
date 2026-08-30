@@ -1,51 +1,60 @@
 /**
- * Claude Code adapter — reads/writes `~/.claude/projects/<encoded-cwd>/<uuid>.jsonl`.
+ * Claude Code adapter — `~/.claude/projects/<encoded-cwd>/<uuid>.jsonl`
+ * (+ `<sessionId>/subagents/agent-*.jsonl` sidechains & `.meta.json` sidecars).
  *
- * Source-anchored (from the installed claude-code-main source):
- *  - project directory = cwd with every non-alphanumeric → `-` (`sanitizePath`).
- *  - each line is one record (`user`/`assistant` carry `message:{role,content}`),
- *    chained by `parentUuid`; the file ends near-EOF with a `last-prompt` line
- *    `{type:'last-prompt', lastPrompt:<≤200 chars>, sessionId}` (display only —
- *    the chain is rebuilt purely by walking `parentUuid`).
- *  - resume/sidechain discovery is a pure directory scan; NO sessions-index needs
- *    touching (`/resume` filters out files whose first line has "isSidechain":true).
- *  - sub-agent sidechains live at `<sessionDir>/subagents/agent-<id>.jsonl`,
- *    records identical to main but with `isSidechain:true` + `agentId`, plus an
- *    optional `<id>.meta.json` sidecar {agentType, worktreePath?, description?}.
+ * 红线 (docs/agents/claude.md §6):
+ *  1. NEVER delete, rewrite or append to an existing session file — write only
+ *     brand-new files under brand-new sessionIds; skip-and-report on collision;
+ *  2. 100% lossless except redacted_thinking.data; thinking.signature rides
+ *     byte-for-byte; everything without a typed slot survives in
+ *     extensions.claude.recordsRaw;
+ *  3. IR.systemPrompt is ignored on write (§5.4/#8) — claude regenerates its
+ *     system prompt per resume; the engine carries source prompts via the
+ *     --append-system-prompt process flag.
+ *
+ * listSessions follows the native /resume listing rules (§1/§1.0):
+ * filename must be a strict UUID; first line `"isSidechain":true` filters;
+ * head `teamName` (tmux teammate files) filters; title resolution is
+ * customTitle → aiTitle, summary display last-prompt.lastPrompt → legacy
+ * summary → firstPrompt; worktree dirs aggregate case-insensitively by
+ * longest-prefix (startsWith only allowed for ≥200 truncated+hash dirs).
  */
 
 import { promises as fs } from 'node:fs';
-import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
-import type { Adapter, WriteOptions, WriteResult } from '../../registry.js';
-import type {
-  ContentBlock,
-  MigratedMessage,
-  MigratedSession,
-  MigratedSidechain,
-  SessionMeta,
-} from '../../ir.js';
-import { validateSession } from '../../ir.js';
-import { blocksToText, normalizeContent } from '../../content.js';
-import { claudeProjectDirName, defaultClaudeProjectsRoot } from './path.js';
 
-interface ClaudeRecord {
-  type?: string;
-  sessionId?: string;
+/** uuid v4-any-version validator (native listSessions validateUuid gate). */
+function uuidValidate(s: string): boolean {
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(s);
+}
+import { join } from 'node:path';
+import type { Adapter, WriteOptions, WriteResult } from '../../registry.js';
+import type { MigratedSession, SessionMeta } from '../../ir.js';
+import { validateSession } from '../../ir.js';
+import { blocksToText } from '../../content.js';
+import { claudeProjectDirName, defaultClaudeProjectsRoot } from './path.js';
+import { parseClaudeFile, readClaudeLinesForList } from './parse.js';
+import { buildMainRecords, buildSidechainRecords } from './write.js';
+
+interface ListLiteHead {
+  isSidechain: boolean;
+  teamName?: string;
+  customTitle?: string;
+  aiTitle?: string;
+  lastPrompt?: string;
+  lastPromptLeafUuid?: string;
+  summary?: string;
+  firstTimestamp?: string;
+  gitBranch?: string;
+  tag?: string;
   cwd?: string;
-  uuid?: string;
-  parentUuid?: string | null;
-  timestamp?: string;
-  message?: { role?: string; content?: unknown };
-  isSidechain?: boolean;
-  agentId?: string;
-  leafUuid?: string;
+  firstPrompt?: string;
 }
 
 export class ClaudeAdapter implements Adapter {
   readonly tool = 'claude' as const;
 
-  /** Read one Claude session jsonl into IR. */
+  /** Read one Claude session jsonl (main + sidechains) into IR. */
   async parse(sessionId: string, root?: string): Promise<MigratedSession> {
     const projectsRoot = root ?? defaultClaudeProjectsRoot();
     if (!projectsRoot) throw new Error('Claude: cannot resolve ~/.claude/projects');
@@ -54,80 +63,89 @@ export class ClaudeAdapter implements Adapter {
     return parseClaudeFile(path);
   }
 
-  /** Write an IR session into a Claude-resumable jsonl (new session id). */
+  /**
+   * Write IR as a brand-new Claude session file (红线 #1: 只新增).
+   * When the target path already exists the write is SKIPPED and reported via
+   * `skippedExisting` — never overwritten, never appended to.
+   */
   async write(ir: MigratedSession, opts?: WriteOptions): Promise<WriteResult> {
     validateSession(ir);
     const projectsRoot = opts?.root ?? defaultClaudeProjectsRoot();
     if (!projectsRoot) throw new Error('Claude: cannot resolve ~/.claude/projects');
-    const cwd = opts?.targetCwd ?? ir.cwd ?? '';
-    const newId = opts?.sessionId ?? randomUUID();
+    const targetCwd = opts?.targetCwd ?? ir.cwd ?? '';
+    if (!targetCwd) throw new Error('Claude: write needs a target cwd (opts.targetCwd or ir.cwd)');
 
-    const records = buildClaudeRecords(ir, newId, cwd);
-    const dir = join(projectsRoot, claudeProjectDirName(cwd));
-    await fs.mkdir(dir, { recursive: true });
+    // 红线 #3: 系统提示词绝不进会话正文（忽略 IR.systemPrompt；进程 flag 通道归引擎）
+    void ir.systemPrompt;
+
+    let newId = opts?.sessionId ?? randomUUID();
+    const dir = join(projectsRoot, claudeProjectDirName(targetCwd));
     const finalPath = join(dir, `${newId}.jsonl`);
-    const lines = records.map((r) => JSON.stringify(r));
-    await fs.writeFile(finalPath, lines.join('\n') + '\n');
+    if (await exists(finalPath)) {
+      // 目标位置已有同 id 文件：换号重写，绝不覆盖（§6#2）
+      if (opts?.sessionId) {
+        throw new Error(`Claude: refusing to overwrite existing session file ${finalPath}`);
+      }
+      newId = randomUUID();
+    }
 
-    // Sub-agent / teammate sidechains: each under <sessionDir>/subagents/agent-<sanitized>.jsonl
-    const paths = [finalPath];
+    const keepSynthetic = opts?.keepSynthetic === true;
+    const built = buildMainRecords(ir, newId, { targetCwd, keepSynthetic });
+    const lines = built.records.map((r) => JSON.stringify(r));
+
+    const paths: string[] = [];
+    await fs.mkdir(dir, { recursive: true });
+    if (await exists(finalPath)) {
+      throw new Error(`Claude: refusing to overwrite existing session file ${finalPath}`);
+    }
+    await fs.writeFile(finalPath, lines.join('\n') + '\n', 'utf8');
+    paths.push(finalPath);
+
+    // sidechains: <dir>/<sessionId>/subagents/agent-<id>.jsonl (+ .meta.json sidecar)
     if (ir.sidechains?.length) {
-      const sessionDir = join(dir, newId);
-      const subagentsDir = join(sessionDir, 'subagents');
-      await fs.mkdir(subagentsDir, { recursive: true });
-      const usedNames = new Set<string>();
+      const subagentsDir = join(dir, newId, 'subagents');
+      const used = new Set<string>();
       for (const sc of ir.sidechains) {
-        let sanitized = sanitizeAgentId(sc.agentId);
-        let base = `agent-${sanitized}`;
-        let finalBase = base;
-        if (usedNames.has(finalBase)) {
-          if (sc.kind === 'teammate') {
-            finalBase = `${base}-teammate`;
-            let idx = 1;
-            while (usedNames.has(finalBase)) {
-              idx += 1;
-              finalBase = `${base}-teammate-${idx}`;
-            }
-          } else {
-            let idx = 1;
-            while (usedNames.has(finalBase)) {
-              idx += 1;
-              finalBase = `${base}-${idx}`;
-            }
-          }
-        } else if (sc.kind === 'teammate') {
-          // pre-check: sanitized collides with a prior subagent's sanitized name
-          // already handled by usedNames; if no collision, keep base as-is
+        let stem = `agent-${sanitizeStem(sc.agentId)}`;
+        let n = 1;
+        while (used.has(stem)) stem = `agent-${sanitizeStem(sc.agentId)}-${n++}`;
+        used.add(stem);
+        const { records, meta } = buildSidechainRecords(sc, newId, { targetCwd, keepSynthetic });
+        const scPath = join(subagentsDir, `${stem}.jsonl`);
+        if (await exists(scPath)) {
+          throw new Error(`Claude: refusing to overwrite existing sidechain file ${scPath}`);
         }
-        usedNames.add(finalBase);
-        const scPath = join(subagentsDir, `${finalBase}.jsonl`);
-        const scLines = buildClaudeSidechainRecords(sc, newId, cwd);
-        await fs.writeFile(scPath, scLines.map((r) => JSON.stringify(r)).join('\n') + '\n');
+        await fs.mkdir(subagentsDir, { recursive: true });
+        await fs.writeFile(scPath, records.map((r) => JSON.stringify(r)).join('\n') + '\n', 'utf8');
         paths.push(scPath);
-        if (sc.agentType) {
-          const meta = { agentType: sc.agentType };
-          await fs.writeFile(join(subagentsDir, `${finalBase}.meta.json`), JSON.stringify(meta));
-        }
+        await fs.writeFile(join(subagentsDir, `${stem}.meta.json`), JSON.stringify(meta), 'utf8');
+        paths.push(`${scPath}.meta.json`);
       }
     }
 
     return { tool: 'claude', sessionId: newId, paths };
   }
 
-  /** Lightweight session listing from the Claude projects root. */
+  /**
+   * /resume-equivalent listing (§1.0): uuid-named files only, first-line
+   * isSidechain + head teamName filtered, worktree dirs de-duplicated by
+   * sessionId (mtime wins), titles customTitle → aiTitle.
+   */
   async listSessions(root?: string): Promise<SessionMeta[]> {
     const projectsRoot = root ?? defaultClaudeProjectsRoot();
     if (!projectsRoot) return [];
-    const metas: SessionMeta[] = [];
     let projects: string[];
     try {
       projects = await fs.readdir(projectsRoot);
     } catch {
       return [];
     }
+
+    // worktree aggregation: same-repo project dirs share a case-insensitive
+    // name prefix; startsWith is only allowed for truncated(200)+hash dirs
+    const bySession = new Map<string, SessionMeta & { _mtime: number }>();
     for (const proj of projects) {
       const projDir = join(projectsRoot, proj);
-      // skip subagents/ memory/ directories non-jsonl entries
       let entries: string[];
       try {
         entries = await fs.readdir(projDir);
@@ -137,21 +155,48 @@ export class ClaudeAdapter implements Adapter {
       for (const name of entries) {
         if (!name.endsWith('.jsonl')) continue;
         const sid = name.slice(0, -'.jsonl'.length);
+        if (!uuidValidate(sid)) continue; // §1.0: 非 uuid 文件名被列表忽略
         const full = join(projDir, name);
+        let head: ListLiteHead;
         try {
-          const st = await fs.stat(full);
-          metas.push({ tool: 'claude', sessionId: sid, createdAt: st.mtimeMs, sourcePath: full });
+          head = await readClaudeLinesForList(full);
         } catch {
-          // skip
+          continue;
         }
+        if (head.isSidechain) continue; // 首行 isSidechain:true → /resume 过滤
+        if (head.teamName) continue; // tmux teammate 主会话文件 → enrichLog 过滤（独立会话，可选迁移）
+        let st;
+        try {
+          st = await fs.stat(full);
+        } catch {
+          continue;
+        }
+        const parsedCreated = head.firstTimestamp ? Date.parse(head.firstTimestamp) : NaN;
+        const meta: SessionMeta = {
+          tool: 'claude',
+          sessionId: sid,
+          ...(head.customTitle ?? head.aiTitle ?? head.lastPrompt ?? head.summary ?? head.firstPrompt
+            ? { title: head.customTitle ?? head.aiTitle ?? head.lastPrompt ?? head.summary ?? head.firstPrompt }
+            : {}),
+          createdAt: Number.isFinite(parsedCreated) ? parsedCreated : st.mtimeMs,
+          sourcePath: full,
+          // cwd: only the head's cwd stamp (first record's real path) is
+          // trustworthy. The dir name is a one-way encoding (every non-alnum
+          // → `-`) — decoding it yields a skeleton like "D-codes-foo" that
+          // downstream targets (DSH header validation) refuse; leave unknown.
+          ...(head.cwd ? { cwd: head.cwd } : {}),
+          archived: false,
+        };
+        const prev = bySession.get(sid);
+        if (!prev || st.mtimeMs > prev._mtime) bySession.set(sid, { ...meta, _mtime: st.mtimeMs });
       }
     }
-    return metas;
+    return [...bySession.values()].map(({ _mtime, ...m }) => m);
   }
 
   /** Offline preview. */
   preview(session: MigratedSession): string {
-    const main = session.messages.map((m) => `[${m.role}]\n${blocksToText(m.content)}`).join('\n\n');
+    const main = session.messages.map((m) => `[${m.role}${m.synthetic ? ' (synthetic)' : ''}]\n${blocksToText(m.content)}`).join('\n\n');
     if (session.sidechains?.length) {
       const extra = session.sidechains.map((sc) => `[sidechain: ${sc.agentId} (${sc.kind})]`).join('\n');
       return main ? `${main}\n\n${extra}` : extra;
@@ -180,241 +225,23 @@ export class ClaudeAdapter implements Adapter {
   }
 }
 
-/* ------------------------------------------------------------------
- * Pure translators
- * ------------------------------------------------------------------ */
-
-/** Parse a Claude jsonl file (by path) into IR, including sub-agent sidechains. */
-export async function parseClaudeFile(path: string): Promise<MigratedSession> {
-  const text = await fs.readFile(path, 'utf8');
-  const lines = text.split('\n').filter((l) => l.trim());
-  const records = lines.map((l) => JSON.parse(l) as ClaudeRecord);
-  const messages: MigratedMessage[] = [];
-  const teammateSidechains: MigratedSidechain[] = [];
-  let sessionId: string | undefined;
-  let cwd: string | undefined;
-  let createdAt: number | undefined;
-
-  for (const rec of records) {
-    if (rec.sessionId && !sessionId) sessionId = rec.sessionId;
-    if (rec.cwd && !cwd) cwd = rec.cwd;
-    if (rec.type === 'user' || rec.type === 'assistant') {
-      const msg = recordToMessage(rec);
-      if (msg) messages.push(msg);
-      if (createdAt === undefined && rec.timestamp) createdAt = new Date(rec.timestamp).getTime();
-      // teammate: <teammate-message teammate_id="name@team" color="...">\n...\n</teammate-message>
-      // anchor print.ts:2601, xml.ts:51 — mirror as sidechain kind:'teammate', keep original in main chain
-      if (rec.type === 'user' && rec.message) {
-        const raw = rec.message.content;
-        let combined = '';
-        if (typeof raw === 'string') combined = raw;
-        else if (Array.isArray(raw)) {
-          for (const b of raw) {
-            if (typeof b === 'string') combined += b + '\n';
-            else if (b && typeof b === 'object') {
-              const blk = b as Record<string, unknown>;
-              if (blk.type === 'text' && typeof blk.text === 'string') combined += blk.text + '\n';
-              else if (typeof blk.text === 'string') combined += String(blk.text) + '\n';
-              else if (typeof blk.content === 'string') combined += String(blk.content) + '\n';
-            }
-          }
-        }
-        if (!combined && msg) {
-          combined = msg.content
-            .filter((c) => c.type === 'text')
-            .map((c) => (c as { text: string }).text)
-            .join('\n');
-        }
-        if (combined) {
-          const re = /<teammate-message[^>]*teammate_id\s*=\s*["']([^"']+)["'][^>]*>([\s\S]*?)<\/teammate-message>/gi;
-          let m: RegExpExecArray | null;
-          while ((m = re.exec(combined)) !== null) {
-            const teammateIdRaw = (m[1] ?? '').trim();
-            const agentId = teammateIdRaw || 'unknown-teammate';
-            let inner = m[2] ?? '';
-            // 去首尾空行：trim outer blank lines, keep inner formatting as single text block
-            inner = inner.replace(/^(?:\r?\n)+|(?:\r?\n)+$/g, '').trim();
-            if (!inner) continue;
-            teammateSidechains.push({
-              agentId,
-              kind: 'teammate' as const,
-              parentMessageId: rec.uuid,
-              messages: [{ role: 'user' as const, content: [{ type: 'text' as const, text: inner }] }],
-            });
-          }
-        }
-      }
-    }
-  }
-
-  const ir: MigratedSession = { schemaVersion: 2, originTool: 'claude', originSessionId: sessionId, cwd, messages };
-  if (createdAt !== undefined) ir.createdAt = createdAt;
-
-  // Sidechains: <dirPath>/<sessionId>/subagents/agent-<id>.jsonl + inline teammate mirrors
-  let sidechains: MigratedSidechain[] = [];
-  if (sessionId) {
-    const dirPath = dirnameOf(path);
-    const subagentsDir = join(dirPath, sessionId, 'subagents');
-    sidechains = await loadSidechains(subagentsDir);
-  }
-  if (teammateSidechains.length) sidechains = [...sidechains, ...teammateSidechains];
-  if (sidechains.length) ir.sidechains = sidechains;
-
-  return validateSession(ir);
-}
-
-function dirnameOf(p: string): string {
-  const idx = Math.max(p.lastIndexOf('/'), p.lastIndexOf('\\'));
-  return idx >= 0 ? p.slice(0, idx) : '.';
-}
-
-/** Scan a session's `subagents/` dir and parse each `agent-<id>.jsonl`. */
-async function loadSidechains(subagentsDir: string): Promise<MigratedSidechain[]> {
-  let entries;
+async function exists(p: string): Promise<boolean> {
   try {
-    entries = await fs.readdir(subagentsDir, { withFileTypes: true });
+    await fs.access(p);
+    return true;
   } catch {
-    return [];
+    return false;
   }
-  const out: MigratedSidechain[] = [];
-  for (const e of entries) {
-    if (!e.isFile() || !e.name.startsWith('agent-') || !e.name.endsWith('.jsonl')) continue;
-    const agentId = e.name.slice('agent-'.length, -'.jsonl'.length);
-    if (!agentId) continue;
-    const scText = await fs.readFile(join(subagentsDir, e.name), 'utf8');
-    const sidechain = parseSidechainFile(scText, agentId);
-    if (sidechain) out.push(sidechain);
-  }
-  return out;
 }
 
-function parseSidechainFile(text: string, agentId: string): MigratedSidechain | null {
-  const records = text.split('\n').filter((l) => l.trim()).map((l) => JSON.parse(l) as ClaudeRecord);
-  const messages: MigratedMessage[] = [];
-  for (const rec of records) {
-    if (rec.type !== 'user' && rec.type !== 'assistant') continue;
-    if (!rec.isSidechain) continue;
-    const msg = recordToMessage(rec);
-    if (msg) messages.push(msg);
-  }
-  if (messages.length === 0) return null;
-  return { agentId, kind: 'subagent' as const, messages };
+function sanitizeStem(agentId: string): string {
+  return agentId.replace(/[^A-Za-z0-9-]/g, '-') || 'unknown';
 }
 
-/** Build the records for one sub-agent sidechain file (isSidechain:true + agentId). */
-export function buildClaudeSidechainRecords(
-  sc: MigratedSidechain,
-  sessionId: string,
-  cwd: string,
-): unknown[] {
-  const records: Record<string, unknown>[] = [];
-  let now = Date.now();
-  for (const msg of sc.messages) {
-    now += 1;
-    const type = msg.role === 'assistant' || msg.role === 'tool' ? 'assistant' : 'user';
-    const contentArr = msg.content.map((b) => claudeNativeBlock(b));
-    records.push({
-      type,
-      ...(cwd ? { cwd } : {}),
-      message: { role: type === 'assistant' ? 'assistant' : 'user', content: contentArr },
-      uuid: randomUUID(),
-      parentUuid: records.length > 0 ? records[records.length - 1].uuid : null,
-      timestamp: new Date(now).toISOString(),
-      isSidechain: true,
-      agentId: sc.agentId,
-      sessionId,
-    });
-  }
-  return records;
-}
-
-function recordToMessage(rec: ClaudeRecord): MigratedMessage | null {
-  const m = rec.message;
-  if (!m) return null;
-  const role = (m.role === 'assistant' ? 'assistant' : m.role === 'user' ? 'user' : (m.role as MigratedMessage['role'])) ?? 'assistant';
-  const raw = m.content;
-  const contentArr = Array.isArray(raw) ? raw : typeof raw === 'string' ? [{ type: 'text', text: raw }] : [];
-  const content = normalizeContent(contentArr);
-  if (content.length === 0) return null;
-  return { role, content, timestamp: rec.timestamp ? new Date(rec.timestamp).getTime() : undefined };
-}
-
-/** Build the Claude record chain (mode + user/assistant + last-prompt). */
-export function buildClaudeRecords(ir: MigratedSession, sessionId: string, cwd: string): unknown[] {
-  const records: Record<string, unknown>[] = [];
-  let now = ir.createdAt ?? Date.now();
-  let lastUserText = '';
-  for (const msg of ir.messages) {
-    now += 1;
-    const uuid = randomUUID();
-    const type = msg.role === 'assistant' || msg.role === 'tool' ? 'assistant' : 'user';
-    if (type === 'user') {
-      const firstText = messageToPlainText(msg);
-      if (firstText) lastUserText = firstText;
-    }
-
-    const contentArr = msg.content.map((b) => claudeNativeBlock(b));
-    records.push({
-      type,
-      ...(cwd ? { cwd } : {}),
-      message: {
-        role: type === 'assistant' ? 'assistant' : 'user',
-        content: contentArr,
-      },
-      uuid,
-      parentUuid: records.length > 0 ? records[records.length - 1].uuid : null,
-      timestamp: new Date(now).toISOString(),
-      isSidechain: false,
-      sessionId,
-    });
-  }
-  // terminal control line — authoritative shape (source: reAppendSessionMetadata):
-  // {type:'last-prompt', lastPrompt:<text>, sessionId}
-  if (lastUserText.length > 200) lastUserText = lastUserText.slice(0, 200);
-  const lp: Record<string, unknown> = { type: 'last-prompt', lastPrompt: lastUserText, sessionId };
-  if (cwd) lp.cwd = cwd;
-  records.push(lp);
-  return records;
-}
-
-function messageToPlainText(msg: MigratedMessage): string {
-  const parts: string[] = [];
-  for (const b of msg.content) {
-    if (b.type === 'text') parts.push(b.text);
-  }
-  return parts.join('\n').replace(/\s+/g, ' ').trim();
-}
-
-function claudeNativeBlock(block: ContentBlock): unknown {
-  if (block.type === 'text') return { type: 'text', text: block.text };
-  if (block.type === 'tool_use') return { type: 'tool_use', id: block.id, name: block.name, input: block.input };
-  if (block.type === 'thinking') {
-    // signed thinking replay: the signature must ride the block (gap #1)
-    return block.signature
-      ? { type: 'thinking', thinking: block.thinking, signature: block.signature }
-      : { type: 'thinking', thinking: block.thinking };
-  }
-  if (block.type === 'file') {
-    const mediaType = block.mediaType ?? 'application/octet-stream';
-    if (block.data) return { type: 'image', source: { type: 'base64', media_type: mediaType, data: block.data } };
-    if (block.url) return { type: 'image', source: { type: 'url', url: block.url } };
-    return { type: 'text', text: `[file${block.filename ? `: ${block.filename}` : ''}]` };
-  }
-  const out: Record<string, unknown> = { type: 'tool_result', tool_use_id: block.toolUseId, content: block.content, is_error: !!block.isError };
-  if (block.attachments?.length) {
-    // anthropic tool_result content may be an array carrying images (gap #4)
-    out.content = [
-      { type: 'text', text: block.content },
-      ...block.attachments.map((a) => claudeNativeBlock(a)),
-    ];
-  }
-  return out;
-}
-
-function sanitizeAgentId(agentId: string): string {
-  let out = '';
-  for (const ch of agentId) out += /^[A-Za-z0-9]$/.test(ch) ? ch : '-';
-  // collapse and trim to keep filenames tidy; same intent as claudeProjectDirName but id-scoped
-  out = out.replace(/-+/g, '-').replace(/^-|-$/g, '');
-  return out || 'unknown-teammate';
-}
+export {
+  claudeProjectDirName,
+  defaultClaudeProjectsRoot,
+  MAX_SANITIZED_LENGTH,
+} from './path.js';
+export { parseClaudeFile, loadSidechains } from './parse.js';
+export { buildMainRecords, buildSidechainRecords, claudeNativeBlock } from './write.js';
