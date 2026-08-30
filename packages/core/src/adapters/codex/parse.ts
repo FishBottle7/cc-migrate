@@ -292,6 +292,82 @@ export async function scanRolloutHead(path: string): Promise<RolloutHeadScan> {
 }
 
 /* ------------------------------------------------------------------ */
+/* First-line meta scan (subagent stitching)                           */
+/* ------------------------------------------------------------------ */
+
+export interface RolloutMetaScan {
+  /** thread_spawn parent — present only for subagent threads (never forks). */
+  parentThreadId?: string;
+  agentNickname?: string;
+  agentRole?: string;
+  agentPath?: string;
+}
+
+/**
+ * session_meta is always record #1, so the subagent linkage
+ * (`source.subagent.thread_spawn`, plus the top-level mirror fields) is
+ * answerable from the first line alone — cheap enough to run across every
+ * rollout to build the parent→children map for read-side sidechain stitching.
+ * Guarded on thread_source==='subagent'/'thread_spawn' so user forks
+ * (forked_from_id) never count as subagent children.
+ */
+export async function scanRolloutMeta(path: string): Promise<RolloutMetaScan> {
+  let head: string | undefined;
+  if (path.endsWith('.zst')) {
+    head = (await readRolloutText(path)).split('\n')[0];
+  } else {
+    const fh = await fs.open(path, 'r');
+    try {
+      const buf = Buffer.alloc(64 * 1024);
+      const chunks: Buffer[] = [];
+      let total = 0;
+      while (total < 512 * 1024) {
+        const { bytesRead } = await fh.read(buf, 0, buf.length, total);
+        if (!bytesRead) break;
+        chunks.push(Buffer.from(buf.subarray(0, bytesRead)));
+        total += bytesRead;
+        const nl = Buffer.concat(chunks).indexOf(0x0a);
+        if (nl >= 0) {
+          head = Buffer.concat(chunks).toString('utf8', 0, nl);
+          break;
+        }
+      }
+      if (head === undefined) head = Buffer.concat(chunks).toString('utf8');
+    } finally {
+      await fh.close();
+    }
+  }
+  if (!head?.trim()) return {};
+  try {
+    const env = JSON.parse(head) as RolloutLineRaw;
+    if (env.type !== 'session_meta') return {};
+    const payload = env.payload as Record<string, unknown> | undefined;
+    if (!payload || typeof payload !== 'object') return {};
+    const source = payload.source as Record<string, unknown> | undefined;
+    const spawn = source?.subagent as Record<string, unknown> | undefined;
+    const threadSpawn = spawn?.thread_spawn as Record<string, unknown> | undefined;
+    if (!threadSpawn && payload.thread_source !== 'subagent') return {};
+    const pick = (nested: unknown, top: unknown): string | undefined =>
+      typeof nested === 'string' ? nested : typeof top === 'string' ? top : undefined;
+    const parent = pick(threadSpawn?.parent_thread_id, payload.parent_thread_id);
+    return {
+      ...(parent ? { parentThreadId: parent } : {}),
+      ...(pick(threadSpawn?.agent_nickname, payload.agent_nickname)
+        ? { agentNickname: pick(threadSpawn?.agent_nickname, payload.agent_nickname) }
+        : {}),
+      ...(pick(threadSpawn?.agent_role, payload.agent_role)
+        ? { agentRole: pick(threadSpawn?.agent_role, payload.agent_role) }
+        : {}),
+      ...(pick(threadSpawn?.agent_path, payload.agent_path)
+        ? { agentPath: pick(threadSpawn?.agent_path, payload.agent_path) }
+        : {}),
+    };
+  } catch {
+    return {};
+  }
+}
+
+/* ------------------------------------------------------------------ */
 /* Records → IR                                                        */
 /* ------------------------------------------------------------------ */export interface IrBuildContext {
   /** Newest-wins thread titles (session_index.jsonl). */

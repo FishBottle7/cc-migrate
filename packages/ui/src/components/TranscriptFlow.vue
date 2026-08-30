@@ -73,7 +73,7 @@ defineProps<{
         </div>
       </details>
 
-      <!-- 注入上下文：暗淡披露行 -->
+      <!-- 注入上下文：暗淡披露行（injKind = IR meta 里的 harness 分类） -->
       <details v-else class="drow inject-row" :title="fmtFull(it.ts)">
         <summary>
           <svg class="chev" viewBox="0 0 8 8" aria-hidden="true"><path d="M2 1l4 3-4 3" /></svg>
@@ -81,6 +81,7 @@ defineProps<{
             <svg viewBox="0 0 14 14"><path d="M7 2v6.5M4.5 6L7 8.5 9.5 6" /><path d="M3 11.5h8" /></svg>
           </span>
           <span class="row-title">注入上下文</span>
+          <span v-if="it.injKind" class="row-kind sm-mono">{{ it.injKind }}</span>
           <span class="row-sep" aria-hidden="true" />
           <span class="row-sum">{{ firstLine(it.text) }}</span>
         </summary>
@@ -285,6 +286,20 @@ defineProps<{
   font-size: 13px;
   line-height: 20px;
   color: var(--fg-2);
+}
+/* 注入分类 chip（agents_md.instructions 等） */
+.row-kind {
+  flex: none;
+  max-width: 220px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 10.5px;
+  line-height: 16px;
+  color: var(--fg-2);
+  border: 1px solid var(--line-0);
+  border-radius: 999px;
+  padding: 0 7px;
 }
 .row-sum.is-err {
   color: var(--err);

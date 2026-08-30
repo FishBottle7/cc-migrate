@@ -21,7 +21,7 @@ export type FlowItem =
       /** tool_use 的调用 id（子代理「定位召唤处」按它滚动定位） */
       callId?: string;
     }
-  | { kind: 'inject'; key: string; ts?: number; text: string };
+  | { kind: 'inject'; key: string; ts?: number; text: string; injKind?: string };
 
 export function firstLine(text: string): string {
   const nl = text.indexOf('\n');
@@ -86,8 +86,11 @@ export function computeFlow(messages: PreviewMessageDTO[], prefix = 'm'): FlowIt
     if (m.role === 'user') {
       const text = m.blocks.filter((b) => b.t === 'text').map((b) => b.text ?? '').join('');
       const key = `${prefix}u${mi}`;
-      if (m.synthetic) items.push({ kind: 'inject', key, ts, text: text || '（空）' });
-      else if (text.trim()) items.push({ kind: 'user', key, ts, text });
+      // synthetic 之外，IR meta 里的 harness 分类（codex contentKind 等）
+      // 也按注入渲染 —— AGENTS.md 指令这类「非 synthetic 的注入」靠它识别。
+      if (m.synthetic || m.injectionKind) {
+        items.push({ kind: 'inject', key, ts, text: text || '（空）', ...(m.injectionKind ? { injKind: m.injectionKind } : {}) });
+      } else if (text.trim()) items.push({ kind: 'user', key, ts, text });
       return;
     }
     if (m.role === 'system' || m.role === 'developer') {

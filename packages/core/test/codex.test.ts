@@ -973,3 +973,63 @@ test('write: unmapped event_msg replay gates on persisted EventMsg variants', as
   const tags = eventRows.map((l) => l.payload?.type);
   assert.deepEqual(tags, ['task_started'], 'only persisted variants replay; retired + foreign tags stay in the IR');
 });
+
+test('read: native subagent threads stitch into ir.sidechains (recursively)', async () => {
+  const adapter = new CodexAdapter();
+  const root = await tempRoot();
+  const ir: MigratedSession = {
+    schemaVersion: 2,
+    originTool: 'claude',
+    originSessionId: 'src-stitch',
+    createdAt: Date.parse(TS),
+    cwd: 'D:\proj',
+    messages: [{ role: 'user', content: [{ type: 'text', text: 'main prompt' }] }],
+    sidechains: [
+      {
+        agentId: 'agent-1',
+        kind: 'subagent',
+        agentType: 'Harvey',
+        messages: [
+          { role: 'user', content: [{ type: 'text', text: 'child task' }] },
+          { role: 'assistant', content: [{ type: 'text', text: 'child answer' }] },
+        ],
+        sidechains: [
+          { agentId: 'agent-2', kind: 'subagent', messages: [{ role: 'user', content: [{ type: 'text', text: 'grandchild task' }] }] },
+        ],
+      },
+    ],
+  };
+  const res = await adapter.write(ir, { root, targetCwd: 'D:\proj', keepSynthetic: true });
+  const mainId = res.sessionId;
+  const childIr = await parseRolloutFile(res.paths[1]!, root);
+  const childThreadId = childIr.originSessionId!;
+  const gcIr = await parseRolloutFile(res.paths[2]!, root);
+  const gcThreadId = gcIr.originSessionId!;
+
+  // parent parse: child stitches in with its nickname and nested grandchild
+  const back = await adapter.parse(mainId, root);
+  assert.equal(back.sidechains?.length, 1);
+  const sc = back.sidechains![0]!;
+  assert.equal(sc.agentId, childThreadId);
+  assert.equal(sc.kind, 'subagent');
+  assert.equal(sc.agentType, 'Harvey', 'agent_nickname rides from session_meta');
+  assert.deepEqual(
+    sc.messages.map((m) => m.content.map((b) => (b.type === 'text' ? b.text : '')).join('')),
+    ['child task', 'child answer'],
+  );
+  assert.equal(sc.sidechains?.length, 1, 'grandchild nests under the child');
+  assert.equal(sc.sidechains![0]!.agentId, gcThreadId);
+  assert.equal(
+    (sc.sidechains![0]!.messages[0]!.content[0] as { text: string }).text,
+    'grandchild task',
+  );
+
+  // previewing the child itself: its own subtree stitches in, no cycles
+  const childBack = await adapter.parse(childThreadId, root);
+  assert.equal(childBack.sidechains?.length, 1);
+  assert.equal(childBack.sidechains![0]!.agentId, gcThreadId);
+
+  // leaf has no children → no sidechains key at all
+  const gcBack = await adapter.parse(gcThreadId, root);
+  assert.equal(gcBack.sidechains, undefined);
+});

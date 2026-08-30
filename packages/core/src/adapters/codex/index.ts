@@ -35,6 +35,7 @@ import {
   parseRolloutLines,
   readRolloutText,
   scanRolloutHead,
+  scanRolloutMeta,
 } from './parse.js';
 import { buildRolloutLines, sessionIndexTitle } from './write.js';
 import type { CodexWriteOptions } from './write.js';
@@ -49,7 +50,14 @@ export class CodexAdapter implements Adapter {
     if (!path) throw new Error(`Codex: session "${sessionId}" not found under ${codexHome}`);
     const titles = await loadSessionIndexTitles(codexHome);
     const text = await readRolloutText(path);
-    return rolloutRecordsToIr(parseRolloutLines(text), { titles, sourcePath: path });
+    const ir = rolloutRecordsToIr(parseRolloutLines(text), { titles, sourcePath: path });
+    // Read side of the write-side subagent expansion: native codex subagent
+    // threads are separate rollout files linked via session_meta thread_spawn
+    // — stitch them into ir.sidechains (recursively for grandchildren).
+    const byParent = await subagentChildIndex(codexHome);
+    const stitched = await loadSubagentTree(sessionId, byParent, titles, new Set([sessionId]));
+    if (stitched.length) ir.sidechains = stitched;
+    return ir;
   }
 
   async write(ir: MigratedSession, opts?: WriteOptions): Promise<WriteResult> {
@@ -203,6 +211,88 @@ async function writeSidechainTree(
   const out = [path];
   for (const kid of sc.sidechains ?? []) {
     out.push(...(await writeSidechainTree(kid, parentIr, codexHome, wopts, targetCwd, threadId, depth + 1)));
+  }
+  return out;
+}
+
+/* ── Read-side subagent stitching ────────────────────────────── */
+
+interface SubagentChildInfo {
+  threadId: string;
+  path: string;
+  agentNickname?: string;
+  agentRole?: string;
+  agentPath?: string;
+  ts?: number;
+}
+
+/** Preview/migrate click arounds re-parse the same home — brief TTL cache. */
+const SUBAGENT_INDEX_TTL_MS = 5_000;
+const subagentIndexCache = new Map<string, { at: number; byParent: Map<string, SubagentChildInfo[]> }>();
+
+/**
+ * parent thread id → subagent child rollouts, by first-line meta scan of every
+ * rollout in the home (session_meta is record #1, so this is cheap). Result is
+ * a snapshot: sessions written while the TTL entry lives appear on the next
+ * rebuild — fine for preview, and migrate re-checks nothing older than 5s.
+ */
+async function subagentChildIndex(codexHome: string): Promise<Map<string, SubagentChildInfo[]>> {
+  const hit = subagentIndexCache.get(codexHome);
+  if (hit && Date.now() - hit.at < SUBAGENT_INDEX_TTL_MS) return hit.byParent;
+  const files = new Map<string, { path: string; mtime: number; createdAt: number | null }>();
+  await walkRollouts(codexHome, files, false);
+  await walkRollouts(archivedDir(codexHome), files, true);
+  const byParent = new Map<string, SubagentChildInfo[]>();
+  for (const [threadId, f] of files) {
+    const meta = await scanRolloutMeta(f.path);
+    if (!meta.parentThreadId || meta.parentThreadId === threadId) continue;
+    const list = byParent.get(meta.parentThreadId) ?? [];
+    list.push({
+      threadId,
+      path: f.path,
+      agentNickname: meta.agentNickname,
+      agentRole: meta.agentRole,
+      agentPath: meta.agentPath,
+      ts: f.createdAt ?? undefined,
+    });
+    byParent.set(meta.parentThreadId, list);
+  }
+  for (const list of byParent.values()) list.sort((a, b) => (a.ts ?? 0) - (b.ts ?? 0));
+  subagentIndexCache.set(codexHome, { at: Date.now(), byParent });
+  return byParent;
+}
+
+/** Parse one parent's subagent subtree into MigratedSidechain[] (visited-set cycle guard). */
+async function loadSubagentTree(
+  parentId: string,
+  byParent: Map<string, SubagentChildInfo[]>,
+  titles: Map<string, string>,
+  visited: Set<string>,
+): Promise<MigratedSidechain[]> {
+  const out: MigratedSidechain[] = [];
+  for (const info of byParent.get(parentId) ?? []) {
+    if (visited.has(info.threadId)) continue;
+    visited.add(info.threadId);
+    const text = await readRolloutText(info.path);
+    const child = rolloutRecordsToIr(parseRolloutLines(text), { titles, sourcePath: info.path });
+    const label =
+      info.agentNickname ?? info.agentRole ?? info.agentPath?.split('/').filter(Boolean).pop();
+    const nested = await loadSubagentTree(info.threadId, byParent, titles, visited);
+    out.push({
+      agentId: info.threadId,
+      kind: 'subagent',
+      ...(label ? { agentType: label } : {}),
+      messages: child.messages,
+      ...(child.toolCalls?.length ? { toolCalls: child.toolCalls } : {}),
+      originSessionId: info.threadId,
+      ...(child.title ? { title: child.title } : {}),
+      ...(child.createdAt ? { createdAt: child.createdAt } : {}),
+      ...(child.cwd ? { cwd: child.cwd } : {}),
+      ...(child.compaction?.length ? { compaction: child.compaction } : {}),
+      ...(child.unmappedEvents?.length ? { unmappedEvents: child.unmappedEvents } : {}),
+      ...(child.meta ? { meta: child.meta } : {}),
+      ...(nested.length ? { sidechains: nested } : {}),
+    });
   }
   return out;
 }

@@ -35,6 +35,12 @@ export interface PreviewMessageDTO {
   ts?: number;
   model?: string;
   synthetic?: boolean;
+  /**
+   * Harness-injection classification from the IR message meta
+   * (meta.codex.contentKind 等)——非 synthetic 但由 harness 注入/包装的行
+   * （如 codex AGENTS.md 指令、inter-agent 通信）。有值即按「注入」渲染。
+   */
+  injectionKind?: string;
   blocks: PreviewBlockDTO[];
 }
 

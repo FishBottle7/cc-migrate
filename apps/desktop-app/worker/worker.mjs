@@ -104,18 +104,54 @@ function blockToDto(b) {
   }
 }
 
+/**
+ * Harness 注入分类投影（GUI 只吃 IR）：synthetic 之外，IR 消息 meta 里的
+ * harness 分类也要带到 DTO —— codex 的 AGENTS.md 指令行是非 synthetic 的
+ * contentKind（agents_md.instructions），漏了它 GUI 就会把注入当用户提示词。
+ * meta.codex.kind 里的 'agent_message' 是真助手消息（legacy agent_message
+ * 事件），不算注入；'iac' / 'compaction_summary' 算。
+ */
+function injectionKindOf(m) {
+  const cx = m.meta?.codex;
+  if (typeof cx?.contentKind === 'string') return cx.contentKind;
+  if (cx?.kind === 'compaction_summary' || cx?.kind === 'iac') return cx.kind;
+  return undefined;
+}
+
 function messagesToDto(messages) {
   return messages.map((m) => ({
     role: m.role,
     ts: m.timestamp,
     model: m.model,
     synthetic: m.synthetic,
+    ...(injectionKindOf(m) ? { injectionKind: injectionKindOf(m) } : {}),
     blocks: m.content.map(blockToDto).filter((b) => b !== null),
   }));
 }
 
 // 每条子代理最多投影的消息数：预览用，防单个巨型 Task 把 IPC 载荷撑爆
 const SC_MSG_CAP = 300;
+
+function sidechainToDto(sc) {
+  const msgs = sc.messages ?? [];
+  const capped = msgs.slice(0, SC_MSG_CAP);
+  return {
+    agentId: sc.agentId,
+    agentType: sc.agentType,
+    parentCallId: sc.parentMessageId,
+    truncated: msgs.length > SC_MSG_CAP || undefined,
+    messages: messagesToDto(capped),
+  };
+}
+
+/** 嵌套旁链（孙代）拍平为顶层条目 —— GUI 的子代理树是一层主干 + N 个节点。 */
+function flattenSidechains(list, out = []) {
+  for (const sc of list ?? []) {
+    out.push(sidechainToDto(sc));
+    if (sc.sidechains?.length) flattenSidechains(sc.sidechains, out);
+  }
+  return out;
+}
 
 async function buildPreview({ tool, sessionId, root }) {
   const t = assertTool(tool);
@@ -132,17 +168,7 @@ async function buildPreview({ tool, sessionId, root }) {
     toolCallCount: ir.toolCalls?.length ?? 0,
     hasSidechains: (ir.sidechains?.length ?? 0) > 0,
     messages: messagesToDto(ir.messages),
-    sidechains: (ir.sidechains ?? []).map((sc) => {
-      const msgs = sc.messages ?? [];
-      const capped = msgs.slice(0, SC_MSG_CAP);
-      return {
-        agentId: sc.agentId,
-        agentType: sc.agentType,
-        parentCallId: sc.parentMessageId,
-        truncated: msgs.length > SC_MSG_CAP || undefined,
-        messages: messagesToDto(capped),
-      };
-    }),
+    sidechains: flattenSidechains(ir.sidechains),
   };
 }
 

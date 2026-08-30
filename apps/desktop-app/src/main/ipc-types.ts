@@ -36,6 +36,8 @@ export interface PreviewMessageDTO {
   ts?: number;
   model?: string;
   synthetic?: boolean;
+  /** IR 消息 meta 里的 harness 注入分类（如 codex agents_md.instructions）——有值按「注入」渲染 */
+  injectionKind?: string;
   blocks: PreviewBlockDTO[];
 }
 
