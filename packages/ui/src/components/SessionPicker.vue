@@ -15,6 +15,8 @@ const emit = defineEmits<{
 }>();
 
 const query = ref('');
+const hideEmpty = ref(true);
+const archivedOnly = ref(false);
 
 function fmtTime(ts?: number): string {
   if (!ts) return '—';
@@ -29,7 +31,9 @@ function truncate(s: string, n: number): string {
 
 const filtered = computed(() => {
   const q = query.value.trim().toLowerCase();
-  const sorted = [...props.sessions].sort((a, b) => (b.createdAt ?? 0) - (a.createdAt ?? 0));
+  let sorted = [...props.sessions].sort((a, b) => (b.createdAt ?? 0) - (a.createdAt ?? 0));
+  if (hideEmpty.value) sorted = sorted.filter((m) => !m.deferredCreation);
+  if (archivedOnly.value) sorted = sorted.filter((m) => m.archived);
   if (!q) return sorted;
   return sorted.filter((m) =>
     String(m.sessionId).toLowerCase().includes(q) ||
@@ -95,6 +99,14 @@ function toggleGroup(key: string) {
         placeholder="过滤：标题 / 会话 id / 工作目录…"
         spellcheck="false"
       />
+      <label class="sp-chip" :class="{ on: hideEmpty }" title="隐藏已登记但还没有 rollout 文件的会话（codex deferred creation，无可迁移内容）">
+        <input v-model="hideEmpty" type="checkbox" />
+        空会话
+      </label>
+      <label class="sp-chip" :class="{ on: archivedOnly }" title="只看归档目录（DSH 归档 / codex archived_sessions）里的会话">
+        <input v-model="archivedOnly" type="checkbox" />
+        只看归档
+      </label>
       <span class="sp-count sm-mono">{{ filtered.length }}<i>/</i>{{ props.sessions.length }}</span>
       <button class="sm-btn sm-btn--ghost" type="button" :disabled="props.loading" @click="emit('refresh')">
         重新扫描
@@ -139,7 +151,11 @@ function toggleGroup(key: string) {
             :class="{ 'is-active': props.selectedId === m.sessionId }"
             @click="emit('select', m)"
           >
-            <span class="sp-title">{{ m.title ? truncate(m.title, 60) : '(无标题)' }}</span>
+            <span class="sp-title">
+              {{ m.title ? truncate(m.title, 60) : '(无标题)' }}
+              <span v-if="m.deferredCreation" class="sp-tag" title="已登记但无 rollout 文件（deferred creation）">空</span>
+              <span v-else-if="m.archived" class="sp-tag" title="位于归档目录">归档</span>
+            </span>
             <span class="sp-meta">
               <span class="sp-time sm-mono">{{ fmtTime(m.createdAt) }}</span>
               <span v-if="m.cwd" class="sp-cwd sm-mono">{{ truncate(m.cwd, 42) }}</span>
@@ -370,6 +386,39 @@ function toggleGroup(key: string) {
   font-weight: 600;
   line-height: 1.45;
   letter-spacing: 0.01em;
+}
+.sp-tag {
+  display: inline-block;
+  margin-left: 6px;
+  padding: 0 5px;
+  border: 1px solid var(--line-1);
+  border-radius: 5px;
+  font-size: 10px;
+  font-weight: 500;
+  color: var(--fg-2);
+  vertical-align: 1px;
+}
+.sp-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 3px 9px;
+  border: 1px solid var(--line-1);
+  border-radius: 999px;
+  font-size: 11px;
+  color: var(--fg-2);
+  white-space: nowrap;
+  cursor: pointer;
+  user-select: none;
+  transition: color 0.15s, border-color 0.15s;
+}
+.sp-chip input {
+  accent-color: currentcolor;
+  margin: 0;
+}
+.sp-chip.on {
+  color: var(--fg-1);
+  border-color: var(--fg-2);
 }
 .sp-meta {
   display: flex;

@@ -656,6 +656,48 @@ test('round-trip: adapter write→parse keeps messages + native meta + title', a
   assert.equal(found?.sourcePath, res.paths[0]);
 });
 
+test('listSessions: archived_sessions flagged + index-only threads listed as deferredCreation', async () => {
+  const adapter = new CodexAdapter();
+  const root = await tempRoot();
+  const ir = fallbackIr();
+  ir.createdAt = Date.parse('2026-01-12T20:55:48Z');
+  const res = await adapter.write(ir, { root, targetCwd: 'D:\\proj' });
+
+  // an archived rollout under archived_sessions/
+  const archId = '019b-archived-thread';
+  const archDir = join(root, 'archived_sessions');
+  await fs.mkdir(archDir, { recursive: true });
+  const archMeta = JSON.stringify({
+    timestamp: '2026-01-12T12:55:47.732Z', type: 'session_meta',
+    payload: { id: archId, session_id: archId, timestamp: '2026-01-12T12:55:47.732Z', cwd: 'D:\\proj', originator: 'codex_cli_rs', cli_version: '0.146.0' },
+  });
+  const archMsg = JSON.stringify({
+    timestamp: '2026-01-12T12:55:48.000Z', type: 'response_item',
+    payload: { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'archived question' }] },
+  });
+  await fs.writeFile(join(archDir, `rollout-2026-01-12T20-55-48-${archId}.jsonl`), `${archMeta}\n${archMsg}\n`, 'utf8');
+
+  // a deferred-creation thread: index entry with no rollout file
+  await fs.appendFile(
+    join(root, 'session_index.jsonl'),
+    JSON.stringify({ id: 'ghost-thread', thread_name: '幽灵会话', updated_at: new Date().toISOString() }) + '\n',
+    'utf8',
+  );
+
+  const metas = await adapter.listSessions(root);
+  const mine = metas.find((m) => m.sessionId === res.sessionId);
+  const arch = metas.find((m) => m.sessionId === archId);
+  const ghost = metas.find((m) => m.sessionId === 'ghost-thread');
+  assert.ok(mine && !mine.archived && !mine.deferredCreation, 'live session unflagged');
+  assert.ok(arch?.archived, 'archived_sessions flagged');
+  assert.equal(arch?.deferredCreation, undefined);
+  assert.ok(ghost?.deferredCreation, 'index-only thread listed as deferredCreation');
+  assert.equal(ghost?.title, '幽灵会话');
+  assert.equal(ghost?.sourcePath, undefined);
+  // deferred sessions sort last
+  assert.equal(metas[metas.length - 1].sessionId, 'ghost-thread');
+});
+
 test('round-trip: synthetic drop default vs keepSynthetic', () => {
   const ir1 = rolloutRecordsToIr(lines(richFixture()), {});
   const dropped = buildRolloutLines(ir1, 'x', 'D:\\proj', 0, { targetCwd: 'D:\\proj', createdAt: 0, threadId: 'x' });

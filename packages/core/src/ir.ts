@@ -156,8 +156,10 @@ export interface SessionMeta {
   sourcePath?: string;
   /** Absolute working directory the session ran under (source). */
   cwd?: string;
-  /** True when the source store flags the session as archived (DSH workspace.json). */
+  /** True when the source store flags the session as archived (DSH workspace.json; codex archived_sessions/). */
   archived?: boolean;
+  /** True when the native index registers the session but no rollout file exists yet (codex deferred creation — nothing to migrate). */
+  deferredCreation?: boolean;
 }
 
 export interface MigratedGoal {

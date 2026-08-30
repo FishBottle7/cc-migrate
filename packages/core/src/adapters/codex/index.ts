@@ -93,9 +93,9 @@ export class CodexAdapter implements Adapter {
   async listSessions(root?: string): Promise<SessionMeta[]> {
     const codexHome = root ?? defaultCodexHome();
     if (!codexHome) return [];
-    const files = new Map<string, { path: string; mtime: number; createdAt: number | null }>();
-    await walkRollouts(codexHome, files);
-    await walkRollouts(archivedDir(codexHome), files);
+    const files = new Map<string, { path: string; mtime: number; createdAt: number | null; archived?: boolean }>();
+    await walkRollouts(codexHome, files, false);
+    await walkRollouts(archivedDir(codexHome), files, true);
     const titles = await loadSessionIndexTitles(codexHome);
     const items: SessionMeta[] = [];
     for (const [threadId, f] of files) {
@@ -105,9 +105,17 @@ export class CodexAdapter implements Adapter {
         ...(titles.get(threadId) ? { title: titles.get(threadId) } : {}),
         createdAt: f.createdAt ?? (f.mtime || undefined),
         sourcePath: f.path,
+        ...(f.archived ? { archived: true } : {}),
       });
     }
-    items.sort((a, b) => (a.createdAt ?? 0) - (b.createdAt ?? 0));
+    // Deferred-creation threads: registered in the append-only index but no
+    // rollout file on disk yet — nothing to migrate; listed so consumers can
+    // account for them (SessionMeta.deferredCreation) and filter in the UI.
+    for (const [threadId, title] of titles) {
+      if (files.has(threadId)) continue;
+      items.push({ tool: 'codex', sessionId: threadId, ...(title ? { title } : {}), deferredCreation: true });
+    }
+    items.sort((a, b) => (a.deferredCreation ? Number.MAX_SAFE_INTEGER : a.createdAt ?? 0) - (b.deferredCreation ? Number.MAX_SAFE_INTEGER : b.createdAt ?? 0));
     return items;
   }
 
@@ -133,7 +141,8 @@ async function appendSessionIndex(codexHome: string, threadId: string, threadNam
 /** Collect rollout files (thread id → newest mtime wins for revert variants). */
 async function walkRollouts(
   dir: string,
-  out: Map<string, { path: string; mtime: number; createdAt: number | null }>,
+  out: Map<string, { path: string; mtime: number; createdAt: number | null; archived?: boolean }>,
+  archived: boolean,
 ): Promise<void> {
   let entries;
   try {
@@ -144,7 +153,10 @@ async function walkRollouts(
   for (const e of entries) {
     const full = join(dir, e.name);
     if (e.isDirectory()) {
-      await walkRollouts(full, out);
+      // the home-root walk must not swallow archived_sessions — it is scanned
+      // separately (with the archived flag) by the caller.
+      if (!archived && e.name === 'archived_sessions') continue;
+      await walkRollouts(full, out, archived);
     } else if (e.isFile() && e.name.startsWith('rollout-')) {
       const parsed = parseRolloutFileName(e.name);
       if (!parsed) continue;
@@ -152,7 +164,7 @@ async function walkRollouts(
       const mtime = st?.mtimeMs ?? 0;
       const prev = out.get(parsed.threadId);
       if (prev && prev.mtime >= mtime) continue;
-      out.set(parsed.threadId, { path: full, mtime, createdAt: parsed.createdAt });
+      out.set(parsed.threadId, { path: full, mtime, createdAt: parsed.createdAt, ...(archived ? { archived: true } : {}) });
     }
   }
 }
