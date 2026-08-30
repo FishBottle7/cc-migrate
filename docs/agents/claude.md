@@ -285,7 +285,7 @@ route-by-agent: content-replacement, fork-context-ref(新), observer-ref(新)
 ## 6. 删除与安全策略（硬约束，适配器红线）
 
 1. **引擎/适配器永远不执行删除**：不 unlink 会话文件、不清理"目标目录已存在文件"、不做 tombstone（Claude 自己的 `removeMessageByUuid` 是其内部机制，迁移工具不得模仿）。删除界面只能由人操作。
-2. **只新增**：写入一律 `新 sessionId（crypto.randomUUID）→ 新 jsonl`；已存在 sessionId 直接换号重写，不覆盖不追加。
+2. **只新增**：写入一律 `新 sessionId（crypto.randomUUID）→ 新 jsonl`；目标已存在同 id 文件时——调用方显式指定 id 则拒绝并报告，自动生成 id 则换号重写，绝不覆盖不追加；写文件用 `wx` flag 兜底（文件系统级防覆盖）。行级 uuid 随 claude→claude 字节级还原保留原值，取舍详见 §13。
 3. **禁止 append-to-existing**：Claude 主文件有 uuid 去重 + phantom-parent + last-prompt 状态机，向"活着"的会话文件追加会触发其内部一致性逻辑；迁移产出的文件必须是"已结束"形态（尾部 last-prompt）。
 4. `--dst-root` dry-run 优先，用户确认后才写真实 `~/.claude/projects/`。
 5. 读端对损坏行容错（真实读取端 `parseJSONL` 跳坏行、容忍 NUL 前缀、容忍截断尾行）；写端产出的必须是完整合法行（\n 结尾、UTF-8、无 NUL）。
@@ -407,6 +407,30 @@ route-by-agent: content-replacement, fork-context-ref(新), observer-ref(新)
 **写侧验证（会话文件 6 → 81 条）**：claude 自己的每次运行都向伪造会话**原生地追加**：新 user 消息（parentUuid 正确接前 leaf）+ assistant 回复 + attachment（deferred_tools_delta/skill_listing/task_reminder/total_tokens_reminder…）+ queue-operation(enqueue/dequeue) + `Continue from where you left off`（isMeta）+ 失败重试的 API Error assistant（`model:'<synthetic>'`）+ 每轮末尾重写 last-prompt（lastPrompt=最新提问、leafUuid=最新 assistant）+ 退出时 atis-latch/ai-title/mode reAppend。**结论：伪造会话与原生会话在读写两端行为完全一致；§2.7 最小可 resume 集合经真机验证成立。**
 
 **验证附带产物**：一份完整的"503 重试落盘"真实样本（错误恢复的记录序列），以及 dequeue 操作值、`Continue from where you left off` isMeta 续跑注入等细节确认。
+
+---
+
+## 13. 写端策略：claude→claude 字节级还原 + 行 uuid 取舍（2026-08-30）
+
+**决策**：`originTool==='claude'` 且 `extensions.claude.recordsRaw` 非空时，写端**不做投影重写**，把 recordsRaw（= 全文件原始行，§8#7）逐行回写，仅重盖行内会话身份字段（`sessionId`/`session_id` → 新 id）。跨工具迁移（zcode→claude 等，无 claude recordsRaw）仍走投影路径（活跃链 + native 盖章 + keepSynthetic 门控）。真机验证（9c958067，6778 行 / 5 次压缩 / 1864 attachment / 6 旁链）：行数 1:1、uuid 行全部 verbatim 存活、`parse(write(x)) ≡ parse(x)`、0 伪造时间戳。
+
+**为什么"投影重写 + 折叠行 ride-back"不可行**（实测翻车记录，2026-08-30）：该方案使输出文件出现两条平行谱系，而读端 `applyPreservedSegmentRelinks` 的收尾剪枝语义是「map 序最后一个 boundary 之前的全部非 preserved 行删除」——ride 回来的旧 boundary（文件后部）触发剪枝，把新链整条剪没（9c958067 re-parse 得 0 消息）。该机制假设文件只有一条谱系，这是原生文件的不变式，迁移文件必须遵守。
+
+**行 uuid 保留原值的取舍**（红线 §6.2「全新 sessionId/uuid」按**文件级身份**解读：全新 sessionId + 全新文件名 + 逐行 sessionId 重盖 + 存在即拒绝 + `wx` 原子写；行级 uuid 是 DAG 节点 id，随字节还原保留）：
+
+保留原 uuid 的收益：
+1. 文件内 7+ 类交叉引用天然自洽——`parentUuid` / `sourceToolAssistantUUID` / `last-prompt.leafUuid` / boundary `logicalParentUuid` / `compactMetadata.preservedSegment`+`preservedMessages` / `snipMetadata.removedUuids` / legacy `summary.leafUuid`。全量 rekey 漏映射任何一类的后果**不是报错而是静默丢上下文**（悬挂引用触发读端剪枝或 native no-op，surface 上只是"会话变空/变短"）。
+2. `diff 迁移文件 源文件` 仅 sessionId 字段差异 → 无损可审计（rekey 后失去此验证手段）。
+3. `--resume` 行为与源会话逐字节等价（§12 真机验证的等价性直接继承）。
+
+代价（实测影响≈0）：
+1. 同一源会话迁移两次 → 两文件行 uuid 相同。`loadTranscriptFile` 按文件独立索引 uuid，无跨文件 uuid 机制（2.1.251 核实），功能零影响；仅影响人类 diff/去重。
+2. 行 uuid 构成源会话指纹——但会话内容本身是更强指纹，rekey 无实质匿名收益。
+3. 同机同 projects root 迁移时 /resume 列表出现两个内容相同的会话（不同 sessionId）——人类困惑，claude 不出错。
+
+**何时需要 rekey**：出现跨文件全局 uuid 索引机制、或需将会话作为全新身份分发时，在写端加一致性 rekey（`uuid` + `parentUuid` + `sourceToolAssistantUUID` + `leafUuid` + `logicalParentUuid` + `preservedSegment.headUuid/tailUuid/anchorUuid` + `preservedMessages.uuids` + `removedUuids` + `summary.leafUuid` 全量映射）；rekey 是纯写端增量，可与字节还原并存。
+
+**残余边界**：sidechain 文件无 recordsRaw 槽位（`MigratedSidechain` 未含），旁链仍走投影回写（死枝不回写）；sidecar `.meta.json` 合并原 `agentMeta` 回写。
 
 ---
 
