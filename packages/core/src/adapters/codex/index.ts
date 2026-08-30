@@ -55,7 +55,7 @@ export class CodexAdapter implements Adapter {
     // threads are separate rollout files linked via session_meta thread_spawn
     // — stitch them into ir.sidechains (recursively for grandchildren).
     const byParent = await subagentChildIndex(codexHome);
-    const stitched = await loadSubagentTree(sessionId, byParent, titles, new Set([sessionId]));
+    const stitched = await loadSubagentTree(sessionId, ir, byParent, titles, new Set([sessionId]));
     if (stitched.length) ir.sidechains = stitched;
     return ir;
   }
@@ -262,9 +262,30 @@ async function subagentChildIndex(codexHome: string): Promise<Map<string, Subage
   return byParent;
 }
 
+/**
+ * Summon-point linkage: codex parents record `spawn_agent` function calls whose
+ * `task_name` equals the child's agent_path tail (e.g. agent_path
+ * `/root/realtime_preemptive_slice/preemptive_review` ← task_name
+ * `preemptive_review`). Resolving it to the call id lets the GUI anchor the
+ * subagent to its summoning tool row.
+ */
+function spawnCallIdForChild(parentIr: MigratedSession, agentPath?: string): string | undefined {
+  const tail = agentPath?.split('/').filter(Boolean).pop();
+  if (!tail) return undefined;
+  for (const m of parentIr.messages) {
+    for (const b of m.content) {
+      if (b.type !== 'tool_use' || b.name !== 'spawn_agent' || !b.id) continue;
+      const task = (b.input as Record<string, unknown> | undefined)?.task_name;
+      if (task === tail) return b.id;
+    }
+  }
+  return undefined;
+}
+
 /** Parse one parent's subagent subtree into MigratedSidechain[] (visited-set cycle guard). */
 async function loadSubagentTree(
   parentId: string,
+  parentIr: MigratedSession,
   byParent: Map<string, SubagentChildInfo[]>,
   titles: Map<string, string>,
   visited: Set<string>,
@@ -277,11 +298,12 @@ async function loadSubagentTree(
     const child = rolloutRecordsToIr(parseRolloutLines(text), { titles, sourcePath: info.path });
     const label =
       info.agentNickname ?? info.agentRole ?? info.agentPath?.split('/').filter(Boolean).pop();
-    const nested = await loadSubagentTree(info.threadId, byParent, titles, visited);
+    const nested = await loadSubagentTree(info.threadId, child, byParent, titles, visited);
     out.push({
       agentId: info.threadId,
       kind: 'subagent',
       ...(label ? { agentType: label } : {}),
+      parentMessageId: spawnCallIdForChild(parentIr, info.agentPath),
       messages: child.messages,
       ...(child.toolCalls?.length ? { toolCalls: child.toolCalls } : {}),
       originSessionId: info.threadId,

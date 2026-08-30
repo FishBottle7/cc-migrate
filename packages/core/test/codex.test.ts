@@ -1033,3 +1033,40 @@ test('read: native subagent threads stitch into ir.sidechains (recursively)', as
   const gcBack = await adapter.parse(gcThreadId, root);
   assert.equal(gcBack.sidechains, undefined);
 });
+
+test('read: spawn_agent task_name links a subagent to its summoning call', async () => {
+  const adapter = new CodexAdapter();
+  const root = await tempRoot();
+  const mainId = '019b0000-0000-7000-8000-00000000aaaa';
+  const childId = '019b0000-0000-7000-8000-00000000bbbb';
+  const day = join(root, 'sessions', '2026', '08', '30');
+  await fs.mkdir(day, { recursive: true });
+  // parent records the spawn as an ordinary function_call (real codex shape)
+  await fs.writeFile(join(day, `rollout-2026-08-30T10-00-00-${mainId}.jsonl`), [
+    JSON.stringify({ timestamp: TS, type: 'session_meta', payload: { session_id: mainId, id: mainId, timestamp: TS, cwd: 'D:\proj', originator: 'codex_cli_rs', cli_version: '0.146.0' } }),
+    JSON.stringify({ timestamp: TS, type: 'response_item', payload: { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'please review preemptively' }] } }),
+    JSON.stringify({ timestamp: TS, type: 'response_item', payload: { type: 'function_call', name: 'spawn_agent', call_id: 'call_spawn_1', arguments: '{"task_name":"preemptive_review","fork_turns":"3","message":"gAAAAAB-encrypted"}' } }),
+  ].join('\n') + '\n', 'utf8');
+  // child session_meta carries agent_path whose tail == task_name
+  await fs.writeFile(join(day, `rollout-2026-08-30T10-00-01-${childId}.jsonl`), [
+    JSON.stringify({ timestamp: TS, type: 'session_meta', payload: { session_id: childId, id: childId, timestamp: TS, cwd: 'D:\proj', originator: 'codex_cli_rs', cli_version: '0.146.0', source: { subagent: { thread_spawn: { parent_thread_id: mainId, depth: 1, agent_path: '/root/realtime_preemptive_slice/preemptive_review', agent_nickname: 'Harvey', agent_role: null } } }, thread_source: 'subagent', agent_nickname: 'Harvey', agent_path: '/root/realtime_preemptive_slice/preemptive_review' } }),
+    JSON.stringify({ timestamp: TS, type: 'response_item', payload: { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'child work' }] } }),
+  ].join('\n') + '\n', 'utf8');
+
+  // a sibling child with a foreign agent_path must NOT bind to the call —
+  // written before the first parse so the child index sees all three files
+  const otherId = '019b0000-0000-7000-8000-00000000cccc';
+  await fs.writeFile(join(day, `rollout-2026-08-30T10-00-02-${otherId}.jsonl`), [
+    JSON.stringify({ timestamp: TS, type: 'session_meta', payload: { session_id: otherId, id: otherId, timestamp: TS, cwd: 'D:\proj', originator: 'codex_cli_rs', cli_version: '0.146.0', source: { subagent: { thread_spawn: { parent_thread_id: mainId, depth: 1, agent_path: '/root/other_task', agent_nickname: 'Nina', agent_role: null } } }, thread_source: 'subagent', agent_nickname: 'Nina', agent_path: '/root/other_task' } }),
+    JSON.stringify({ timestamp: TS, type: 'response_item', payload: { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'other work' }] } }),
+  ].join('\n') + '\n', 'utf8');
+
+  const ir = await adapter.parse(mainId, root);
+  assert.equal(ir.sidechains?.length, 2);
+  assert.equal(ir.sidechains![0]!.agentId, childId, 'children sort by timestamp');
+  assert.equal(ir.sidechains![0]!.agentType, 'Harvey');
+  assert.equal(ir.sidechains![0]!.parentMessageId, 'call_spawn_1', 'agent_path tail matches spawn_agent.task_name');
+  const nina = ir.sidechains![1]!;
+  assert.equal(nina.agentId, otherId);
+  assert.equal(nina.parentMessageId, undefined, 'no spawn call matches a foreign task_name');
+});

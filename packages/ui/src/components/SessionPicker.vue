@@ -102,7 +102,8 @@ const groups = computed<SessionGroup[]>(() => {
   }
   const arr = [...map.entries()].map(([key, g]) => {
     g.items.sort((a, b) => (b.createdAt ?? 0) - (a.createdAt ?? 0));
-    return { key, label: g.label, path: g.path, rows: flattenNodes(buildNodes(g.items), collapsed.value) };
+    // 子会话折叠消费 foldedSubs（工作区分组折叠用的是 collapsed，别混）
+    return { key, label: g.label, path: g.path, rows: flattenNodes(buildNodes(g.items), foldedSubs.value) };
   });
   arr.sort((a, b) => (b.rows[0]?.meta.createdAt ?? 0) - (a.rows[0]?.meta.createdAt ?? 0));
   return arr;
@@ -188,7 +189,7 @@ function toggleSub(id: string) {
             type="button"
             class="sp-item"
             :class="{ 'is-active': props.selectedId === row.meta.sessionId, 'is-sub': row.depth > 0 }"
-            :style="row.depth ? { paddingLeft: 14 + row.depth * 18 + 'px' } : undefined"
+            :style="row.depth ? { marginLeft: row.depth * 18 + 'px' } : undefined"
             @click="emit('select', row.meta)"
           >
             <span class="sp-title">
@@ -206,11 +207,11 @@ function toggleSub(id: string) {
               {{ row.meta.title ? truncate(row.meta.title, 60) : '(无标题)' }}
               <span v-if="row.meta.deferredCreation" class="sp-tag" title="已登记但无 rollout 文件（deferred creation）">空</span>
               <span v-else-if="row.meta.archived" class="sp-tag" title="位于归档目录">归档</span>
-              <span v-else-if="row.depth > 0" class="sp-tag" title="子代理会话（thread_spawn）">子</span>
+              <span v-else-if="row.depth > 0" class="sp-tag sp-tag--sub" title="子代理会话（thread_spawn）">子</span>
             </span>
             <span class="sp-meta">
               <span class="sp-time sm-mono">{{ fmtTime(row.meta.createdAt) }}</span>
-              <span v-if="row.meta.cwd" class="sp-cwd sm-mono">{{ truncate(row.meta.cwd, 42) }}</span>
+              <span v-if="row.meta.cwd && row.depth === 0" class="sp-cwd sm-mono">{{ truncate(row.meta.cwd, 42) }}</span>
             </span>
             <span class="sp-bar" aria-hidden="true" />
           </button>
@@ -468,8 +469,21 @@ function toggleSub(id: string) {
   width: 8px;
   height: 8px;
 }
+.sp-sub-toggle:hover {
+  color: var(--fg-0);
+}
+/* 子会话卡片整体缩进（marginLeft 让背景/色条/边框一起动，flex 拉伸自动收宽） */
 .sp-item.is-sub {
-  border-left: 2px solid var(--line-1);
+  width: auto;
+  border-left: 2px solid rgba(118, 99, 224, 0.35);
+}
+.sp-item.is-sub .sp-title {
+  font-weight: 500;
+  color: var(--fg-1);
+}
+.sp-tag--sub {
+  color: var(--acc-ink);
+  border-color: rgba(118, 99, 224, 0.4);
 }
 .sp-chip {
   display: inline-flex;

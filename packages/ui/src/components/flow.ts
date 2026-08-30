@@ -34,6 +34,9 @@ const TOOL_TITLES: Record<string, string> = {
   WebSearch: '搜索网页', WebFetch: '抓取网页', Task: '派发子代理',
   TodoWrite: '更新待办', TodoRead: '读取待办', Computer: '控制电脑',
   Browser: '操作浏览器', NotebookEdit: '编辑 Notebook', Skill: '调用技能',
+  // codex 多代理工具（子代理由 spawn_agent 派发，召唤点定位靠它）
+  spawn_agent: '派发子代理', send_message: '发消息给子代理', wait: '等待子代理',
+  followup_task: '追加任务', request_user_input: '请求用户输入',
 };
 
 export function toolTitle(name: string): string {
