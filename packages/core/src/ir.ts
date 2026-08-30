@@ -218,11 +218,13 @@ export interface MigratedUnmappedEvent {
   surfaceOp?: string;
   sourceEventSeqs?: number[];
   /**
-   * Source-harness "unknown-but-skippable" envelope marker (DSH
-   * `ignorable:true`). PRESERVE on round-trip; a write side MUST emit any
-   * event type unknown to the TARGET harness with this flag set — targets
-   * (e.g. DSH) refuse logs that contain unknown unmarked types
-   * (SessionFormatUnsupportedError).
+   * Source-harness forward-compat envelope marker, preserved as provenance
+   * only. ⚠️ Current DSH (SESSION_FORMAT_VERSION 0) has NO such mechanism:
+   * `assertEventsSupported` refuses a whole log on ANY unknown event type and
+   * `assertSessionEventEnvelope` rejects the key itself — so a write side
+   * must NOT emit `ignorable` into DSH logs. Instead, drop unmapped rows
+   * whose type the target harness does not know (see DSH_KNOWN_EVENT_TYPES);
+   * the IR bucket keeps them for transfers to harnesses that do.
    */
   ignorable?: boolean;
 }

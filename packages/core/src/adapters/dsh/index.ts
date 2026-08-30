@@ -135,6 +135,10 @@ interface DshEvent {
   time?: number;
   type: string;
   surfaceOp?: string;
+  /** Source-side forward-compat marker, preserved as IR provenance only (see
+   * MigratedUnmappedEvent.ignorable) — current DSH never writes it and its
+   * envelope allowlist would reject it, so the write side must not emit it. */
+  ignorable?: true;
   data: {
     message?: unknown;
     role?: string;
@@ -145,6 +149,72 @@ interface DshEvent {
 
 const SURFACE_TYPES = new Set(['user/message', 'assistant/message', 'tool/result']);
 const PACKED_CHUNK_TYPES = new Set(['reasoning-chunks', 'text-chunks', 'tool-call-chunks']);
+
+/**
+ * The event types the DSH harness knows — mirrored 1:1 from
+ * `@deepseek-ai/dsh-session`'s generated `known-event-types.ts`
+ * (SESSION_FORMAT_VERSION 0, 51 entries). DSH's loader
+ * (`assertEventsSupported`) refuses a WHOLE log when it contains any other
+ * type — there is no per-row skip mechanism, and the envelope key allowlist
+ * (`assertSessionEventEnvelope`: type/seq/time/data/surfaceOp/sourceEventSeqs)
+ * rejects extra keys like a hypothetical `ignorable` marker. So replayed
+ * `ir.unmappedEvents` rows whose type is not in this set must be DROPPED on
+ * write: keeping them (marked or not) makes the artifact unloadable, while
+ * the IR bucket still carries them for cross-tool transfers.
+ */
+export const DSH_KNOWN_EVENT_TYPES = new Set([
+  'agent-preset/selected',
+  'agent/inbox/spliced',
+  'approval/asked',
+  'approval/decided',
+  'approval/policy',
+  'assistant/chunk',
+  'assistant/message',
+  'command/done',
+  'command/run',
+  'compaction/end',
+  'compaction/prune',
+  'compaction/start',
+  'compaction/summary',
+  'feedback/record',
+  'goal/change',
+  'hook/invoked',
+  'hook/result',
+  'llm/retry',
+  'llm/retry-started',
+  'model/selection',
+  'permission/preset',
+  'plan/mode',
+  'request/context',
+  'request/header',
+  'sandbox/mode',
+  'schedule/change',
+  'session-log-deepseek/delivery-accepted',
+  'session/end-seed',
+  'session/title',
+  'session/title-llm-request',
+  'step/end',
+  'step/start',
+  'subagent/descriptor',
+  'subagent/model-selection-policy',
+  'team/member',
+  'team/message/delivered',
+  'team/message/queued',
+  'team/task',
+  'todo/write',
+  'tool-workflow/agent-end',
+  'tool-workflow/agent-start',
+  'tool-workflow/run-end',
+  'tool-workflow/run-start',
+  'tool/call',
+  'tool/code-dispatch',
+  'tool/code-dispatch-start',
+  'tool/result',
+  'turn/end',
+  'turn/start',
+  'user/message',
+  'web/deepseek-search-llm-request',
+]);
 
 function stripEncrypted(obj: unknown): unknown {
   if (obj === null || typeof obj !== 'object') return obj;
@@ -812,6 +882,7 @@ export function buildIrFromEvents(header: { cwd?: string; createdAt?: number; id
       data: cleanData,
       ...(ev.surfaceOp !== undefined ? { surfaceOp: ev.surfaceOp } : {}),
       ...(ev.surfaceOp !== undefined && (ev as { sourceEventSeqs?: number[] }).sourceEventSeqs ? { sourceEventSeqs: (ev as { sourceEventSeqs?: number[] }).sourceEventSeqs } : {}),
+      ...(ev.ignorable === true ? { ignorable: true } : {}),
     } as NonNullable<MigratedSession['unmappedEvents']>[number]);
   }
 
@@ -1205,6 +1276,13 @@ export function irToEvents(ir: MigratedSession, baseTime: number): DshEvent[] {
       (raw[raw.length - 1] as any).__time0 = time;
       continue;
     }
+    // Foreign event types (codex event_msg rows like task_started/token_count,
+    // or rows a newer DSH harness wrote) would make the DSH loader refuse the
+    // WHOLE log — assertEventsSupported rejects any type outside
+    // KNOWN_SESSION_EVENT_TYPES, and the envelope allowlist leaves no room for
+    // a skip marker. Drop them here; the IR bucket keeps them for transfers to
+    // harnesses that do understand the source's event vocabulary.
+    if (!DSH_KNOWN_EVENT_TYPES.has(ev.type)) continue;
     raw.push({
       time,
       type: ev.type,

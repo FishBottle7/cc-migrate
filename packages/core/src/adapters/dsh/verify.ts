@@ -28,6 +28,7 @@
 import { readdir, readFile, stat } from 'node:fs/promises';
 import { join } from 'node:path';
 import { decompressSessionBuffer, defaultDshRoot } from './format.js';
+import { DSH_KNOWN_EVENT_TYPES } from './index.js';
 
 export const SURFACE_ELIGIBLE_TYPES = new Set(['user/message', 'assistant/message', 'tool/result']);
 export const PACKED_ROW_TYPES = new Set(['text-chunks', 'reasoning-chunks', 'tool-call-chunks']);
@@ -37,7 +38,7 @@ export interface VerifyIssue {
   line?: number;
   /** Decoded seq when known. */
   seq?: number;
-  check: 'header' | 'envelope' | 'seq' | 'surface' | 'turn-tail' | 'message-shape';
+  check: 'header' | 'envelope' | 'seq' | 'surface' | 'turn-tail' | 'message-shape' | 'event-type';
   message: string;
 }
 
@@ -131,6 +132,12 @@ export function verifySessionLog(plain: string, sessionId: string, path: string)
     const keys = new Set(Object.keys(ev));
     const fail = (check: VerifyIssue['check'], message: string) => issues.push({ line: lineNo, seq: isSafeInt(ev.seq) ? (ev.seq as number) : isSafeInt(ev.seq0) ? (ev.seq0 as number) : undefined, check, message });
 
+    // DSH refuses a whole log containing any event type outside its known set
+    // (assertEventsSupported — no per-row skip mechanism exists).
+    if (!DSH_KNOWN_EVENT_TYPES.has(type)) {
+      fail('event-type', `event type ${JSON.stringify(type)} is unknown to DSH — the loader refuses the whole log`);
+    }
+
     if (PACKED_ROW_TYPES.has(type)) {
       // storage rows must be exactly {type, seq0, time0, data}
       const wanted = new Set(['type', 'seq0', 'time0', 'data']);
@@ -141,13 +148,14 @@ export function verifySessionLog(plain: string, sessionId: string, path: string)
       const data = ev.data as Record<string, unknown> | undefined;
       if (typeof data !== 'object' || data === null) fail('envelope', 'packed row data must be an object');
     } else {
-      const allowed = new Set(['type', 'seq', 'time', 'data', 'surfaceOp', 'sourceEventSeqs', 'ignorable']);
+      // DSH's assertSessionEventEnvelope allows exactly these keys — anything
+      // else (e.g. a hypothetical skip marker) makes the loader refuse the log.
+      const allowed = new Set(['type', 'seq', 'time', 'data', 'surfaceOp', 'sourceEventSeqs']);
       for (const k of keys) if (!allowed.has(k)) fail('envelope', `unexpected event key "${k}"`);
       for (const k of ['type', 'seq', 'time', 'data'] as const) if (!keys.has(k)) fail('envelope', `event missing key "${k}"`);
       if (!isSafeInt(ev.seq) || (ev.seq as number) < 0) fail('envelope', 'seq must be a non-negative safe integer');
       if (!isSafeInt(ev.time)) fail('envelope', 'time must be a safe integer');
       if (keys.has('data') && ev.data === undefined) fail('envelope', 'data must not be undefined');
-      if (keys.has('ignorable') && ev.ignorable !== true) fail('envelope', 'ignorable must be true when present');
 
       // surface rules
       const eligible = SURFACE_ELIGIBLE_TYPES.has(type);

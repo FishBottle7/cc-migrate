@@ -156,7 +156,10 @@ test('normalizeContent/blocksToNative preserve images, attachments and thinking 
 test('irToEvents emits surfaceOp append + contiguous seq', () => {
   const now = Date.now();
   const events = irToEvents(fallbackIr(), now) as DshEventLike[];
-  assert.ok(events.every((e) => e.surfaceOp === 'append'));
+  // surface rows are plain appends; the synthesized turn/step skeleton rows
+  // (foreign-origin IR) legitimately carry no surfaceOp.
+  const surface = new Set(['user/message', 'assistant/message', 'tool/result']);
+  assert.ok(events.every((e) => !surface.has(e.type) || e.surfaceOp === 'append'));
   events.forEach((e, i) => assert.equal(e.seq, i));
 });
 
@@ -291,10 +294,12 @@ test('irToEvents re-points replace surfaceOps and sourceEventSeqs at the renumbe
     message: { id, role: 'assistant', source: { kind: 'model', provider: 'p', model: 'm' }, content: [{ type: 'text', text }] },
   });
   const raw = [
-    { type: 'user/message', seq: 0, time: 10, surfaceOp: 'append', data: { id: 'u1', role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: 'q' }] } },
-    { type: 'assistant/message', seq: 1, time: 11, surfaceOp: 'append', data: msg('a1', 'v1') },
-    // replace of assistant seq 1 with a regenerated answer
-    { type: 'assistant/message', seq: 2, time: 12, surfaceOp: { op: 'replace', start: 1, end: 1 }, sourceEventSeqs: [1], data: msg('a2', 'v2') },
+    { type: 'turn/start', seq: 0, time: 9, data: { turn: 1 } },
+    { type: 'step/start', seq: 1, time: 9, data: { turn: 1, step: 1 } },
+    { type: 'user/message', seq: 2, time: 10, surfaceOp: 'append', data: { id: 'u1', role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: 'q' }] } },
+    { type: 'assistant/message', seq: 3, time: 11, surfaceOp: 'append', data: msg('a1', 'v1') },
+    // replace of assistant seq 3 with a regenerated answer
+    { type: 'assistant/message', seq: 4, time: 12, surfaceOp: { op: 'replace', start: 3, end: 3 }, sourceEventSeqs: [3], data: msg('a2', 'v2') },
   ];
   const ir = buildIrFromEvents({ id: 's', createdAt: 10 }, raw as never);
   // the REPLACER surfaces as a message carrying its native op; the shadowed
@@ -302,18 +307,19 @@ test('irToEvents re-points replace surfaceOps and sourceEventSeqs at the renumbe
   const a1 = ir.messages[1];
   const a2 = ir.messages[2];
   assert.equal(((a1.meta as { dsh?: { shadowed?: boolean } }).dsh)?.shadowed, true);
-  assert.deepEqual(((a2.meta as { dsh?: { surfaceOp?: unknown } }).dsh)?.surfaceOp, { op: 'replace', start: 1, end: 1 });
+  assert.deepEqual(((a2.meta as { dsh?: { surfaceOp?: unknown } }).dsh)?.surfaceOp, { op: 'replace', start: 3, end: 3 });
 
   const events = irToEvents(ir, 10) as unknown as Array<Record<string, unknown>>;
-  assert.equal(events.length, 3);
-  const replaced = events[2];
+  assert.equal(events.length, 5);
+  const replaced = events[4];
   assert.equal(replaced.type, 'assistant/message');
   const rop = replaced.surfaceOp as Record<string, unknown>;
   assert.equal(rop.op, 'replace');
-  // old seq 1 (assistant v1) is new seq 1 — remapped, valid, earlier than seq 2
-  assert.equal(rop.start, 1);
-  assert.equal(rop.end, 1);
-  assert.deepEqual(replaced.sourceEventSeqs, [1]);
+  // old seq 3 (assistant v1) keeps seq 3 — the native turn/step context makes
+  // the renumbering identity, so the preserved op stays valid
+  assert.equal(rop.start, 3);
+  assert.equal(rop.end, 3);
+  assert.deepEqual(replaced.sourceEventSeqs, [3]);
 });
 
 test('compacted session: shadowed span + checkpoint fold, round-trip byte-faithful', async () => {
@@ -324,14 +330,16 @@ test('compacted session: shadowed span + checkpoint fold, round-trip byte-faithf
     message: { id, role: 'assistant', source: { kind: 'model', provider: 'p', model: 'm' }, content: [{ type: 'text', text }] },
   });
   const raw = [
-    { type: 'user/message', seq: 0, time: 1, surfaceOp: 'append', data: { id: 'u1', role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: 'old question' }] } },
-    { type: 'assistant/message', seq: 1, time: 2, surfaceOp: 'append', data: asst('a1', 'old answer') },
+    { type: 'turn/start', seq: 0, time: 0, data: { turn: 1 } },
+    { type: 'step/start', seq: 1, time: 0, data: { turn: 1, step: 1 } },
+    { type: 'user/message', seq: 2, time: 1, surfaceOp: 'append', data: { id: 'u1', role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: 'old question' }] } },
+    { type: 'assistant/message', seq: 3, time: 2, surfaceOp: 'append', data: asst('a1', 'old answer') },
     // log-only metering record for the compaction
-    { type: 'compaction/summary', seq: 2, time: 3, data: { compactionId: 'c1', summary: [], shadowedRange: { start: 0, end: 1 }, shadowedSeqs: [0, 1], shadowedTokenCount: 4321, provider: 'p', model: 'm' } },
-    // the checkpoint shadows BOTH surface nodes (positions 0..1) and carries the summary
-    { type: 'user/message', seq: 3, time: 4, surfaceOp: { op: 'replace', start: 0, end: 1 }, sourceEventSeqs: [2, 0, 1], data: { id: 'ck1', role: 'user', source: { kind: 'plugin', plugin: 'compact', compactionId: 'c1' }, content: [{ type: 'text', text: 'This is an automatically generated checkpoint condensing an earlier span of the conversation to free up context.' }] } },
-    { type: 'user/message', seq: 4, time: 5, surfaceOp: 'append', data: { id: 'u2', role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: 'new question' }] } },
-    { type: 'assistant/message', seq: 5, time: 6, surfaceOp: 'append', data: asst('a2', 'new answer') },
+    { type: 'compaction/summary', seq: 4, time: 3, data: { compactionId: 'c1', summary: [], shadowedRange: { start: 2, end: 3 }, shadowedSeqs: [2, 3], shadowedTokenCount: 4321, provider: 'p', model: 'm' } },
+    // the checkpoint shadows BOTH surface nodes (positions 2..3) and carries the summary
+    { type: 'user/message', seq: 5, time: 4, surfaceOp: { op: 'replace', start: 2, end: 3 }, sourceEventSeqs: [4, 2, 3], data: { id: 'ck1', role: 'user', source: { kind: 'plugin', plugin: 'compact', compactionId: 'c1' }, content: [{ type: 'text', text: 'This is an automatically generated checkpoint condensing an earlier span of the conversation to free up context.' }] } },
+    { type: 'user/message', seq: 6, time: 5, surfaceOp: 'append', data: { id: 'u2', role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: 'new question' }] } },
+    { type: 'assistant/message', seq: 7, time: 6, surfaceOp: 'append', data: asst('a2', 'new answer') },
   ];
   const ir = buildIrFromEvents({ id: 's', createdAt: 1 }, raw as never);
   // ALL surface messages survive (log keeps everything); compaction/summary
@@ -356,10 +364,10 @@ test('compacted session: shadowed span + checkpoint fold, round-trip byte-faithf
   const back = await adapter.parse(res.sessionId, root);
   assert.equal(back.messages.length, ir.messages.length);
   const backCk = back.messages.find((m) => ((m.meta as { dsh?: { id?: string } }).dsh)?.id === 'ck1')!;
-  assert.deepEqual((backCk.meta as { dsh?: { surfaceOp?: unknown } }).dsh?.surfaceOp, { op: 'replace', start: 0, end: 1 });
+  assert.deepEqual((backCk.meta as { dsh?: { surfaceOp?: unknown } }).dsh?.surfaceOp, { op: 'replace', start: 2, end: 3 });
   // sourceEventSeqs survive as the provenance SET (canonicalized sorted —
   // the fold only requires set membership over the shadowed surface nodes)
-  assert.deepEqual((backCk.meta as { dsh?: { sourceEventSeqs?: number[] } }).dsh?.sourceEventSeqs, [0, 1, 2]);
+  assert.deepEqual((backCk.meta as { dsh?: { sourceEventSeqs?: number[] } }).dsh?.sourceEventSeqs, [2, 3, 4]);
   assert.equal(((back.messages.find((m) => ((m.meta as { dsh?: { id?: string } }).dsh)?.id === 'u1')!.meta as { dsh?: { shadowed?: boolean } }).dsh)?.shadowed, true);
   assert.equal(back.compaction?.length, 1);
 });
@@ -852,4 +860,54 @@ test('dsh->dsh native turn/start + step/start are not duplicated by the skeleton
   const stepIdx = written.findIndex((e) => e.type === 'step/start');
   const ai = written.findIndex((e) => e.type === 'assistant/message');
   assert.ok(turnIdx < stepIdx && stepIdx < ai, 'native order preserved');
+});
+
+test('write drops foreign unmapped events (unknown types make DSH refuse the whole log)', async () => {
+  // DSH's assertEventsSupported refuses a WHOLE log containing any event type
+  // outside KNOWN_SESSION_EVENT_TYPES, and its envelope allowlist
+  // (assertSessionEventEnvelope) rejects extra keys — there is no per-row skip
+  // marker to save unknown types with. codex event_msg rows (task_started,
+  // token_count, ...) riding IR unmappedEvents must therefore be DROPPED on
+  // write, while known non-surface types (approval/asked, ...) replay verbatim.
+  const adapter = new DshAdapter();
+  const root = await tempRoot();
+  const ir = {
+    schemaVersion: 2 as const,
+    originTool: 'codex' as const,
+    createdAt: 1000,
+    messages: [{ role: 'user' as const, content: [{ type: 'text' as const, text: 'q' }] }],
+    unmappedEvents: [
+      { seq: 1, time: 1001, type: 'task_started', data: { turn_id: 't1' } },
+      { seq: 2, time: 1002, type: 'token_count', data: { info: { total: 42 } } },
+      { seq: 3, time: 1003, type: 'approval/asked', data: { kind: 'bash' } },
+    ],
+  };
+  const res = await adapter.write(ir as never, { root, sessionId: 'ign-1', targetCwd: 'D:\\proj' });
+  const events = decompressSessionBuffer(await fs.readFile(res.paths[0]!)).split('\n').filter((l) => l.trim()).slice(1).map((l) => JSON.parse(l)) as Array<{ type: string }>;
+  assert.equal(events.some((e) => e.type === 'task_started'), false, 'foreign task_started dropped');
+  assert.equal(events.some((e) => e.type === 'token_count'), false, 'foreign token_count dropped');
+  assert.ok(events.some((e) => e.type === 'approval/asked'), 'known non-surface type replayed');
+  assert.ok(events.every((e) => !('ignorable' in e)), 'no envelope carries an ignorable key');
+  const verdict = verifySessionLog(decompressSessionBuffer(await fs.readFile(res.paths[0]!)), 'ign-1', res.paths[0]!);
+  assert.ok(verdict.ok, `verifySessionLog passes: ${JSON.stringify(verdict.issues ?? []).slice(0, 200)}`);
+});
+
+test('dsh->dsh: unknown-to-DSH source types are dropped, known types replay verbatim', async () => {
+  const adapter = new DshAdapter();
+  const root = await tempRoot();
+  const events: DshEventLike[] = [
+    { seq: 0, type: 'turn/start', time: 1, data: { turn: 1 } },
+    { seq: 1, type: 'user/message', surfaceOp: 'append', time: 2, data: { id: 'u1', role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: 'q' }] } },
+    { seq: 2, type: 'approval/asked', time: 3, data: { kind: 'bash' } },
+    { seq: 3, type: 'future/thing', time: 4, data: { hint: 'written by a newer harness' } },
+  ];
+  const ir = buildIrFromEvents({ id: 'src-ign', createdAt: 1 } as never, events as never);
+  assert.ok(ir.unmappedEvents?.some((e) => e.type === 'approval/asked'), 'known type archived to unmappedEvents');
+  assert.ok(ir.unmappedEvents?.some((e) => e.type === 'future/thing'), 'unknown type archived too (read side keeps everything)');
+  const res = await adapter.write(ir, { root, sessionId: 'ign-2', targetCwd: 'D:\\proj' });
+  const written = decompressSessionBuffer(await fs.readFile(res.paths[0]!)).split('\n').filter((l) => l.trim()).slice(1).map((l) => JSON.parse(l)) as Array<{ type: string }>;
+  assert.ok(written.some((e) => e.type === 'approval/asked'), 'known non-surface type survives dsh->dsh');
+  assert.equal(written.some((e) => e.type === 'future/thing'), false, 'unknown type dropped (would refuse DSH load)');
+  const verdict = verifySessionLog(decompressSessionBuffer(await fs.readFile(res.paths[0]!)), 'ign-2', res.paths[0]!);
+  assert.ok(verdict.ok, `verifySessionLog passes: ${JSON.stringify(verdict.issues ?? []).slice(0, 200)}`);
 });
