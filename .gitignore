@@ -10,3 +10,17 @@ docs/_probe*
 # audit scratch homes & probe scripts
 .tmp-*/
 packages/core/scratch/
+
+# generic temp files / editor droppings
+*.tmp
+*.log
+*.bak
+*.swp
+*.orig
+*.rej
+.cache/
+Thumbs.db
+
+# oversized build artifacts (git 无法按大小忽略，按产物类型兜底)
+*.min.js.map
+*.bundle
