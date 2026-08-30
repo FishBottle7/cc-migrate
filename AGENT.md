@@ -34,6 +34,25 @@
 5. **"沙箱里能跑"不等于"哪里都能跑"**：参数化脚本的威力来自参数，也死于参数——
    换目标 = 重新走一遍第 1 条。
 
+## 事件跨工具共识（2026-08-30 立，codex→dsh 拒载事故的教训）
+
+**事故**：codex→dsh 迁移后 DSH 拒绝加载——dsh 写端把源 harness 事件（codex `task_started` 等）
+裸写进目标日志，未带 `ignorable` 标记。由此确立事件处理的三层共识：
+
+1. **源端 parse——桶优先**：新事件类型先问"IR 是否已有语义桶"（`todos`/`planModes`/`goals`/
+   `compaction`/`toolCalls`/`sessionEvents`/消息 meta），有则进桶，没有才进 `unmappedEvents`。
+   桶是已转译的语义，全工具通用。
+2. **目标写端——转译或标记，绝不裸写**：
+   - 桶 → 目标原生事件（必须做，dsh 已做）；
+   - `unmappedEvents` → 语义等价才转译成目标原生事件（转译表登记在 `docs/agents/<tool>.md`）；
+     否则保留原样并带目标格式的"可跳过"标记（DSH `ignorable:true`；codex loader 天然跳行，
+     但有变体撞名风险，不应发注定被跳过的行）。
+3. **GUI——只吃 IR**：分组、待办、计划、轮次等渲染一律消费 IR 桶与消息 meta，
+   不依赖目标原生事件（转译有损时 GUI 依然完整）。
+
+转译层放在**各目标写端**，不做全局中间转译引擎：IR 本身就是中间层，只有目标写端
+清楚自家 harness 的装配规则（如 DSH 的 start-match 顺序、surfaceOp 约束）。
+
 ## 其他
 
 - 涉及外部工具真实数据（如 opencode.db、~/.dsh）的操作，默认视为不可再生数据。
