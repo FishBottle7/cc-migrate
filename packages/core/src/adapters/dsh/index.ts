@@ -1138,6 +1138,9 @@ export function irToEvents(ir: MigratedSession, baseTime: number): DshEvent[] {
     };
   };
   let msgFallback = baseTime;
+  // callIds the toolCalls bucket will re-emit as tool/call rows (dsh-origin
+  // sessions) — block-derived synthesis below must not duplicate them.
+  const bucketCallIds = new Set((ir.toolCalls ?? []).map((r) => r.callId));
   for (const msg of ir.messages) {
     const t = msg.timestamp;
     const time = typeof t === 'number' && Number.isFinite(t) ? t : msgFallback++;
@@ -1179,18 +1182,36 @@ export function irToEvents(ir: MigratedSession, baseTime: number): DshEvent[] {
       raw.push({ time, type: 'tool/result', ...(surfaceOf(msg) as { surfaceOp: string; sourceEventSeqs?: number[] }), data: toolData as unknown as DshEvent['data'], _msg: msg, _seq: seq });
       continue;
     }
-    if (msg.role === 'user' || msg.role === 'system') {
+    if (msg.role === 'user' || msg.role === 'system' || msg.role === 'developer') {
       // DSH validates user/message data IS the message: must have {id, role:"user", source:{kind}, content:[]}
       // See assertMessageEventShape in dsh-session (≈ line 1252). Plain {role,content} fails with
       // "lacks an identified message".
+      //
+      // Foreign harness rows: system/developer roles and messages flagged
+      // `synthetic` are harness injections (codex permissions/AGENTS.md/
+      // collaboration-mode text, claude isMeta, ...). DSH has no developer
+      // surface — projecting them as model output or human turns makes the
+      // migrated session read as garbage; DSH's own convention for persisted
+      // injections is a plugin-sourced user message instead.
+      const injected = msg.role !== 'user' || msg.synthetic === true;
+      const contentKind = (msg.meta as { codex?: { contentKind?: string } } | undefined)?.codex?.contentKind;
       const data = {
         ...(native.id ? { id: native.id } : { id: `msg_${randomUUID()}` }),
         role: 'user' as const,
-        ...(native.source !== undefined ? { source: native.source } : { source: { kind: 'user', rpcId: randomUUID(), clientTimeZone: 'Asia/Shanghai' } }),
+        ...(native.source !== undefined
+          ? { source: native.source }
+          : injected
+            ? { source: { kind: 'plugin', plugin: contentKind ?? 'external-harness' } }
+            : { source: { kind: 'user', rpcId: randomUUID(), clientTimeZone: 'Asia/Shanghai' } }),
         content: native.rawContent ?? dshContentFromBlocks(msg.content),
       } as unknown as DshEvent['data'];
       raw.push({ time, type: 'user/message', ...(surfaceOf(msg) as { surfaceOp: string; sourceEventSeqs?: number[] }), data, _msg: msg, _seq: seq });
     } else {
+      const content = native.rawContent ?? dshContentFromBlocks(msg.content);
+      // Reasoning-only foreign assistant rows carry no durable content (the
+      // encrypted reasoning text was dropped at read time) — an empty
+      // assistant/message would just render as a dead step in the GUI.
+      if (Array.isArray(content) && content.length === 0) continue;
       // DSH validates assistant/message data as {turn,step,message:{id, role:"assistant", source:{kind:"model",provider,model}, content:[]}}
       const provider = (ir.model?.provider as string) ?? 'abrdns';
       const model = (ir.model?.id as string) ?? 'GLM-5.3-Flash';
@@ -1208,10 +1229,26 @@ export function irToEvents(ir: MigratedSession, baseTime: number): DshEvent[] {
           // per-message source first (exact provider/model/requestId), else
           // session-level, else legacy defaults
           source: nativeSource ?? { kind: 'model', provider, model },
-          content: native.rawContent ?? dshContentFromBlocks(msg.content),
+          content,
         },
       } as unknown as DshEvent['data'];
       raw.push({ time, type: 'assistant/message', ...(surfaceOf(msg) as { surfaceOp: string; sourceEventSeqs?: number[] }), data, _msg: msg, _seq: seq });
+      // Foreign harnesses (codex/claude/…) keep tool calls as tool_use blocks
+      // inside the assistant content. Native DSH logs pair every tool-result
+      // with a standalone tool/call event — without it the GUI renders ghost
+      // "Tool call <callId>" fallback cards from the orphan tool/results. Emit
+      // the missing half (deduped against the IR toolCalls bucket, which is
+      // re-emitted further down for dsh-origin sessions).
+      for (const b of msg.content) {
+        if (b.type !== 'tool_use' || bucketCallIds.has(b.id)) continue;
+        const args = b.input === undefined ? '' : typeof b.input === 'string' ? b.input : JSON.stringify(b.input);
+        raw.push({
+          time,
+          type: 'tool/call',
+          data: { turn: 1, step: 1, callId: b.id ?? `call_${randomUUID()}`, name: b.name ?? 'tool', arguments: args } as unknown as DshEvent['data'],
+          _seq: seq,
+        });
+      }
     }
   }
   for (const g of ir.goals ?? []) {

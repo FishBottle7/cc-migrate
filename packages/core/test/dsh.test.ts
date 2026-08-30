@@ -892,6 +892,46 @@ test('write drops foreign unmapped events (unknown types make DSH refuse the who
   assert.ok(verdict.ok, `verifySessionLog passes: ${JSON.stringify(verdict.issues ?? []).slice(0, 200)}`);
 });
 
+test('foreign-origin message shapes: tool_use pairs a tool/call, injections go plugin-source, empty assistant rows dropped', async () => {
+  const adapter = new DshAdapter();
+  const root = await tempRoot();
+  const ir = {
+    schemaVersion: 2 as const,
+    originTool: 'codex' as const,
+    createdAt: 1000,
+    messages: [
+      // developer harness instructions -> plugin-sourced user/message
+      { role: 'developer' as const, content: [{ type: 'text' as const, text: '<permissions instructions>…' }] },
+      // synthetic user injection -> plugin-sourced user/message
+      { role: 'user' as const, synthetic: true, content: [{ type: 'text' as const, text: '<environment_context>…' }] },
+      // real user turn
+      { role: 'user' as const, content: [{ type: 'text' as const, text: 'q' }] },
+      // assistant carrying a tool_use block -> emits the paired tool/call event
+      { role: 'assistant' as const, content: [{ type: 'tool_use' as const, id: 'call_x1', name: 'exec', input: 'do()' }] },
+      // reasoning-only assistant (no durable content) -> dropped
+      { role: 'assistant' as const, content: [] },
+      { role: 'tool' as const, content: [{ type: 'tool_result' as const, toolUseId: 'call_x1', content: 'ok' }] },
+    ],
+  };
+  const res = await adapter.write(ir as never, { root, sessionId: 'shape-1', targetCwd: 'D:\\proj' });
+  const events = decompressSessionBuffer(await fs.readFile(res.paths[0]!)).split('\n').filter((l) => l.trim()).slice(1).map((l) => JSON.parse(l)) as Array<{ type: string; data: Record<string, unknown> }>;
+  const tc = events.find((e) => e.type === 'tool/call');
+  assert.ok(tc, 'tool/call event emitted for the tool_use block');
+  assert.equal((tc.data as Record<string, unknown>).callId, 'call_x1');
+  assert.equal((tc.data as Record<string, unknown>).name, 'exec');
+  assert.equal((tc.data as Record<string, unknown>).arguments, 'do()');
+  const trIdx = events.findIndex((e) => e.type === 'tool/result');
+  const tcIdx = events.indexOf(tc);
+  assert.ok(tcIdx < trIdx, 'tool/call precedes its tool/result');
+  const sources = events.filter((e) => e.type === 'user/message').map((e) => (e.data as Record<string, unknown>).source as Record<string, unknown>);
+  assert.equal(sources[0]?.kind, 'plugin', 'developer instructions are plugin-sourced injections');
+  assert.equal(sources[1]?.kind, 'plugin', 'synthetic user rows are plugin-sourced injections');
+  assert.equal(sources[2]?.kind, 'user', 'the real user turn stays human');
+  assert.equal(events.filter((e) => e.type === 'assistant/message').length, 1, 'empty assistant row dropped, content row kept');
+  const verdict = verifySessionLog(decompressSessionBuffer(await fs.readFile(res.paths[0]!)), 'shape-1', res.paths[0]!);
+  assert.ok(verdict.ok, `verifySessionLog passes: ${JSON.stringify(verdict.issues ?? []).slice(0, 200)}`);
+});
+
 test('dsh->dsh: unknown-to-DSH source types are dropped, known types replay verbatim', async () => {
   const adapter = new DshAdapter();
   const root = await tempRoot();
