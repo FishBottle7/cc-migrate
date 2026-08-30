@@ -1,6 +1,8 @@
 <script setup lang="ts">
 import { computed, ref } from 'vue';
 import type { SessionMeta } from '@session-migrate/core';
+import { buildNodes, countNodes, type SessionNode } from './sessionTree.js';
+import SpSessionRow from './SpSessionRow.vue';
 
 const props = defineProps<{
   sessions: SessionMeta[];
@@ -17,17 +19,6 @@ const emit = defineEmits<{
 const query = ref('');
 const hideEmpty = ref(true);
 const archivedOnly = ref(false);
-
-function fmtTime(ts?: number): string {
-  if (!ts) return '—';
-  const d = new Date(ts);
-  const pad = (n: number) => String(n).padStart(2, '0');
-  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
-}
-
-function truncate(s: string, n: number): string {
-  return s.length > n ? s.slice(0, n - 1) + '…' : s;
-}
 
 const filtered = computed(() => {
   const q = query.value.trim().toLowerCase();
@@ -48,44 +39,7 @@ interface SessionGroup {
   key: string;
   label: string;
   path?: string;
-  rows: FlatRow[];
-}
-
-interface SessionNode {
-  meta: SessionMeta;
-  children: SessionNode[];
-}
-
-interface FlatRow {
-  meta: SessionMeta;
-  depth: number;
-  hasChildren: boolean;
-}
-
-/** 主会话在下、子会话挂到父节点下；父不在列表/本组的子会话按根处理。 */
-function buildNodes(items: SessionMeta[]): SessionNode[] {
-  const byId = new Map<string, SessionNode>();
-  for (const m of items) byId.set(m.sessionId, { meta: m, children: [] });
-  const roots: SessionNode[] = [];
-  for (const node of byId.values()) {
-    const parent = node.meta.parentSessionId ? byId.get(node.meta.parentSessionId) : undefined;
-    if (parent && parent !== node) parent.children.push(node);
-    else roots.push(node);
-  }
-  return roots;
-}
-
-function flattenNodes(nodes: SessionNode[], collapsed: Set<string>, depth = 0, out: FlatRow[] = []): FlatRow[] {
-  for (const n of nodes) {
-    out.push({ meta: n.meta, depth, hasChildren: n.children.length > 0 });
-    if (!collapsed.has(n.meta.sessionId)) flattenNodes(n.children, collapsed, depth + 1, out);
-  }
-  return out;
-}
-
-function baseName(p: string): string {
-  const parts = p.split(/[\\/]/).filter(Boolean);
-  return parts.length ? parts[parts.length - 1] : p;
+  nodes: SessionNode[];
 }
 
 /** 按 cwd 分组；组内主会话优先，子会话嵌套在父会话下可展开。 */
@@ -102,30 +56,34 @@ const groups = computed<SessionGroup[]>(() => {
   }
   const arr = [...map.entries()].map(([key, g]) => {
     g.items.sort((a, b) => (b.createdAt ?? 0) - (a.createdAt ?? 0));
-    // 子会话折叠消费 foldedSubs（工作区分组折叠用的是 collapsed，别混）
-    return { key, label: g.label, path: g.path, rows: flattenNodes(buildNodes(g.items), foldedSubs.value) };
+    return { key, label: g.label, path: g.path, nodes: buildNodes(g.items) };
   });
-  arr.sort((a, b) => (b.rows[0]?.meta.createdAt ?? 0) - (a.rows[0]?.meta.createdAt ?? 0));
+  arr.sort((a, b) => (b.nodes[0]?.meta.createdAt ?? 0) - (a.nodes[0]?.meta.createdAt ?? 0));
   return arr;
 });
 
-const collapsed = ref(new Set<string>());
-
-function toggleGroup(key: string) {
-  const next = new Set(collapsed.value);
-  if (next.has(key)) next.delete(key);
-  else next.add(key);
-  collapsed.value = next;
+function baseName(p: string): string {
+  const parts = p.split(/[\\/]/).filter(Boolean);
+  return parts.length ? parts[parts.length - 1] : p;
 }
 
-/** 子会话默认展开；按 sessionId 折叠。 */
-const foldedSubs = ref(new Set<string>());
+function replaceToggle(set: Set<string>, key: string): Set<string> {
+  const next = new Set(set);
+  if (next.has(key)) next.delete(key);
+  else next.add(key);
+  return next;
+}
 
+/** 工作区分组折叠（组容器 grid clip 动效）。 */
+const collapsed = ref(new Set<string>());
+function toggleGroup(key: string) {
+  collapsed.value = replaceToggle(collapsed.value, key);
+}
+
+/** 子会话折叠（SpSessionRow 消费；子会话默认展开）。 */
+const foldedSubs = ref(new Set<string>());
 function toggleSub(id: string) {
-  const next = new Set(foldedSubs.value);
-  if (next.has(id)) next.delete(id);
-  else next.add(id);
-  foldedSubs.value = next;
+  foldedSubs.value = replaceToggle(foldedSubs.value, id);
 }
 </script>
 
@@ -139,6 +97,11 @@ function toggleSub(id: string) {
         placeholder="过滤：标题 / 会话 id / 工作目录…"
         spellcheck="false"
       />
+      <button class="sm-btn" type="button" :disabled="props.loading" @click="emit('refresh')">
+        重新扫描
+      </button>
+    </div>
+    <div class="sp-toolbar sp-toolbar--filters">
       <label class="sp-chip" :class="{ on: hideEmpty }" title="隐藏已登记但还没有 rollout 文件的会话（codex deferred creation，无可迁移内容）">
         <input v-model="hideEmpty" type="checkbox" />
         空会话
@@ -148,9 +111,6 @@ function toggleSub(id: string) {
         只看归档
       </label>
       <span class="sp-count sm-mono">{{ filtered.length }}<i>/</i>{{ props.sessions.length }}</span>
-      <button class="sm-btn sm-btn--ghost" type="button" :disabled="props.loading" @click="emit('refresh')">
-        重新扫描
-      </button>
     </div>
 
     <!-- 骨架屏 -->
@@ -180,41 +140,22 @@ function toggleSub(id: string) {
             <svg viewBox="0 0 14 14"><path d="M1.5 3a1 1 0 011-1h3l1.4 1.6h4.6a1 1 0 011 1V11a1 1 0 01-1 1h-9a1 1 0 01-1-1z" /></svg>
           </span>
           <span class="g-name">{{ g.label }}</span>
-          <span class="g-count sm-mono">{{ g.rows.length }}</span>
+          <span class="g-count sm-mono">{{ countNodes(g.nodes) }}</span>
         </button>
-        <div v-if="!collapsed.has(g.key)" class="sp-group-items">
-          <button
-            v-for="row in g.rows"
-            :key="row.meta.sessionId"
-            type="button"
-            class="sp-item"
-            :class="{ 'is-active': props.selectedId === row.meta.sessionId, 'is-sub': row.depth > 0 }"
-            :style="row.depth ? { marginLeft: row.depth * 18 + 'px' } : undefined"
-            @click="emit('select', row.meta)"
-          >
-            <span class="sp-title">
-              <button
-                v-if="row.hasChildren"
-                type="button"
-                class="sp-sub-toggle"
-                :title="foldedSubs.has(row.meta.sessionId) ? '展开子会话' : '收起子会话'"
-                @click.stop="toggleSub(row.meta.sessionId)"
-              >
-                <svg class="g-chev" :class="{ closed: foldedSubs.has(row.meta.sessionId) }" viewBox="0 0 8 8" aria-hidden="true">
-                  <path d="M2 1l4 3-4 3" />
-                </svg>
-              </button>
-              {{ row.meta.title ? truncate(row.meta.title, 60) : '(无标题)' }}
-              <span v-if="row.meta.deferredCreation" class="sp-tag" title="已登记但无 rollout 文件（deferred creation）">空</span>
-              <span v-else-if="row.meta.archived" class="sp-tag" title="位于归档目录">归档</span>
-              <span v-else-if="row.depth > 0" class="sp-tag sp-tag--sub" title="子代理会话（thread_spawn）">子</span>
-            </span>
-            <span class="sp-meta">
-              <span class="sp-time sm-mono">{{ fmtTime(row.meta.createdAt) }}</span>
-              <span v-if="row.meta.cwd && row.depth === 0" class="sp-cwd sm-mono">{{ truncate(row.meta.cwd, 42) }}</span>
-            </span>
-            <span class="sp-bar" aria-hidden="true" />
-          </button>
+        <!-- 组容器 clip：grid 0fr↔1fr 高度折叠 + 淡入淡出（同 SpSessionRow 子树） -->
+        <div class="sp-group-clip" :class="{ closed: collapsed.has(g.key) }">
+          <div class="sp-group-items">
+            <SpSessionRow
+              v-for="root in g.nodes"
+              :key="root.meta.sessionId"
+              :node="root"
+              :depth="0"
+              :selected-id="props.selectedId"
+              :folded="foldedSubs"
+              @select="(m) => emit('select', m)"
+              @toggle="toggleSub"
+            />
+          </div>
         </div>
       </li>
     </ul>
@@ -228,16 +169,21 @@ function toggleSub(id: string) {
   gap: 10px;
   min-height: 0;
 }
+/* 工具条两行：搜索+重新扫描 / 筛选 chip+计数（288px 默认列宽单行放不下） */
 .sp-toolbar {
   display: flex;
-  gap: 10px;
+  gap: 8px;
   align-items: center;
+}
+.sp-toolbar--filters {
+  margin-top: -5px;
 }
 .sp-search {
   flex: 1;
   min-width: 0;
 }
 .sp-count {
+  margin-left: auto;
   font-size: 11px;
   color: var(--fg-2);
   white-space: nowrap;
@@ -365,11 +311,36 @@ function toggleSub(id: string) {
   padding: 1px 8px;
   font-variant-numeric: tabular-nums;
 }
+/* 组容器折叠 clip：grid 0fr↔1fr 高度过渡 + 内容淡入淡出；
+   关闭后 visibility 出焦点序（延迟到高度动画结束） */
+.sp-group-clip {
+  display: grid;
+  grid-template-rows: 1fr;
+  min-height: 0;
+  visibility: visible;
+  transition:
+    grid-template-rows 220ms var(--ease-out),
+    visibility 0s 0s;
+}
+.sp-group-clip.closed {
+  grid-template-rows: 0fr;
+  visibility: hidden;
+  transition:
+    grid-template-rows 220ms var(--ease-out),
+    visibility 0s 220ms;
+}
 .sp-group-items {
+  min-height: 0;
+  overflow: hidden;
   display: flex;
   flex-direction: column;
   gap: 6px;
   padding-left: 12px;
+  opacity: 1;
+  transition: opacity 160ms var(--ease-out);
+}
+.sp-group-clip.closed .sp-group-items {
+  opacity: 0;
 }
 .sp-list--sk {
   display: flex;
@@ -388,102 +359,6 @@ function toggleSub(id: string) {
 }
 .sp-sk-meta {
   height: 9px;
-}
-.sp-item {
-  position: relative;
-  width: 100%;
-  display: flex;
-  flex-direction: column;
-  gap: 5px;
-  text-align: left;
-  padding: 9px 12px;
-  background: transparent;
-  border: none;
-  border-radius: 8px;
-  cursor: pointer;
-  font: inherit;
-  color: var(--fg-0);
-  transition:
-    background var(--t-fast) ease,
-    transform var(--t-fast) var(--ease-out);
-}
-.sp-item:hover {
-  background: var(--ink-2);
-}
-.sp-item:active {
-  transform: scale(0.995);
-}
-.sp-item.is-active {
-  background: var(--ink-3);
-}
-.sp-bar {
-  position: absolute;
-  left: -1px;
-  top: 10px;
-  bottom: 10px;
-  width: 2px;
-  border-radius: 2px;
-  background: var(--acc-0);
-  opacity: 0;
-  transform: scaleY(0.4);
-  transition:
-    opacity var(--t-med) var(--ease-out),
-    transform var(--t-med) var(--ease-spring);
-}
-.sp-item.is-active .sp-bar {
-  opacity: 1;
-  transform: scaleY(1);
-}
-.sp-title {
-  font-size: 13px;
-  font-weight: 600;
-  line-height: 1.45;
-  letter-spacing: 0.01em;
-}
-.sp-tag {
-  display: inline-block;
-  margin-left: 6px;
-  padding: 0 5px;
-  border: 1px solid var(--line-1);
-  border-radius: 5px;
-  font-size: 10px;
-  font-weight: 500;
-  color: var(--fg-2);
-  vertical-align: 1px;
-}
-.sp-sub-toggle {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  width: 16px;
-  height: 16px;
-  margin-right: 4px;
-  padding: 0;
-  border: none;
-  background: none;
-  color: var(--fg-2);
-  cursor: pointer;
-  vertical-align: -3px;
-}
-.sp-sub-toggle .g-chev {
-  width: 8px;
-  height: 8px;
-}
-.sp-sub-toggle:hover {
-  color: var(--fg-0);
-}
-/* 子会话卡片整体缩进（marginLeft 让背景/色条/边框一起动，flex 拉伸自动收宽） */
-.sp-item.is-sub {
-  width: auto;
-  border-left: 2px solid rgba(118, 99, 224, 0.35);
-}
-.sp-item.is-sub .sp-title {
-  font-weight: 500;
-  color: var(--fg-1);
-}
-.sp-tag--sub {
-  color: var(--acc-ink);
-  border-color: rgba(118, 99, 224, 0.4);
 }
 .sp-chip {
   display: inline-flex;
@@ -506,22 +381,5 @@ function toggleSub(id: string) {
 .sp-chip.on {
   color: var(--fg-1);
   border-color: var(--fg-2);
-}
-.sp-meta {
-  display: flex;
-  gap: 12px;
-  font-size: 11px;
-  color: var(--fg-2);
-}
-.sp-time {
-  white-space: nowrap;
-  font-variant-numeric: tabular-nums;
-}
-.sp-cwd {
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  direction: rtl;
-  min-width: 0;
 }
 </style>
