@@ -96,7 +96,16 @@ export function buildRolloutLines(
   const lines: RolloutLineRaw[] = [];
 
   // 1. session_meta first line (§9.2), then the inherited prefix verbatim.
-  lines.push(line(rolloutTimestamp(createdAt), undefined, 'session_meta', buildSessionMetaPayload(ir, threadId, targetCwd, createdAt, opts)));
+  // Paginated sources ordinal every line — the own meta line keeps its
+  // source ordinal (0 for a fresh thread).
+  lines.push(
+    line(
+      rolloutTimestamp(createdAt),
+      paginated ? ((ownRow?.ordinal as number | undefined) ?? 0) : undefined,
+      'session_meta',
+      buildSessionMetaPayload(ir, threadId, targetCwd, createdAt, opts),
+    ),
+  );
   for (const row of inheritedRows) {
     lines.push(line(row.ts, paginated ? row.ordinal : undefined, 'session_meta', row.payload));
   }
@@ -190,6 +199,15 @@ export function buildRolloutLines(
     }
   }
 
+  // Stitched paginated chains merge several files' ordinal spaces into one
+  // stream — renumber sequentially in emission order (the order itself is
+  // exact; absolute ordinal values are file-local positions).
+  if (paginated && ((sessionCodex?.historyChain as unknown[] | undefined)?.length ?? 0) > 0) {
+    lines.forEach((l, i) => {
+      l.ordinal = i;
+    });
+  }
+
   return lines.map((l) => JSON.stringify(l));
 }
 
@@ -235,13 +253,15 @@ export function buildSessionMetaPayload(
     payload.session_id = threadId;
     payload.cwd = targetCwd;
     payload.timestamp = rolloutTimestamp(createdAt);
-    // The written file is legacy-mode; a stale paginated marker would make
-    // resume expect ordinals that aren't there. When the source omitted the
-    // field entirely (pre-history_mode codex versions — absence is the legacy
-    // fingerprint) preserve that absence; Rust's #[serde(default)] reads it
-    // as legacy either way.
+    // The written file keeps the SOURCE history mode: legacy stays legacy
+    // (absence on pre-history_mode files is the legacy fingerprint and is
+    // preserved); paginated stays paginated — every record line re-emits its
+    // original ordinal, so resume reconstructs identically.
     const sourcePayload = ownRow.payload as Record<string, unknown>;
-    if ('history_mode' in sourcePayload) payload.history_mode = 'legacy';
+    if ('history_mode' in sourcePayload) payload.history_mode = sourcePayload.history_mode;
+    // When the paginated prefix chain was stitched into the IR, the new file
+    // is self-contained — a stale history_base pointer must not survive.
+    if (sessionCodex?.historyChain && 'history_base' in payload) delete payload.history_base;
     if ((opts.systemPromptSource ?? 'source') === 'target') {
       delete payload.base_instructions;
     } else if (!payload.base_instructions && wantSystemPrompt) {

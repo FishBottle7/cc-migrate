@@ -10,6 +10,29 @@
 3. **不允许"不好分清"的信息存在。** 任何信息必须能无歧义地归属到它描述的实体（会话 / 消息 / 块 / 单次工具调用），且关联方式必须跟随实体本身（挂在实体字段上），而不是靠源存储 id 的旁路映射表约定——旁路表在消息被过滤、重排、跨工具转换后即失联。
 4. **扩展模式：typed bucket / 可选字段。** 新概念优先加类型化桶（参照 `goals` / `planModes` / `todos` / `toolCalls` 的既有模式）或实体上的可选字段；必须向后兼容——旧适配器不认识新桶时忽略即可，`validateSession` 同步校验。
 5. **每次扩展三件事同步落地**：validateSession 校验、至少一个适配器完成读写两端、本文档登记（桶清单 + 适配器状态）。
+6. **允许填空，但只在目标端写侧。** 源框架未记录的字段在 IR 里保持缺失（缺失 = 源端缺失 = 无损，禁止用猜测值污染 IR）；目标端为展示/回放所需，可按下方《填空（合成值）政策》合成可推导的近似值。
+
+## 填空（合成值）政策
+
+> 2026-08-30 确立，回答"源 agent 框架没记录某字段怎么办"。先例：opencode 写端用 chars/200 合成 thinking 时长以显示头部 `Thought · Ns`（commit `1b9f146`）——源端没记录时长、目标端展示需要，合成是正当的。
+
+**两层分开判：**
+
+| 层 | 政策 |
+|----|------|
+| IR 层（交换格式） | **禁止填空。** 源端没记录 → IR 保持缺失。IR 缺失 = 源端缺失 = 无损；填入猜测值会让消费端无法区分"源端真没有"和"适配器编的"，且猜测值会随轮转被当成真数据继续扩散 |
+| 目标端写侧（投影层） | **允许填空。** 目标工具需要某字段才能正确展示/回放、而 IR 没有时，可合成 |
+
+**写侧合成三规则：**
+
+1. **可推导**——只能从同会话/同记录内的真实数据推导（字符数 ÷ 200 估时长、相邻时间戳插值、由块类型推默认媒体类型）；禁止凭空发明。
+2. **不冒充**——合成值只存在于目标端原生存储里，不回写 IR；IR→源端 round-trip 的无损断言必须排除合成值，否则"无损"被合成值污染。
+3. **语义字段宁缺勿错**——影响回放语义的字段缺失就缺失，绝不猜：`synthetic`/注入标记（claude `isMeta`、dsh `source.kind`）、关联指针（claude `parentUuid`/`sourceToolAssistantUUID`、IR `toolUseId` 关联）、thinking `signature`。猜错会改变回放行为，比缺失严重一个量级。
+
+**边界澄清：**
+
+- 加密内容（claude `redacted_thinking.data`）不是"没记录"，是"不可迁移"——单独归类（允许丢弃的唯一类别），不适用本政策。
+- 目标端本来就要新生成的值（新 sessionId、迁移时刻的时间戳）是"生成"，不是填空，不受本政策约束。
 
 ## 已落地的 typed buckets
 
@@ -38,6 +61,7 @@
 | `compaction[].replacementHistory?: MigratedMessage[]` | compaction 桶 | codex `CompactedItem.replacement_history`：压缩后**取代此前全部历史**的完整保留史（与 messages[] 同构投影）。区别于 Pi 的 `retainedTail`（Pi 是自包含保留尾） | codex 读写两端；其他忽略 | **codex**（新）；其余忽略 |
 | `compaction[].meta?: Record<string, unknown>` | compaction 桶 | 压缩记录实体上的原生载荷（codex：`window_number`/`first_window_id`/`previous_window_id`/`window_id`/`mcp_resource_origins`），不开源 id 旁表 | codex 读写两端 | **codex**（新）；zcode 可选跟进（边界行迁 `meta.zcode`） |
 | `unmappedEvents` 语义泛化 | 事件日志桶 | 原注释限定 DSH，现泛化为**源 harness 事件日志**（codex `event_msg` 行等）：`seq`=源日志位置（无显式序号时取行号），`type`=源事件类型，`data`=原始载荷（去加密字段）。codex 写回从桶重放 resume 相关事件（turn 边界/rollback/settings） | dsh 不变 + codex 读 | **codex**（新）；dsh 无动作 |
+| `SessionMeta.parentSessionId?/deferredCreation?` + `meta.codex.historyChain?/sourceDir?/sourceFile?` | 会话列表 + 会话级 meta | codex 会话拓扑与溯源三件套（2026-08-30 增补）：`parentSessionId`=子代理 thread_spawn 的父 thread（UI 树状嵌套用，`source.subagent.thread_spawn.parent_thread_id`）；`deferredCreation`=index 已登记但 rollout 文件不存在（无可迁移内容）；`sourceDir/sourceFile`=源 rollout 相对 CODEX_HOME 的文件夹/文件名；`historyChain[]`=paginated `history_base` 跨文件分叉的拼接链路（rolloutId/endOrdinalExclusive/endByteOffset/sourcePath），读端链式拼接、写端发自足单文件（去 history_base、ordinal 重编号） | codex 读写两端；UI 树消费 parentSessionId | **codex**（新）；其余忽略 |
 
 **turn/事件级残条归属约定**（codex 特有，其他工具参考同型做法）：`turn_context`（每真实用户轮的 cwd/model/approval/sandbox/effort/personality 基线）与 `world_state`（全量/补丁快照）挂到该轮首条消息的 `meta.codex`（zcode 已有 contextSnapshot 挂消息 meta 的先例）；会话级基线随首条用户消息走。`event_msg` 整流进 `unmappedEvents`，不散挂。`ResponseItem` 级原生字段（id/phase/`internal_chat_message_metadata_passthrough`/envelope `client_authored`）挂对应消息的 `meta.codex`。
 
@@ -92,6 +116,44 @@ messages[] 里**全量保留**（含被遮蔽消息）——无损原则；"哪�
 
 > 残留小项：sidechain 子会话里无块投影的 assistant 载体行（timeline-event 宿主等）目前仍整体丢弃（主会话同类行已进 `zcode.syntheticMessages` 原始档案桶，且档案桶不参与写回——它保存的是读端原始行，重新物化超出 IR 契约）。待 sidechain 获得独立 extensions/meta 槽位时一并收敛。
 
+## IR 加固清单（2026-08-30 定稿，随 claude 适配器重写执行）
+
+> 背景：现有三层约束（TS 类型 / `validateSession` / 每适配器 round-trip 测试）骨架成立，但有四个缺口：① 校验深度浅——`isMigratedMessage`（ir.ts:281）只查 role 合法 + content 是数组，**块级形状完全不查**，缺 `callId` 的 tool_result 也能过；② `extensions` 是 `Record<string, unknown>`（ir.ts:271），无任何形状；③ 引擎无统一卡点——`migrate.ts` 的 `readSource`/`writeTarget` 是纯透传（migrate.ts:17-28），校验全靠适配器自觉；④ 仓库无 CI。四层加固，**零新依赖**（不引 zod：ContentBlock 联合小而稳定，手写守卫贴合仓库风格；将来 IR 拆独立包对外发布给第三方适配器时再评估）。
+
+### 第一层：校验下探到块级（只动 `ir.ts`，与 claude 重写解耦，先做）
+
+- 新增 `isContentBlock()`，按判别式逐型校验：
+  - `text`：`text` 为 string
+  - `tool_use`：`id`/`name` 非空 string，`input` 有定义
+  - `tool_result`：`toolUseId` 非空 string，`content` 为 string，`isError` 出现时为 boolean，`attachments` 出现时为合法 FileBlock 数组（每块 `filename`/`mediaType`/`data`/`url` 出现时均为 string）
+  - `thinking`：`thinking` 为 string；**`signature` 出现时必须为 string**（逐字节透传的无损关键件，绝不允许被换成非字符串占位）
+  - `file`：`data`/`url`/`filename` 至少其一存在，四个字段出现时均为 string
+  - 未知 `type` → **拒绝**（闭集：新块类型必须走 IR 演进流程登记，临时扩展走 extensions 桶——设计共识 #4）
+- `isMigratedMessage` 加深：`synthetic`/`seq`/`timestamp` 类型校验、`meta` 必须是对象
+- `isValidToolCall` 加深：`output`/`error`/`title` 出现时为 string、`time.{start,end}` 为 number、`source` 形状完整
+- 错误信息带完整定位路径（`message[i].content[j]...`）
+- 兼作**金丝雀**：加深后若现有 6 适配器有产出过不了块级校验，先修适配器再叠新功能
+
+### 第二层：扩展槽位最小形状（随 claude 重写落地，依赖上表 #6/#7 进代码）
+
+- `extensions` 守卫：已知命名空间（`claude` 等）出现时必须是对象；`recordsRaw` 必须是数组；**`rawResult` 保持 `unknown` 不加强约束**（toolUseResult 原样透传，形状由各工具自己定义）
+- `systemPrompt`（ir.ts:224，语义已冻结于上表 #8）：出现时必须为 string，空串合法（= claude 源恒空的语义）
+
+### 第三层：收口到引擎（`migrate.ts` 两处 + `ir.ts` 一处）
+
+- `readSource` 出口、`writeTarget` 入口各加一次 `validateSession`——校验从"适配器自觉"升级为"引擎强制"，任何适配器无法绕过；适配器内部现有调用保留作双保险
+- `schemaVersion` 改严格必填 `= 2`（去掉"未定义放行"分支，ir.ts:335-340）
+
+### 第四层：测试与 CI（当前最大缺口）
+
+- 坏例电池：每块型/每关键字段各构造一个畸形 IR，断言 `validateSession` 抛错且错误信息带正确路径
+- 契约测试：对每个已注册适配器喂毒 IR 调 `write()`，必须抛错——证明引擎卡点真实生效
+- 新增 `.github/workflows/ci.yml`：install + typecheck + test——没有 CI，"三同步"永远只是流程约定
+
+### 执行顺序
+
+第一/三/四层与 claude 重写完全解耦（只碰 `ir.ts`/`migrate.ts`/测试），**先做**——小 diff、现有测试立即验回归；第二层绑重写（依赖 #6/#7 落地时一并守卫）。
+
 ## 适配器适配状态
 
 | 适配器 | 状态 |
@@ -100,7 +162,7 @@ messages[] 里**全量保留**（含被遮蔽消息）——无损原则；"哪�
 | zcode | ✅ 已落地（toolCalls / signature / meta / FileBlock / compaction 锚，读写两端） |
 | claude | ⚠️ **待重写**——现有实现只线性读 user/assistant、丢 DAG 并行 tool_result（`sourceToolAssistantUUID` 挂接 + 同 `message.id` 兄弟恢复缺失）、丢 system/attachment/30+ 种元数据行、`path.ts` 缺 200 截断 + hash；按 `docs/agents/claude.md` 重做，消费上表 #6-#8 槽位 |
 | pi | ✅ 兼容——新桶均为可选字段，忽略即可；pi 已带 FileBlock 文本降级 |
-| codex | ✅ **全部落地**（11 类 rollout 记录全量读写 / response_item 17 变体 1:1 消息投影 + native payload 重建（reasoning summary+content、function/custom/local_shell/tool_search/web_search/image_generation、agent_message+inter_agent_communication 模型可见、developer 角色保留）/ turn_context+world_state 挂轮首消息、孤行归档重放 / compacted→compaction 桶（RH+窗口字段+锚）/ event_msg 全量→unmappedEvents（seq=行号）写回重放 / additional_tools、compaction_trigger、other 归档重放 / session_meta 继承链 + source/thread_source/git/agent_* 原生保真 / session_index append-only 写回 / .zst + `_<rolloutId>` revert 变体 + archived_sessions / **harness 注入行官方分类**：`content_item_kinds` 主通道 + codex rollback.rs 冻结文本标记 fallback——goal resume、system reminder、AGENTS.md、user_shell_command 等不再误判为用户提示词 / `meta.codex.sourceDir/sourceFile` 源文件夹捕获 / 标题=首条真实用户 prompt） |
+| codex | ✅ **全部落地**（11 类 rollout 记录全量读写 / response_item 17 变体 1:1 消息投影 + native payload 重建（reasoning summary+content、function/custom/local_shell/tool_search/web_search/image_generation、agent_message+inter_agent_communication 模型可见、developer 角色保留）/ turn_context+world_state 挂轮首消息、孤行归档重放 / compacted→compaction 桶（RH+窗口字段+锚）/ event_msg 全量→unmappedEvents（seq=行号）写回重放 / additional_tools、compaction_trigger、other 归档重放 / session_meta 继承链 + source/thread_source/git/agent_* 原生保真 / session_index append-only 写回 / .zst + `_<rolloutId>` revert 变体 + archived_sessions / **harness 注入行官方分类**：`content_item_kinds` 主通道 + codex rollback.rs 冻结文本标记 fallback——goal resume、system reminder、AGENTS.md、user_shell_command 等不再误判为用户提示词 / `meta.codex.sourceDir/sourceFile` 源文件夹捕获 / **paginated history_mode 按源保真 + history_base 跨文件链式拼接**（byte 精确截断、防环递归，写端自足单文件）+ `SessionMeta.parentSessionId` 子代理树 / `deferredCreation` 空会话 / 标题=首条真实用户 prompt） |
 | opencode | ✅ 已落地（写端消费 compaction 桶 → 原生边界对；synthetic 默认丢弃 / `--keep-runtime-context` 惰性保留；TUI 工具/思考渲染契约对齐） |
 
 ### dsh 待适配清单（✅ 已全部完成，留档）

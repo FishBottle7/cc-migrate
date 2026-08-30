@@ -42,13 +42,45 @@ const filtered = computed(() => {
   );
 });
 
-/* ── 工作区分组（DSH：workspace 文件夹）─────────────────────── */
+/* ── 工作区分组（DSH：workspace 文件夹）+ 子会话树 ─────────── */
 
 interface SessionGroup {
   key: string;
   label: string;
   path?: string;
-  items: SessionMeta[];
+  rows: FlatRow[];
+}
+
+interface SessionNode {
+  meta: SessionMeta;
+  children: SessionNode[];
+}
+
+interface FlatRow {
+  meta: SessionMeta;
+  depth: number;
+  hasChildren: boolean;
+}
+
+/** 主会话在下、子会话挂到父节点下；父不在列表/本组的子会话按根处理。 */
+function buildNodes(items: SessionMeta[]): SessionNode[] {
+  const byId = new Map<string, SessionNode>();
+  for (const m of items) byId.set(m.sessionId, { meta: m, children: [] });
+  const roots: SessionNode[] = [];
+  for (const node of byId.values()) {
+    const parent = node.meta.parentSessionId ? byId.get(node.meta.parentSessionId) : undefined;
+    if (parent && parent !== node) parent.children.push(node);
+    else roots.push(node);
+  }
+  return roots;
+}
+
+function flattenNodes(nodes: SessionNode[], collapsed: Set<string>, depth = 0, out: FlatRow[] = []): FlatRow[] {
+  for (const n of nodes) {
+    out.push({ meta: n.meta, depth, hasChildren: n.children.length > 0 });
+    if (!collapsed.has(n.meta.sessionId)) flattenNodes(n.children, collapsed, depth + 1, out);
+  }
+  return out;
 }
 
 function baseName(p: string): string {
@@ -56,26 +88,23 @@ function baseName(p: string): string {
   return parts.length ? parts[parts.length - 1] : p;
 }
 
-/** 按 cwd 分组；组内与组间都按最近活跃排序。 */
+/** 按 cwd 分组；组内主会话优先，子会话嵌套在父会话下可展开。 */
 const groups = computed<SessionGroup[]>(() => {
-  const map = new Map<string, SessionGroup>();
+  const map = new Map<string, { label: string; path?: string; items: SessionMeta[] }>();
   for (const m of filtered.value) {
     const key = m.cwd ?? '';
     let g = map.get(key);
     if (!g) {
-      g = {
-        key: key || '__nocwd',
-        label: key ? baseName(key) : '（无工作目录）',
-        path: key || undefined,
-        items: [],
-      };
+      g = { label: key ? baseName(key) : '（无工作目录）', path: key || undefined, items: [] };
       map.set(key, g);
     }
     g.items.push(m);
   }
-  const arr = [...map.values()];
-  for (const g of arr) g.items.sort((a, b) => (b.createdAt ?? 0) - (a.createdAt ?? 0));
-  arr.sort((a, b) => (b.items[0]?.createdAt ?? 0) - (a.items[0]?.createdAt ?? 0));
+  const arr = [...map.entries()].map(([key, g]) => {
+    g.items.sort((a, b) => (b.createdAt ?? 0) - (a.createdAt ?? 0));
+    return { key, label: g.label, path: g.path, rows: flattenNodes(buildNodes(g.items), collapsed.value) };
+  });
+  arr.sort((a, b) => (b.rows[0]?.meta.createdAt ?? 0) - (a.rows[0]?.meta.createdAt ?? 0));
   return arr;
 });
 
@@ -86,6 +115,16 @@ function toggleGroup(key: string) {
   if (next.has(key)) next.delete(key);
   else next.add(key);
   collapsed.value = next;
+}
+
+/** 子会话默认展开；按 sessionId 折叠。 */
+const foldedSubs = ref(new Set<string>());
+
+function toggleSub(id: string) {
+  const next = new Set(foldedSubs.value);
+  if (next.has(id)) next.delete(id);
+  else next.add(id);
+  foldedSubs.value = next;
 }
 </script>
 
@@ -140,25 +179,38 @@ function toggleGroup(key: string) {
             <svg viewBox="0 0 14 14"><path d="M1.5 3a1 1 0 011-1h3l1.4 1.6h4.6a1 1 0 011 1V11a1 1 0 01-1 1h-9a1 1 0 01-1-1z" /></svg>
           </span>
           <span class="g-name">{{ g.label }}</span>
-          <span class="g-count sm-mono">{{ g.items.length }}</span>
+          <span class="g-count sm-mono">{{ g.rows.length }}</span>
         </button>
         <div v-if="!collapsed.has(g.key)" class="sp-group-items">
           <button
-            v-for="m in g.items"
-            :key="m.sessionId"
+            v-for="row in g.rows"
+            :key="row.meta.sessionId"
             type="button"
             class="sp-item"
-            :class="{ 'is-active': props.selectedId === m.sessionId }"
-            @click="emit('select', m)"
+            :class="{ 'is-active': props.selectedId === row.meta.sessionId, 'is-sub': row.depth > 0 }"
+            :style="row.depth ? { paddingLeft: 14 + row.depth * 18 + 'px' } : undefined"
+            @click="emit('select', row.meta)"
           >
             <span class="sp-title">
-              {{ m.title ? truncate(m.title, 60) : '(无标题)' }}
-              <span v-if="m.deferredCreation" class="sp-tag" title="已登记但无 rollout 文件（deferred creation）">空</span>
-              <span v-else-if="m.archived" class="sp-tag" title="位于归档目录">归档</span>
+              <button
+                v-if="row.hasChildren"
+                type="button"
+                class="sp-sub-toggle"
+                :title="foldedSubs.has(row.meta.sessionId) ? '展开子会话' : '收起子会话'"
+                @click.stop="toggleSub(row.meta.sessionId)"
+              >
+                <svg class="g-chev" :class="{ closed: foldedSubs.has(row.meta.sessionId) }" viewBox="0 0 8 8" aria-hidden="true">
+                  <path d="M2 1l4 3-4 3" />
+                </svg>
+              </button>
+              {{ row.meta.title ? truncate(row.meta.title, 60) : '(无标题)' }}
+              <span v-if="row.meta.deferredCreation" class="sp-tag" title="已登记但无 rollout 文件（deferred creation）">空</span>
+              <span v-else-if="row.meta.archived" class="sp-tag" title="位于归档目录">归档</span>
+              <span v-else-if="row.depth > 0" class="sp-tag" title="子代理会话（thread_spawn）">子</span>
             </span>
             <span class="sp-meta">
-              <span class="sp-time sm-mono">{{ fmtTime(m.createdAt) }}</span>
-              <span v-if="m.cwd" class="sp-cwd sm-mono">{{ truncate(m.cwd, 42) }}</span>
+              <span class="sp-time sm-mono">{{ fmtTime(row.meta.createdAt) }}</span>
+              <span v-if="row.meta.cwd" class="sp-cwd sm-mono">{{ truncate(row.meta.cwd, 42) }}</span>
             </span>
             <span class="sp-bar" aria-hidden="true" />
           </button>
@@ -397,6 +449,27 @@ function toggleGroup(key: string) {
   font-weight: 500;
   color: var(--fg-2);
   vertical-align: 1px;
+}
+.sp-sub-toggle {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 16px;
+  margin-right: 4px;
+  padding: 0;
+  border: none;
+  background: none;
+  color: var(--fg-2);
+  cursor: pointer;
+  vertical-align: -3px;
+}
+.sp-sub-toggle .g-chev {
+  width: 8px;
+  height: 8px;
+}
+.sp-item.is-sub {
+  border-left: 2px solid var(--line-1);
 }
 .sp-chip {
   display: inline-flex;

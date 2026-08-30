@@ -31,7 +31,19 @@
  *  - compaction[] 新增 replacementHistory?: MigratedMessage[]（codex
  *    CompactedItem.replacement_history 的类型化投影）与 meta?:（原生记录）。
  *  - unmappedEvents 语义泛化：不再限 DSH，泛指"源 harness 事件日志"
- *    （codex event_msg 行等），seq = 源日志位置。
+ *    (codex event_msg 行等)，seq = 源日志位置。
+ *
+ * v3.2 additive changes (2026-08-30, claude 适配器重写驱动 — 全部为可选字段，旧适配器
+ * 忽略即可，见 docs/ir-protocol.md「v3.2 登记（claude）」):
+ *  - ContentBlock.tool_result 新增 rawResult?: unknown（claude user.toolUseResult
+ *    结构化工具结果原文，挂在块实体上，禁止按 toolUseId 旁表；zcode 可映射融合 output）。
+ *  - MigratedSession 新增 tag? / permissionMode? / prLink? / worktreeSession? /
+ *    costState?（claude 高频有语义的会话级元数据行提升为类型化字段）与
+ *    sessionEvents?: MigratedUnmappedEvent[]（非对话的会话级行：claude system
+ *    subtype 行等；seq = 源文件行号）。MigratedSidechain 同步获得 sessionEvents?。
+ *  - systemPrompt 语义冻结进共识（#8）：源端无原生提示词则留空（claude 恒空）；
+ *    目标端有原生通道走原生槽位（claude = 进程 flag --append-system-prompt），
+ *    无通道才注入 IR 值；禁止把源提示词写进会话正文再叠加目标端系统提示词。
  */
 
 export type ToolId = 'dsh' | 'claude' | 'codex' | 'opencode' | 'pi' | 'zcode' | 'unknown';
@@ -53,7 +65,21 @@ export interface FileBlock {
 export type ContentBlock =
   | { type: 'text'; text: string }
   | { type: 'tool_use'; id: string; name: string; input: unknown }
-  | { type: 'tool_result'; toolUseId: string; content: string; isError?: boolean; attachments?: FileBlock[] }
+  | {
+      type: 'tool_result';
+      toolUseId: string;
+      content: string;
+      isError?: boolean;
+      attachments?: FileBlock[];
+      /**
+       * Structured tool-result payload as the SOURCE tool stored it, beyond the
+       * model-visible `content` text (claude `user.toolUseResult`: Bash
+       * {stdout,stderr,interrupted,isImage,noOutputExpected}, rejection string,
+       * per-tool structs). Attached to the block entity itself — never a
+       * toolUseId side-table (gap #6 in docs/ir-protocol.md).
+       */
+      rawResult?: unknown;
+    }
   | { type: 'thinking'; thinking: string; signature?: string }
   | FileBlock;
 
@@ -113,6 +139,8 @@ export interface MigratedSidechain {
   todos?: MigratedTodo[];
   compaction?: MigratedCompaction[];
   unmappedEvents?: MigratedUnmappedEvent[];
+  /** Non-conversation session-level rows (claude system subtype rows etc.) — see SessionEvents. */
+  sessionEvents?: SessionEvents[];
   /** adapter-namespaced session-level native payload, same contract as MigratedSession.meta */
   meta?: Record<string, unknown>;
   /** nested delegation tree (subagent's own subagents) */
@@ -160,6 +188,8 @@ export interface SessionMeta {
   archived?: boolean;
   /** True when the native index registers the session but no rollout file exists yet (codex deferred creation — nothing to migrate). */
   deferredCreation?: boolean;
+  /** Parent session when this session is a subagent (codex thread_spawn parent_thread_id). */
+  parentSessionId?: string;
 }
 
 export interface MigratedGoal {
@@ -212,6 +242,25 @@ export interface MigratedCompaction {
   meta?: Record<string, unknown>;
 }
 
+/** Linked pull request (claude `pr-link` metadata row). */
+export interface MigratedPrLink {
+  prNumber: number;
+  prUrl: string;
+  prRepository: string;
+  timestamp?: string;
+}
+
+/**
+ * Non-conversation session-level rows from the source harness — claude system
+ * records whose subtype has no conversational projection (turn_duration,
+ * stop_hook_summary, microcompact_boundary, model_refusal_*, informational,
+ * away_summary, …) and any other non-transcript row without a typed slot.
+ * Same shape as `unmappedEvents`; `seq` = source file line index. Rows WITH a
+ * conversational projection are not duplicated here (local_command → synthetic
+ * user message; compact_boundary → compaction[] + meta).
+ */
+export type SessionEvents = MigratedUnmappedEvent[];
+
 export interface MigratedSession {
   schemaVersion: 2;
   originTool: ToolId;
@@ -259,6 +308,18 @@ export interface MigratedSession {
    * rollback, settings) are replayed by the codex write side from here.
    */
   unmappedEvents?: MigratedUnmappedEvent[];
+  /** Non-conversation session-level rows (claude system subtype rows etc.) — see SessionEvents. */
+  sessionEvents?: SessionEvents[];
+  /** Source tag (claude `tag` metadata row). */
+  tag?: string;
+  /** Source permission mode (claude `permission-mode` metadata row). */
+  permissionMode?: string;
+  /** Linked pull request (claude `pr-link` metadata row). */
+  prLink?: MigratedPrLink;
+  /** Worktree session state (claude `worktree-state` row; null = exited). Opaque source shape. */
+  worktreeSession?: unknown;
+  /** Cumulative session cost state (claude `cost-state` row). Opaque source shape. */
+  costState?: unknown;
   /**
    * Adapter-namespaced session-level native payload with no cross-tool slot
    * (codex session_meta line: source/thread_source/git/originator/
@@ -301,6 +362,7 @@ function isValidSidechain(v: unknown): boolean {
     for (const tc of s.toolCalls as unknown[]) if (!isValidToolCall(tc)) return false;
   }
   if (s.unmappedEvents !== undefined && !Array.isArray(s.unmappedEvents)) return false;
+  if (s.sessionEvents !== undefined && !Array.isArray(s.sessionEvents)) return false;
   if (s.goals !== undefined && !Array.isArray(s.goals)) return false;
   if (s.planModes !== undefined && !Array.isArray(s.planModes)) return false;
   if (s.todos !== undefined && !Array.isArray(s.todos)) return false;
@@ -374,6 +436,20 @@ export function validateSession(ir: MigratedSession): MigratedSession {
   if (ir.meta !== undefined && (typeof ir.meta !== 'object' || ir.meta === null || Array.isArray(ir.meta))) {
     throw new Error('validateSession: meta must be an object');
   }
+  if (ir.sessionEvents !== undefined) {
+    if (!Array.isArray(ir.sessionEvents)) throw new Error('validateSession: sessionEvents must be an array');
+  }
+  if (ir.prLink !== undefined) {
+    if (typeof ir.prLink !== 'object' || ir.prLink === null || Array.isArray(ir.prLink)) {
+      throw new Error('validateSession: prLink must be an object');
+    }
+    const pr = ir.prLink as unknown as Record<string, unknown>;
+    if (typeof pr.prNumber !== 'number' || typeof pr.prUrl !== 'string' || typeof pr.prRepository !== 'string') {
+      throw new Error('validateSession: prLink must carry prNumber/prUrl/prRepository');
+    }
+  }
+  if (ir.tag !== undefined && typeof ir.tag !== 'string') throw new Error('validateSession: tag must be a string');
+  if (ir.permissionMode !== undefined && typeof ir.permissionMode !== 'string') throw new Error('validateSession: permissionMode must be a string');
   if (ir.model !== undefined) {
     if (typeof ir.model !== 'object' || ir.model === null || Array.isArray(ir.model)) {
       throw new Error('validateSession: model must be an object { id }');

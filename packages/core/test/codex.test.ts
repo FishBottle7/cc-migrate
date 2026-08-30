@@ -630,6 +630,9 @@ test('round-trip: paginated fixture preserves ordinals end-to-end', () => {
     records2.map((r) => [r.type, (r.payload as Record<string, unknown> | undefined)?.type ?? null]),
     records1.map((r) => [r.type, (r.payload as Record<string, unknown> | undefined)?.type ?? null]),
   );
+  // paginated mode preserved end-to-end; own meta line keeps its ordinal
+  assert.equal((records2[0].payload as Record<string, unknown>).history_mode, 'paginated');
+  assert.equal(records2[0].ordinal, 0);
   // ordinals re-emitted and order-preserving
   assert.deepEqual(records2.slice(1).map((r) => r.ordinal), [1, 2, 3, 4, 5, 6]);
   const ir2 = rolloutRecordsToIr(lines(records2), {});
@@ -762,4 +765,78 @@ test('adapter: parse error for unknown id; validateSession runs on write', async
     adapter.write({ schemaVersion: 2, originTool: 'codex', messages: [{ role: 'bogus' as never, content: [] }] } as MigratedSession, { root }),
     /malformed/,
   );
+});
+
+test('read+write: paginated history_base chain stitches the prefix file into one session', async () => {
+  const root = await tempRoot();
+  const dir = join(root, 'sessions', '2026', '01', '12');
+  await fs.mkdir(dir, { recursive: true });
+  const threadId = '019b0000-0000-7000-8000-00000000abcd';
+  const suffixId = '019b0000-0000-7000-8000-00000000ffff';
+
+  const prefixRecords = [
+    { timestamp: TS, ordinal: 0, type: 'session_meta', payload: { id: threadId, session_id: threadId, timestamp: TS, cwd: 'D:\\proj', originator: 'codex_cli_rs', cli_version: '0.146.0', history_mode: 'paginated' } },
+    { timestamp: TS, ordinal: 1, type: 'response_item', payload: { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'prefix question' }] } },
+    { timestamp: TS, ordinal: 2, type: 'response_item', payload: { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'prefix answer' }] } },
+  ];
+  const prefixText = prefixRecords.map((r) => JSON.stringify(r)).join('\n') + '\n';
+  await fs.writeFile(join(dir, `rollout-2026-01-12T20-55-47-${threadId}.jsonl`), prefixText, 'utf8');
+
+  const suffixRecords = [
+    { timestamp: TS, ordinal: 3, type: 'session_meta', payload: {
+      id: threadId, session_id: threadId, timestamp: TS, cwd: 'D:\\proj', originator: 'codex_cli_rs', cli_version: '0.146.0',
+      history_mode: 'paginated',
+      history_base: { thread_id: threadId, end_ordinal_exclusive: 3, end_byte_offset: Buffer.byteLength(prefixText, 'utf8') },
+    } },
+    { timestamp: TS, ordinal: 4, type: 'response_item', payload: { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'suffix question' }] } },
+    { timestamp: TS, ordinal: 5, type: 'response_item', payload: { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'suffix answer' }] } },
+  ];
+  const suffixPath = join(dir, `rollout-2026-01-12T20-55-48-${threadId}_${suffixId}.jsonl`);
+  await fs.writeFile(suffixPath, suffixRecords.map((r) => JSON.stringify(r)).join('\n') + '\n', 'utf8');
+
+  const ir = await parseRolloutFile(suffixPath, root);
+  // stitched: prefix messages precede suffix ones under the suffix identity
+  assert.equal(ir.messages.length, 4);
+  assert.deepEqual(ir.messages.map((m) => m.seq), [1, 2, 4, 5]);
+  assert.equal(ir.originSessionId, threadId);
+  const codex = (ir.meta as Record<string, unknown>).codex as Record<string, unknown>;
+  const chain = codex.historyChain as Array<{ rolloutId: string; endByteOffset: number }>;
+  assert.equal(chain?.length, 1);
+  assert.equal(chain[0].rolloutId, threadId);
+  assert.equal((codex.sessionMetaLine as Record<string, unknown>).ordinal, 3);
+
+  // write-back: self-contained paginated file — history_base dropped,
+  // ordinal space renumbered sequentially in emission order
+  const lines = buildRolloutLines(ir, 'new-thread', 'D:\\proj', Date.parse(TS), {
+    targetCwd: 'D:\\proj', createdAt: Date.parse(TS), threadId: 'new-thread', keepSynthetic: true,
+  });
+  const recs = lines.map((l) => JSON.parse(l));
+  assert.equal((recs[0].payload as Record<string, unknown>).history_mode, 'paginated');
+  assert.equal('history_base' in (recs[0].payload as Record<string, unknown>), false);
+  assert.deepEqual(recs.map((r) => r.ordinal), [0, 1, 2, 3, 4, 5]);
+  assert.deepEqual(recs.map((r) => r.type), ['session_meta', 'session_meta', 'response_item', 'response_item', 'response_item', 'response_item']);
+  // prefix content rides along, in order
+  const texts = recs.map((r) => JSON.stringify(r.payload)).join('|');
+  assert.ok(texts.indexOf('prefix question') < texts.indexOf('suffix question'));
+});
+
+test('listSessions: subagent threads expose parentSessionId for the UI tree', async () => {
+  const adapter = new CodexAdapter();
+  const root = await tempRoot();
+  const dir = join(root, 'sessions', '2026', '01', '12');
+  await fs.mkdir(dir, { recursive: true });
+  const mainId = '019b0000-0000-7000-8000-00000000aaaa';
+  const subId = '019b0000-0000-7000-8000-00000000bbbb';
+  const mk = (id: string, extra: Record<string, unknown>) => [
+    JSON.stringify({ timestamp: TS, type: 'session_meta', payload: { id, session_id: id, timestamp: TS, cwd: 'D:\\proj', originator: 'codex_cli_rs', cli_version: '0.146.0', ...extra } }),
+    JSON.stringify({ timestamp: TS, type: 'response_item', payload: { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'hello' }] } }),
+  ].join('\n') + '\n';
+  await fs.writeFile(join(dir, `rollout-2026-01-12T20-55-47-${mainId}.jsonl`), mk(mainId, {}), 'utf8');
+  await fs.writeFile(join(dir, `rollout-2026-01-12T20-55-48-${subId}.jsonl`), mk(subId, { source: { subagent: { thread_spawn: { parent_thread_id: mainId, depth: 1 } } } }), 'utf8');
+
+  const metas = await adapter.listSessions(root);
+  const main = metas.find((m) => m.sessionId === mainId);
+  const sub = metas.find((m) => m.sessionId === subId);
+  assert.ok(main && !main.parentSessionId, 'main session unlinked');
+  assert.equal(sub?.parentSessionId, mainId);
 });

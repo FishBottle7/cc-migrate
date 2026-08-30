@@ -203,6 +203,17 @@ export interface IrBuildContext {
   titles?: Map<string, string>;
   /** Absolute path of the source rollout file — recorded into meta.codex. */
   sourcePath?: string;
+  /** Paginated prefix files stitched into this parse (history_base chain). */
+  stitchedChain?: PaginatedChainLink[];
+}
+
+/** One resolved `history_base` hop (docs/agents/codex.md §10). */
+export interface PaginatedChainLink {
+  /** Rollout id of the prefix file (HistoryPosition.thread_id). */
+  rolloutId: string;
+  endOrdinalExclusive?: number;
+  endByteOffset: number;
+  sourcePath: string;
 }
 
 export function rolloutRecordsToIr(records: RolloutLineRaw[], ctx: IrBuildContext = {}): MigratedSession {
@@ -331,6 +342,7 @@ export function rolloutRecordsToIr(records: RolloutLineRaw[], ctx: IrBuildContex
     sessionMeta.sourceFile = basename(ctx.sourcePath);
     sessionMeta.sourceDir = splitDir(ctx.sourcePath);
   }
+  if (ctx.stitchedChain?.length) sessionMeta.historyChain = ctx.stitchedChain;
 
   return {
     schemaVersion: 2,
@@ -1035,30 +1047,89 @@ function safeJson(v: unknown): string {
 /* Public file-level parse                                             */
 /* ------------------------------------------------------------------ */
 
+/**
+ * Paginated continuation stitching (docs/agents/codex.md §10): a rollout whose
+ * session_meta.history_base points at a prefix file inherits that file's
+ * records — codex resume loads the chain, so a migrated session must carry it
+ * too or the target sees a truncated history. Records are concatenated
+ * chronologically (prefix first); the SUFFIX's session_meta stays the own
+ * identity line. Missing links / cycles degrade gracefully to single-file.
+ */
+async function stitchRecords(
+  records: RolloutLineRaw[],
+  sourcePath: string,
+  codexHome: string,
+  chain: PaginatedChainLink[],
+  visited: Set<string>,
+): Promise<RolloutLineRaw[]> {
+  const ownLine = records.find((r) => r.type === 'session_meta');
+  const hb = (ownLine?.payload as Record<string, unknown> | undefined)?.history_base as Record<string, unknown> | undefined;
+  const prefixRolloutId = typeof hb?.thread_id === 'string' ? hb.thread_id : undefined;
+  const endByteOffset = typeof hb?.end_byte_offset === 'number' ? hb.end_byte_offset : undefined;
+  const endOrdinalExclusive = typeof hb?.end_ordinal_exclusive === 'number' ? hb.end_ordinal_exclusive : undefined;
+  if (!hb || !prefixRolloutId || typeof endByteOffset !== 'number' || visited.has(prefixRolloutId) || chain.length >= 32) return records;
+  visited.add(prefixRolloutId);
+
+  const prefixPath = await findRolloutById(codexHome, prefixRolloutId, sourcePath);
+  if (!prefixPath || prefixPath === sourcePath) return records;
+  chain.push({ rolloutId: prefixRolloutId, ...(endOrdinalExclusive !== undefined ? { endOrdinalExclusive } : {}), endByteOffset, sourcePath: prefixPath });
+
+  const prefixRecords = recordsUpToByte(await readRolloutText(prefixPath), endByteOffset);
+  // the prefix may itself continue an earlier file
+  const stitched = await stitchRecords(prefixRecords, prefixPath, codexHome, chain, visited);
+
+  const rest = records.filter((r) => r !== ownLine);
+  return [ownLine!, ...stitched, ...rest];
+}
+
+/** Records wholly contained before a byte offset (the exact paginated cut). */
+function recordsUpToByte(text: string, endByteOffset: number): RolloutLineRaw[] {
+  const out: RolloutLineRaw[] = [];
+  let offset = 0;
+  for (const line of text.split('\n')) {
+    if (offset >= endByteOffset) break;
+    offset += Buffer.byteLength(line, 'utf8') + 1; // + newline
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    try {
+      out.push(JSON.parse(trimmed) as RolloutLineRaw);
+    } catch {
+      // tolerate a torn line inside the prefix
+    }
+  }
+  return out;
+}
+
 /** Parse one rollout file (.jsonl or .jsonl.zst) into IR. */
 export async function parseRolloutFile(path: string, codexHome?: string): Promise<MigratedSession> {
   const text = await readRolloutText(path);
-  const records = parseRolloutLines(text);
-  let titles: Map<string, string> | undefined;
-  if (codexHome) titles = await loadSessionIndexTitles(codexHome);
-  else {
-    // codexHome = sessions/YYYY/MM/DD → up 4 levels (file → day → month → year → sessions → home)
-    titles = await loadSessionIndexTitles(join(dirname(dirname(dirname(dirname(path))))) );
-  }
-  return rolloutRecordsToIr(records, { titles, sourcePath: path });
+  let records = parseRolloutLines(text);
+  // codexHome = sessions/YYYY/MM/DD → up 5 levels (file → day → month → year → sessions → home)
+  const home = codexHome ?? dirname(dirname(dirname(dirname(dirname(path)))));
+  const titles = await loadSessionIndexTitles(home);
+  // Paginated history_base chains stitch the full logical thread.
+  const chain: PaginatedChainLink[] = [];
+  const visited = new Set<string>();
+  const base = parseRolloutFileNameBasic(basename(path));
+  if (base) visited.add(base.rolloutId);
+  records = await stitchRecords(records, path, home, chain, visited);
+  return rolloutRecordsToIr(records, { titles, sourcePath: path, ...(chain.length ? { stitchedChain: chain } : {}) });
 }
 
 /** Resolve a session id (thread id or rollout id) to a rollout file path. */
-export async function findRolloutById(codexHome: string, sessionId: string): Promise<string | null> {
-  const candidates: Array<{ path: string; mtime: number }> = [];
-  await scanForId(codexHome, sessionId, candidates);
-  await scanForId(join(codexHome, 'archived_sessions'), sessionId, candidates);
+export async function findRolloutById(codexHome: string, sessionId: string, exclude?: string): Promise<string | null> {
+  const candidates: Array<{ path: string; mtime: number; kind: 'rollout' | 'thread' }> = [];
+  await scanForId(codexHome, sessionId, candidates, exclude);
+  await scanForId(join(codexHome, 'archived_sessions'), sessionId, candidates, exclude);
   if (!candidates.length) return null;
-  candidates.sort((a, b) => b.mtime - a.mtime);
+  // An exact rollout-id match (revert variant `_<rolloutId>` filename) wins
+  // over a thread-id match — paginated history_base points at a specific
+  // rollout file, and a thread can own several of those.
+  candidates.sort((a, b) => (a.kind === b.kind ? b.mtime - a.mtime : a.kind === 'rollout' ? -1 : 1));
   return candidates[0].path;
 }
 
-async function scanForId(dir: string, sessionId: string, out: Array<{ path: string; mtime: number }>): Promise<void> {
+async function scanForId(dir: string, sessionId: string, out: Array<{ path: string; mtime: number; kind: 'rollout' | 'thread' }>, exclude?: string): Promise<void> {
   let entries;
   try {
     entries = await fs.readdir(dir, { withFileTypes: true });
@@ -1068,13 +1139,14 @@ async function scanForId(dir: string, sessionId: string, out: Array<{ path: stri
   for (const e of entries) {
     const full = join(dir, e.name);
     if (e.isDirectory()) {
-      await scanForId(full, sessionId, out);
-    } else if (e.isFile() && e.name.startsWith('rollout-') && (e.name.endsWith('.jsonl') || e.name.endsWith('.jsonl.zst'))) {
+      await scanForId(full, sessionId, out, exclude);
+    } else if (full !== exclude && e.isFile() && e.name.startsWith('rollout-') && (e.name.endsWith('.jsonl') || e.name.endsWith('.jsonl.zst'))) {
       const parsed = parseRolloutFileNameBasic(e.name);
-      if (parsed && (parsed.threadId === sessionId || parsed.rolloutId === sessionId)) {
-        const st = await fs.stat(full).catch(() => null);
-        out.push({ path: full, mtime: st?.mtimeMs ?? 0 });
-      }
+      if (!parsed) continue;
+      const kind = parsed.rolloutId === sessionId && parsed.threadId !== sessionId ? 'rollout' : 'thread';
+      if (parsed.threadId !== sessionId && parsed.rolloutId !== sessionId) continue;
+      const st = await fs.stat(full).catch(() => null);
+      out.push({ path: full, mtime: st?.mtimeMs ?? 0, kind });
     }
   }
 }

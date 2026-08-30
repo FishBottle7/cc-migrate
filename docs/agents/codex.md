@@ -98,7 +98,7 @@
 
 - 目录 `sessions/<YYYY>/<MM>/<DD>/`，**本地时间**（recorder.rs:1630 `now_local`）；文件名 `rollout-<YYYY-MM-DDTHH-mm-ss>-<threadId>[_<rolloutId>].jsonl`（rollout_file_name.rs:39-74）。`_rolloutId` 后缀 = revert 过的线程（threadId 稳定，rolloutId 换新）。
 - 文件名里的 ts 解析按 **UTC** `assume_utc`（rollout_file_name.rs:54）而写入用本地时间——Codex 自己的 quirk，解析保持同款行为即可，别"纠正"。
-- **ordinal**（ordinal.rs）：`history_mode=legacy` → 无 ordinal；`paginated` → 每行递增 u64（从 0 或 `history_base.end_ordinal_exclusive` 起）。子代理继承父记录时校验 `subagent_history_start_ordinal` 前缀完整。本机 0.146.0 常规会话均为 legacy（无 ordinal）；**读端两种都要支持，写端默认 legacy**（与官方 CLI 默认一致）。
+- **ordinal**（ordinal.rs）：`history_mode=legacy` → 无 ordinal；`paginated` → 每行递增 u64（从 0 或 `history_base.end_ordinal_exclusive` 起）。子代理继承父记录时校验 `subagent_history_start_ordinal` 前缀完整。本机 0.146.0 常规会话均为 legacy（无 ordinal）；**读端两种都要支持；写端 foreign/新会话默认 legacy（与官方 CLI 默认一致），paginated 源按源保真（见 §11.2）**。
 - 压缩（rollout/src/compression.rs）：后台 worker 定期把"冷" rollout 转成 `rollout-….jsonl.zst`（zstd stream encoder，level 3，单帧；被引用/fork-base 的跳过；run marker 在 `~/.codex/.tmp`）。**读端必须同时支持 .jsonl 与 .jsonl.zst**（Node ≥24 `node:zlib` `zstdDecompressSync` 可解；现有 `parseRolloutFile` 已有该分支）；追加时 codex 会 materialize 回 plain——我们只写新文件，无此问题。
 
 ## 5. event_msg：持久化子集与载荷
@@ -184,7 +184,7 @@
 - reasoning 的 encrypted_content 是唯一合法丢弃；summary/content 必须保。
 - 文件名 ts 本地写入/UTC 解析的官方 quirk。
 - `.zst` 与 `_rolloutId` 文件名变体；deferred creation 空会话无文件。
-- 同文件多条 session_meta（继承前缀）；history_base 指向**外部文件**的 ordinal 截断（该形态读端要能解析 meta 但不合并外部历史——迁移时按单文件处理并在 meta 标注）。
+- 同文件多条 session_meta（继承前缀）；history_base 指向**外部文件**的 ordinal 截断——读端已实现跨文件链式拼接（见 §11.2）。
 - EventMsg wire 名 `task_started`/`task_complete`（alias turn_*）。
 - `world_state.state` 里的 agents_md 全文 = 项目文档的权威快照，读端从中识别 AGENTS.md 内容。
 - codex 官方导入器（external-agent-migration）是"最小导入"参照：只带 text、丢 thinking/tool 详文、伪造 turn 事件、无 turn_context/world_state、用 ledger 防重导（`~/.codex/external_agent_session_imports.json`，key=path+sha256）。我们方向相反（导出方），但它的 rollout 构造路径验证了最小可 resume 集。
@@ -204,7 +204,7 @@
 
 ### 11.2 与正文的其他偏差
 
-- **写端强制 `history_mode:'legacy'`**（§9.1）：paginated 源转换为 legacy 会话；源行 ordinal 仍按原 ordinal 重发射在行上（信息不丢），但 session_meta 声明 legacy。paginated→paginated 保真转换待 codex 官方格式稳定后再做。
+- **history_mode 按源保真**（取代原"写端强制 legacy"）：源是 paginated 写回仍是 paginated；源无 `history_mode` 字段（legacy 指纹）写回也不添加——`history_mode` 仅在源已声明时 verbatim 转发。跨文件 `history_base` 分叉读端**链式拼接**（`stitchRecords`）：按 `history_base.end_byte_offset` 对前缀 rollout 文件做 byte 精确截断，递归上溯（防环：visited 集 + 32 层深度；`findRolloutById` 按 rollout-id 精确匹配并排除自身与下游文件，防 mtime 更新的后缀文件误选），前缀记录插到 own session_meta 之后、正文之前，链路存 `meta.codex.historyChain[]`（rolloutId/endOrdinalExclusive/endByteOffset/sourcePath）。拼接后写端发**自足单文件**：session_meta 载荷删去 `history_base`，全流 ordinal 按发射顺序重编号连续。已知局限：前缀侧行内嵌的 `subagent_history_start_ordinal` 校验域跨文件后仍 verbatim 保留（对应原文件 ordinal 空间，读回拼接视图时无碍，官方 CLI 校验器视角可能需重算）。
 - **`additional_tools` / `compaction_trigger` / `other`（§3 未持久变体）**：读端归档 `unmappedEvents[]`（`type:'response_item'`，`data.codexResponseItem` = 去加密原始 payload，`data.clientAuthored` 随行），写端按原位重放 response_item 行——比正文"归档不投影"更进一步，零丢弃。
 - **`meta.codex.sourceDir` / `sourceFile`**：读端记录源 rollout 所属文件夹（相对 CODEX_HOME，`sessions/YYYY/MM/DD` 或 `archived_sessions`）与文件名——列表/审计/溯源用；写回新文件路径由 `createdAt` 本地时间重建，不沿用该字段。
 - **session_index 标题推断**（§9.7）：codex 惯例 = **用户第一条真实 prompt 的前缀**。实现顺序：`ir.title` → 原生 `sessionIndex.thread_name` → 首条 `role=user && !synthetic && 无 contentKind && 无 kind` 消息首行文本（60 字符截断）→ `'(untitled)'`。注入行（goal/AGENTS.md/shell 命令/压缩摘要投影）全部跳过。
