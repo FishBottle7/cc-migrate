@@ -668,7 +668,7 @@ function isoToMs(iso: unknown): number | undefined {
 function envelopeMeta(rec: ClaudeRawRecord): Record<string, unknown> {
   const m: Record<string, unknown> = {};
   for (const key of [
-    'parentUuid', 'logicalParentUuid', 'isSidechain', 'teamName', 'agentName',
+    'uuid', 'parentUuid', 'logicalParentUuid', 'isSidechain', 'teamName', 'agentName',
     'promptId', 'agentId', 'userType', 'entrypoint', 'cwd', 'version',
     'gitBranch', 'slug', 'sessionKind', 'session_id', 'origin', 'promptSource',
     'permissionMode', 'requestId', 'effort', 'isAbortedMidStream', 'isVirtual',
@@ -877,6 +877,8 @@ export function projectChain(
         const claudeMeta: Record<string, unknown> = {};
         if (boundary) claudeMeta.boundaryRecord = boundary;
         if (Object.keys(cm).length) claudeMeta.compactMetadata = cm;
+        if (typeof rec.timestamp === 'string') claudeMeta.summaryTimestamp = rec.timestamp; // write-back fidelity
+        if (typeof rec.uuid === 'string') claudeMeta.summaryUuid = rec.uuid; // ride-through representation marker
         const entry: MigratedCompaction = {
           summary: blocks
             .filter((b): b is { type: 'text'; text: string } => b.type === 'text')
@@ -918,7 +920,7 @@ export function projectChain(
           content: [{ type: 'text', text }],
           timestamp: ts,
           synthetic: true,
-          meta: { claude: { ...envelopeMeta(rec), systemSubtype: 'local_command', level: rec.level } },
+          meta: { claude: { ...envelopeMeta(rec), systemSubtype: 'local_command', level: rec.level, ...(rec.isMeta === true ? { isMeta: true } : {}) } },
         };
         messages.push(msg);
         continue;
@@ -962,9 +964,17 @@ export function loadedTranscriptToIr(
   );
   let chain: ClaudeRawRecord[] = [];
   if (leafCandidates.length) {
-    const latest = leafCandidates.reduce((a, b) =>
-      String(a.timestamp ?? '').localeCompare(String(b.timestamp ?? '')) > 0 ? a : b,
-    );
+    // native resume semantics: last-prompt.leafUuid names the ACTIVE leaf —
+    // trust it over the timestamp tiebreak (a ride-back file carries a second
+    // dead tree whose leaf ties on timestamp; the leafUuid disambiguates)
+    const leafHit = typeof meta.lastPromptLeafUuid === 'string'
+      ? messageMap.get(meta.lastPromptLeafUuid)
+      : undefined;
+    const latest = leafHit
+      ? leafHit
+      : leafCandidates.reduce((a, b) =>
+        String(a.timestamp ?? '').localeCompare(String(b.timestamp ?? '')) > 0 ? a : b,
+      );
     chain = buildConversationChain(messageMap, latest);
     const trailing = trailingChildrenOf(messageMap, latest.uuid!);
     chain.push(...trailing);

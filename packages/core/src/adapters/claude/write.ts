@@ -28,6 +28,7 @@ import type {
   MigratedCompaction,
   MigratedMessage,
   MigratedSession,
+  MigratedSidechain,
 } from '../../ir.js';
 
 /* ------------------------------------------------------------------
@@ -53,6 +54,9 @@ interface ChainState {
   parentUuid: string | null;
   /** toolUseId → assistant record uuid (for tool_result parent override) */
   toolUseOwner: Map<string, string>;
+  /** original source-row uuids materialized by the projection — their
+   *  recordsRaw ride-through copies are skipped (represented, not lost) */
+  emittedUuids: Set<string>;
 }
 
 function iso(ms: number): string {
@@ -148,8 +152,16 @@ function envelopeFromMeta(meta: Record<string, unknown>): Partial<Record<string,
 
 function emitMessage(ctx: EmitCtx, msg: MigratedMessage, opts: { compactSummary?: boolean } = {}): void {
   const { stamp: st, state } = ctx;
-  const ts = iso(ctx.at());
+  // 红线 #2: original row timestamps ride IR (msg.timestamp) — only fabricate
+  // when absent (cross-harness IR / synthesized rows)
+  const ts = typeof msg.timestamp === 'number' && Number.isFinite(msg.timestamp)
+    ? iso(msg.timestamp)
+    : iso(ctx.at());
   const meta = (msg.meta?.claude ?? {}) as Record<string, unknown>;
+  /** original source-row uuid — records its ride-through copy as represented */
+  const trackEmitted = (): void => {
+    if (typeof meta.uuid === 'string' && meta.uuid) state.emittedUuids.add(meta.uuid);
+  };
   const native = (meta.message ?? undefined) as Record<string, unknown> | undefined;
   const env = envelopeFromMeta(meta);
   const sidechainFields = {
@@ -211,14 +223,78 @@ function emitMessage(ctx: EmitCtx, msg: MigratedMessage, opts: { compactSummary?
     stripUndefined(record);
     state.records.push(record);
     state.parentUuid = uuid;
+    trackEmitted();
     for (const b of msg.content) {
       if (b.type === 'tool_use') state.toolUseOwner.set(b.id, uuid);
     }
     return;
   }
 
-  if (isSidechain === false && msg.role === 'assistant') {
-    // unreachable (kept for shape clarity)
+  // keepSynthetic write-back: native attachment / local_command rows restore
+  // their ORIGINAL row shape (type:'attachment' + attachment object; system
+  // local_command) instead of the text projection — the projection is for
+  // display; the original structure is what a claude→claude round-trip needs.
+  // (The keep-gate upstream drops these rows unless keepSynthetic, so reaching
+  // here with meta.attachment / systemSubtype set means keepSynthetic is on.)
+  if (meta.attachment !== undefined && typeof meta.attachment === 'object') {
+    // native key order (real-file verified): parentUuid, isSidechain,
+    // attachment, type, uuid, timestamp, envelope
+    const uuid = randomUUID();
+    const record: Record<string, unknown> = {
+      parentUuid: state.parentUuid,
+      isSidechain,
+      attachment: meta.attachment,
+      type: 'attachment',
+      uuid,
+      timestamp: ts,
+      userType: st.userType ?? 'external',
+      entrypoint: st.entrypoint ?? 'cli',
+      cwd: st.cwd,
+      sessionId: st.sessionId,
+      ...(st.snakeSessionId ? { session_id: st.sessionId } : {}),
+      version: st.version,
+      gitBranch: st.gitBranch,
+      slug: st.slug,
+      sessionKind: st.sessionKind,
+    };
+    stripUndefined(record);
+    state.records.push(record);
+    state.parentUuid = uuid;
+    trackEmitted();
+    return;
+  }
+  if (meta.systemSubtype === 'local_command') {
+    // native key order: parentUuid, isSidechain, type, subtype, content,
+    // level, timestamp, uuid, isMeta, envelope
+    const text = msg.content
+      .filter((b): b is Extract<ContentBlock, { type: 'text' }> => b.type === 'text')
+      .map((b) => b.text)
+      .join('\n');
+    const uuid = randomUUID();
+    const record: Record<string, unknown> = {
+      parentUuid: state.parentUuid,
+      isSidechain,
+      type: 'system',
+      subtype: 'local_command',
+      content: text,
+      ...(meta.level !== undefined ? { level: meta.level } : {}),
+      timestamp: ts,
+      uuid,
+      ...(meta.isMeta === true ? { isMeta: true } : {}),
+      userType: st.userType ?? 'external',
+      entrypoint: st.entrypoint ?? 'cli',
+      cwd: st.cwd,
+      sessionId: st.sessionId,
+      ...(st.snakeSessionId ? { session_id: st.sessionId } : {}),
+      version: st.version,
+      gitBranch: st.gitBranch,
+      slug: st.slug,
+      sessionKind: st.sessionKind,
+    };
+    stripUndefined(record);
+    state.records.push(record);
+    state.parentUuid = uuid;
+    trackEmitted();
     return;
   }
 
@@ -263,6 +339,7 @@ function emitMessage(ctx: EmitCtx, msg: MigratedMessage, opts: { compactSummary?
     stripUndefined(record);
     state.records.push(record);
     state.parentUuid = uuid;
+    trackEmitted();
   }
 
   // 2) each tool_result → its own user record, parentUuid overridden to the
@@ -302,6 +379,7 @@ function emitMessage(ctx: EmitCtx, msg: MigratedMessage, opts: { compactSummary?
     state.records.push(record);
     // tool_result 不改变后续消息的链挂点语义：下一条消息按文件序接到它之后
     state.parentUuid = uuid;
+    trackEmitted();
   }
   void trPos;
 }
@@ -347,7 +425,7 @@ export function buildMainRecords(
   };
   let clock = opts.nowMs ?? Date.now();
   const at = (): number => (clock += 1);
-  const ctx: EmitCtx = { stamp: st, state: { records: [], parentUuid: null, toolUseOwner: new Map() }, isSidechain: false, at };
+  const ctx: EmitCtx = { stamp: st, state: { records: [], parentUuid: null, toolUseOwner: new Map(), emittedUuids: new Set() }, isSidechain: false, at };
 
   // ---- header rows (materializeSessionFile 实测头序: ai-title/agent-name/mode/…) ----
   const header: Record<string, unknown>[] = [];
@@ -386,7 +464,7 @@ export function buildMainRecords(
       prNumber: ir.prLink.prNumber,
       prUrl: ir.prLink.prUrl,
       prRepository: ir.prLink.prRepository,
-      timestamp: iso(clock),
+      ...(typeof ir.prLink.timestamp === 'string' ? { timestamp: ir.prLink.timestamp } : { timestamp: iso(clock) }),
     });
   }
   if (ir.costState) header.push({ ...(ir.costState as Record<string, unknown>), sessionId });
@@ -428,13 +506,37 @@ export function buildMainRecords(
   }
 
   // ---- terminal last-prompt (leafUuid = 末条 user/assistant; 不带 cwd) ----
+  const leaf = lastLeafUuidOf(ctx.state.records); // chain-only — ride rows follow
+
+  // ---- recordsRaw ride-through (§8#7): claude→claude byte-level branch ----
+  // restoration. Rows the projection did not materialize ride verbatim —
+  // folded compaction segments, dead rewind branches, historical boundaries,
+  // system subtype rows — with only the session identity re-stamped, so every
+  // parentUuid in the output resolves inside the file (native invariant) and
+  // no non-encrypted source row is lost. Metadata rows re-emitted in the
+  // header are skipped by type (last-prompt/ai-title ride too: the rewritten
+  // terminal row is appended after and wins last-wins on re-read).
+  const rawRecords = ((ir.extensions?.claude as Record<string, unknown> | undefined)?.recordsRaw ?? []) as Record<string, unknown>[];
+  const headerTypes = new Set(header.map((h) => h.type));
+  for (const raw of rawRecords) {
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) continue;
+    const r = raw as Record<string, unknown>;
+    const t = typeof r.type === 'string' ? r.type : undefined;
+    if (typeof r.uuid === 'string' && r.uuid && ctx.state.emittedUuids.has(r.uuid)) continue; // represented by the projection
+    if (t !== undefined && headerTypes.has(t) && t !== 'last-prompt' && t !== 'ai-title') continue;
+    const clone: Record<string, unknown> = { ...r, sessionId };
+    if (st.snakeSessionId && r.session_id !== undefined) clone.session_id = sessionId;
+    ctx.state.records.push(clone);
+  }
+
   const records = [...header, ...ctx.state.records];
-  const leaf = lastLeafUuidOf(ctx.state.records);
-  const lastUser = [...ir.messages].reverse().find((m) => m.role === 'user' && m.synthetic !== true);
+  const lastUser = [...ir.messages].reverse().find(
+    (m) => m.role === 'user' && m.synthetic !== true && m.content.some((b) => b.type === 'text'),
+  );
   const lastPrompt = lastUser ? normalizeLastPrompt(messageFirstText(lastUser)) : undefined;
   if (lastPrompt !== undefined || leaf !== undefined) {
     const lp: Record<string, unknown> = { type: 'last-prompt', sessionId };
-    if (lastPrompt !== undefined) lp.lastPrompt = lastPrompt;
+    if (lastPrompt) lp.lastPrompt = lastPrompt;
     if (leaf) lp.leafUuid = leaf;
     records.push(lp);
   }
@@ -445,7 +547,7 @@ const TRANSCRIPT_ROW_TYPES = new Set(['last-prompt', 'ai-title']);
 
 /** sidechain file records (isSidechain:true + agentId stamps). */
 export function buildSidechainRecords(
-  sc: { agentId: string; messages: MigratedMessage[]; agentType?: string },
+  sc: MigratedSidechain,
   sessionId: string,
   opts: { targetCwd: string; keepSynthetic?: boolean; nowMs?: number },
 ): { records: Record<string, unknown>[]; meta: Record<string, unknown> } {
@@ -460,7 +562,7 @@ export function buildSidechainRecords(
   let clock = opts.nowMs ?? Date.now();
   const ctx: EmitCtx = {
     stamp: st,
-    state: { records: [], parentUuid: null, toolUseOwner: new Map() },
+    state: { records: [], parentUuid: null, toolUseOwner: new Map(), emittedUuids: new Set() },
     isSidechain: true,
     at: () => (clock += 1),
     agentId: sc.agentId,
@@ -471,8 +573,12 @@ export function buildSidechainRecords(
     if (msg.synthetic === true && opts.keepSynthetic !== true && !isMetaRow && !msg.content.some((b) => b.type === 'tool_result')) continue;
     emitMessage(ctx, msg);
   }
+  // 红线 #2: the original .meta.json sidecar (toolUseId/name/color/agentType…)
+  // rides IR as sc.meta.claude.agentMeta — write it back, target fields last
+  const agentMeta = ((sc.meta?.claude as Record<string, unknown> | undefined)?.agentMeta ?? {}) as Record<string, unknown>;
   const meta: Record<string, unknown> = {
-    agentType: sc.agentType ?? 'general-purpose',
+    ...agentMeta,
+    agentType: sc.agentType ?? (typeof agentMeta.agentType === 'string' ? agentMeta.agentType : 'general-purpose'),
   };
   return { records: ctx.state.records, meta };
 }
@@ -501,6 +607,13 @@ function emitCompactionPair(ctx: EmitCtx, c: MigratedCompaction): void {
           timestamp: iso(ctx.at()),
         };
   boundary.parentUuid = null; // compact boundary 截断链（§4）
+  if (typeof boundary.uuid !== 'string' || !boundary.uuid) boundary.uuid = randomUUID();
+  // both the emitted boundary (original uuid on ride-through) and the source
+  // isCompactSummary row count as represented — their raw copies are skipped
+  ctx.state.emittedUuids.add(boundary.uuid as string);
+  if (typeof claudeMeta.summaryUuid === 'string' && claudeMeta.summaryUuid) {
+    ctx.state.emittedUuids.add(claudeMeta.summaryUuid);
+  }
   if (typeof cm.logicalParentUuid === 'string') {
     boundary.logicalParentUuid = cm.logicalParentUuid;
   } else if (ctx.state.parentUuid) {
@@ -509,5 +622,10 @@ function emitCompactionPair(ctx: EmitCtx, c: MigratedCompaction): void {
   ctx.state.records.push(boundary);
   // summary 文本作为 isCompactSummary user 记录接在 boundary 之后
   ctx.state.parentUuid = boundary.uuid as string;
-  emitMessage(ctx, { role: 'user', content: [{ type: 'text', text: c.summary }] }, { compactSummary: true });
+  const sumMs = typeof claudeMeta.summaryTimestamp === 'string' ? Date.parse(claudeMeta.summaryTimestamp) : NaN;
+  emitMessage(
+    ctx,
+    { role: 'user', content: [{ type: 'text', text: c.summary }], ...(Number.isFinite(sumMs) ? { timestamp: sumMs } : {}) },
+    { compactSummary: true },
+  );
 }

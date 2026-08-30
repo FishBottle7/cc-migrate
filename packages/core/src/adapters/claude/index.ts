@@ -90,15 +90,61 @@ export class ClaudeAdapter implements Adapter {
     }
 
     const keepSynthetic = opts?.keepSynthetic === true;
+    const paths: string[] = [];
+    await fs.mkdir(dir, { recursive: true });
+
+    // ---- claude→claude: byte-level restoration (docs/agents/claude.md §8#7) ----
+    // recordsRaw holds EVERY source row verbatim; the session IS those rows.
+    // Re-stamp only the session identity (sessionId/session_id → newId) and
+    // write them back in file order — DAG, dead rewind branches, folded
+    // compaction segments, boundaries, attachment rows all survive byte-for-byte
+    // and parse(write(x)) ≡ parse(x) by construction. IR-level fields (title,
+    // tag, …) are intentionally not re-projected: they already ride the rows.
+    const claudeExt = (ir.extensions?.claude ?? {}) as Record<string, unknown>;
+    const recordsRaw = claudeExt.recordsRaw as Record<string, unknown>[] | undefined;
+    if (ir.originTool === 'claude' && Array.isArray(recordsRaw) && recordsRaw.length) {
+      const lines = recordsRaw.map((row) => {
+        if (!row || typeof row !== 'object' || Array.isArray(row)) return JSON.stringify(row) ?? '';
+        const clone = { ...(row as Record<string, unknown>) };
+        if (clone.sessionId !== undefined) clone.sessionId = newId;
+        if (clone.session_id !== undefined) clone.session_id = newId;
+        return JSON.stringify(clone);
+      });
+      await fs.writeFile(finalPath, lines.join('\n') + '\n', { encoding: 'utf8', flag: 'wx' });
+      paths.push(finalPath);
+      // sidechains still project (MigratedSidechain has no recordsRaw slot yet)
+      if (ir.sidechains?.length) {
+        const subagentsDir = join(dir, newId, 'subagents');
+        const used = new Set<string>();
+        for (const sc of ir.sidechains) {
+          let stem = `agent-${sanitizeStem(sc.agentId)}`;
+          let n = 1;
+          while (used.has(stem)) stem = `agent-${sanitizeStem(sc.agentId)}-${n++}`;
+          used.add(stem);
+          const { records, meta } = buildSidechainRecords(sc, newId, { targetCwd, keepSynthetic });
+          const scPath = join(subagentsDir, `${stem}.jsonl`);
+          if (await exists(scPath)) {
+            throw new Error(`Claude: refusing to overwrite existing sidechain file ${scPath}`);
+          }
+          await fs.mkdir(subagentsDir, { recursive: true });
+          await fs.writeFile(scPath, records.map((r) => JSON.stringify(r)).join('\n') + '\n', { encoding: 'utf8', flag: 'wx' });
+          paths.push(scPath);
+          await fs.writeFile(join(subagentsDir, `${stem}.meta.json`), JSON.stringify(meta), { encoding: 'utf8', flag: 'wx' });
+          paths.push(`${scPath}.meta.json`);
+        }
+      }
+      return { tool: 'claude', sessionId: newId, paths };
+    }
+
     const built = buildMainRecords(ir, newId, { targetCwd, keepSynthetic });
     const lines = built.records.map((r) => JSON.stringify(r));
 
-    const paths: string[] = [];
-    await fs.mkdir(dir, { recursive: true });
     if (await exists(finalPath)) {
       throw new Error(`Claude: refusing to overwrite existing session file ${finalPath}`);
     }
-    await fs.writeFile(finalPath, lines.join('\n') + '\n', 'utf8');
+    // 'wx': fail if the file appeared between the check and the write —
+    // 红线 #1's no-overwrite guarantee is enforced by the filesystem itself
+    await fs.writeFile(finalPath, lines.join('\n') + '\n', { encoding: 'utf8', flag: 'wx' });
     paths.push(finalPath);
 
     // sidechains: <dir>/<sessionId>/subagents/agent-<id>.jsonl (+ .meta.json sidecar)
@@ -116,9 +162,9 @@ export class ClaudeAdapter implements Adapter {
           throw new Error(`Claude: refusing to overwrite existing sidechain file ${scPath}`);
         }
         await fs.mkdir(subagentsDir, { recursive: true });
-        await fs.writeFile(scPath, records.map((r) => JSON.stringify(r)).join('\n') + '\n', 'utf8');
+        await fs.writeFile(scPath, records.map((r) => JSON.stringify(r)).join('\n') + '\n', { encoding: 'utf8', flag: 'wx' });
         paths.push(scPath);
-        await fs.writeFile(join(subagentsDir, `${stem}.meta.json`), JSON.stringify(meta), 'utf8');
+        await fs.writeFile(join(subagentsDir, `${stem}.meta.json`), JSON.stringify(meta), { encoding: 'utf8', flag: 'wx' });
         paths.push(`${scPath}.meta.json`);
       }
     }
