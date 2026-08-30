@@ -9,7 +9,7 @@
  * 数据全部经 props.backend 注入，组件不知道宿主是 Electron 还是插件。
  * 视觉：左侧竖排进度轨 + 右侧步骤舞台；步骤切换带方向感知滑动。
  */
-import { computed, ref } from 'vue';
+import { computed, onUnmounted, ref, watch } from 'vue';
 import type { SessionMeta, ToolId } from '@session-migrate/core';
 import type { MigrateOutcome, MigrationBackend, PreviewPayload, ToolInfo } from '../types.js';
 import ToolSelect from './ToolSelect.vue';
@@ -167,6 +167,7 @@ async function runMigrate() {
   if (!selected.value || !dstTool.value || running.value) return;
   running.value = true;
   runError.value = null;
+  startRunTimer();
   try {
     result.value = await props.backend.migrate({
       srcTool: srcTool.value!,
@@ -182,9 +183,89 @@ async function runMigrate() {
   } catch (e) {
     runError.value = errMsg(e);
   } finally {
+    stopRunTimer();
     running.value = false;
   }
 }
+
+/* 迁移计时（凭单「打印中」状态显示已运行秒数） */
+const runElapsed = ref(0);
+let runTimer: ReturnType<typeof setInterval> | null = null;
+function startRunTimer(): void {
+  runElapsed.value = 0;
+  runTimer = setInterval(() => {
+    runElapsed.value += 1;
+  }, 1000);
+}
+function stopRunTimer(): void {
+  if (runTimer) {
+    clearInterval(runTimer);
+    runTimer = null;
+  }
+}
+
+/* 凭单序列号：源会话 id 的前 8 位大写 */
+const ticketSerial = computed(() => {
+  const id = (selected.value?.sessionId ?? '').replace(/^session-/, '');
+  return id ? `No. ${id.slice(0, 8).toUpperCase()}` : 'No. ————';
+});
+
+/* ── 目标库现状扫描：写入前的实地确认（独立于迁移执行，不阻塞） ── */
+
+const dstScan = ref<{ loading: boolean; count: number | null; latest: number | null; error: string | null }>({
+  loading: false,
+  count: null,
+  latest: null,
+  error: null,
+});
+let dstScanSeq = 0;
+let dstScanTimer: ReturnType<typeof setTimeout> | null = null;
+
+async function scanTarget(tool: ToolId, root: string): Promise<void> {
+  const seq = ++dstScanSeq;
+  dstScan.value = { loading: true, count: null, latest: null, error: null };
+  try {
+    const metas = await props.backend.listSessions(tool, root.trim() || undefined);
+    if (seq !== dstScanSeq) return;
+    let latest = 0;
+    for (const m of metas) {
+      const ts = m.createdAt ?? 0;
+      if (ts > latest) latest = ts;
+    }
+    dstScan.value = { loading: false, count: metas.length, latest: latest || null, error: null };
+  } catch (e) {
+    if (seq !== dstScanSeq) return;
+    dstScan.value = { loading: false, count: null, latest: null, error: errMsg(e) };
+  }
+}
+
+watch([dstTool, dstRoot], ([tool, root], [prevTool, prevRoot]) => {
+  if (dstScanTimer) {
+    clearTimeout(dstScanTimer);
+    dstScanTimer = null;
+  }
+  if (!tool) {
+    dstScanSeq++;
+    dstScan.value = { loading: false, count: null, latest: null, error: null };
+    return;
+  }
+  if (tool === prevTool && root === prevRoot) return;
+  // 输入防抖；大库扫描在 worker 里跑，UI 侧凭单行只显示流动条
+  dstScanTimer = setTimeout(() => void scanTarget(tool, root), 320);
+});
+
+function fmtAgo(ts: number): string {
+  const d = Date.now() - ts;
+  if (d < 60_000) return '刚刚';
+  if (d < 3_600_000) return `${Math.floor(d / 60_000)} 分钟前`;
+  if (d < 86_400_000) return `${Math.floor(d / 3_600_000)} 小时前`;
+  return `${Math.floor(d / 86_400_000)} 天前`;
+}
+
+onUnmounted(() => {
+  if (dstScanTimer) clearTimeout(dstScanTimer);
+  stopRunTimer();
+});
 
 async function openResultPath(p: string) {
   await props.backend.openPath(p);
@@ -223,9 +304,9 @@ function stepIndex(s: Step): number {
   return STEP_LABELS.findIndex((x) => x.key === s);
 }
 
-/** 进度轨允许点回已走过的步骤（完成页除外，避免半途重置状态）。 */
+/** 进度轨允许点回已走过的步骤（完成页/迁移进行中除外）。 */
 function railClick(s: { key: Step }, i: number) {
-  if (step.value === 'done') return;
+  if (step.value === 'done' || running.value) return;
   if (i < stepIndex(step.value)) navTo(s.key, 'back');
 }
 
@@ -382,71 +463,120 @@ function startDrag(e: MouseEvent) {
             </button>
           </div>
 
-          <!-- 步骤 3：目标配置 -->
-          <div v-else-if="step === 'target'" class="pane pane--scroll">
-            <div class="target-grid">
-              <TargetConfig
-                v-model:selected="dstTool"
-                v-model:root="dstRoot"
-                v-model:target-cwd="targetCwd"
-                v-model:flatten="flatten"
-                v-model:keep-synthetic="keepSynthetic"
-                :tools="tools"
-                :root-placeholder="dstToolDefaultRoot"
-                :source-cwd="selected?.cwd"
-                :show-flatten="showFlatten"
-                :show-keep-synthetic="true"
-                @browse-root="browseRoot"
-                @browse-cwd="browseCwd"
-              />
+          <!-- 步骤 3：目标配置（宽窗双栏：左配置轨道 · 右迁移凭单；窄窗单列） -->
+          <div v-else-if="step === 'target'" class="pane target-pane">
+            <div class="target-scroll">
+              <div class="target-grid sm-stagger">
+                <div class="tc-main" :style="{ '--i': 0 }" :inert="running">
+                  <TargetConfig
+                    v-model:selected="dstTool"
+                    v-model:root="dstRoot"
+                    v-model:target-cwd="targetCwd"
+                    v-model:flatten="flatten"
+                    v-model:keep-synthetic="keepSynthetic"
+                    :tools="tools"
+                    :root-placeholder="dstToolDefaultRoot"
+                    :source-cwd="selected?.cwd"
+                    :show-flatten="showFlatten"
+                    :show-keep-synthetic="true"
+                    :loading="tools.length === 0 && !loadError"
+                    @browse-root="browseRoot"
+                    @browse-cwd="browseCwd"
+                  />
+                </div>
 
-              <div class="confirm sm-stagger">
-                <p class="sm-tag confirm-tag" :style="{ '--i': 0 }">迁移计划 · PLAN</p>
-                <div class="confirm-flow" :style="{ '--i': 1 }">
-                  <span class="cf-tool">
-                    <i class="sm-tag">源</i>
-                    {{ srcToolInfo?.label ?? srcTool }}
-                  </span>
-                  <svg class="cf-arrow" viewBox="0 0 40 10" aria-hidden="true">
-                    <path d="M0 5h34" /><path d="M30 1l5 4-5 4" />
-                  </svg>
-                  <span class="cf-tool cf-tool--dst">
-                    <i class="sm-tag">目标</i>
-                    {{ dstToolInfo?.label ?? '—' }}
+                <!-- 迁移凭单：票根质感（打孔线 + 条码），需要与配置区整体分隔 -->
+                <aside class="ticket" :style="{ '--i': 1 }">
+                  <header class="tk-head">
+                    <span class="sm-tag">迁移凭单 · MANIFEST</span>
+                    <span class="tk-serial sm-mono">{{ ticketSerial }}</span>
+                  </header>
+                  <div class="tk-perf" aria-hidden="true">
+                    <i class="tk-notch tk-notch--l" /><i class="tk-notch tk-notch--r" />
+                  </div>
+
+                  <div v-if="!running" class="tk-body">
+                    <div class="confirm-flow">
+                      <span class="cf-tool">
+                        <i class="sm-tag">源</i>
+                        {{ srcToolInfo?.label ?? srcTool }}
+                      </span>
+                      <svg class="cf-arrow" viewBox="0 0 40 10" aria-hidden="true">
+                        <path d="M0 5h34" /><path d="M30 1l5 4-5 4" />
+                      </svg>
+                      <span class="cf-tool cf-tool--dst">
+                        <i class="sm-tag">目标</i>
+                        {{ dstToolInfo?.label ?? '—' }}
+                      </span>
+                    </div>
+                    <dl class="confirm-rows">
+                      <div class="cr">
+                        <dt>会话</dt>
+                        <dd class="sm-mono">{{ selected?.title || selected?.sessionId }}</dd>
+                      </div>
+                      <div class="cr">
+                        <dt>写入</dt>
+                        <dd class="sm-mono">{{ dstRoot.trim() || dstToolDefaultRoot }}</dd>
+                      </div>
+                      <div class="cr">
+                        <dt>cwd</dt>
+                        <dd class="sm-mono">{{ targetCwd.trim() || selected?.cwd || '（沿用源 cwd）' }}</dd>
+                      </div>
+                      <div v-if="dstTool" class="cr">
+                        <dt>目标库</dt>
+                        <dd v-if="dstScan.loading" class="tk-scan-live">
+                          <span class="sm-flow tk-scan-flow" aria-label="正在读取目标存储" />
+                        </dd>
+                        <dd v-else-if="dstScan.error" class="tk-scan-err" :title="dstScan.error">
+                          无法读取该位置 · 不影响写入
+                        </dd>
+                        <dd v-else-if="dstScan.count !== null">
+                          <b class="sm-mono tk-scan-n">{{ dstScan.count }}</b> 个会话<template v-if="dstScan.latest"> · 最近 {{ fmtAgo(dstScan.latest) }}</template>
+                        </dd>
+                        <dd v-else>—</dd>
+                      </div>
+                      <div v-if="showFlatten || keepSynthetic" class="cr">
+                        <dt>选项</dt>
+                        <dd>
+                          <template v-if="showFlatten">旁链：{{ flatten ? '展平' : '保留原生' }}</template>
+                          <template v-if="showFlatten && keepSynthetic"> · </template>
+                          <template v-if="keepSynthetic">保留运行时上下文</template>
+                        </dd>
+                      </div>
+                    </dl>
+                    <p v-if="!dstRoot.trim()" class="confirm-warn">
+                      ※ 未指定自定义目录，将写入目标工具的默认真实存储位置（新会话，不覆盖已有数据）。
+                    </p>
+                  </div>
+
+                  <!-- 迁移中：凭单进入「打印」状态 — 骨架 + 流动条 + 计时，绝不静止卡住 -->
+                  <div v-else class="tk-run" aria-live="polite">
+                    <div class="sm-flow" />
+                    <div class="tk-run-sk" aria-hidden="true">
+                      <span class="sm-sk" style="width: 74%" />
+                      <span class="sm-sk" style="width: 90%" />
+                      <span class="sm-sk" style="width: 42%" />
+                    </div>
+                    <p class="tk-run-hint">
+                      正在写入 {{ dstToolInfo?.label ?? '目标' }} 存储<span class="sm-mono tk-run-sec">· {{ runElapsed }}s</span>
+                    </p>
+                  </div>
+
+                  <footer class="tk-foot" aria-hidden="true">
+                    <span class="tk-bar" />
+                    <span class="tk-foot-serial sm-mono">{{ ticketSerial }}</span>
+                  </footer>
+                </aside>
+
+                <div v-if="showFlatten && dstTool && srcTool && dstTool !== srcTool" class="side-note" :style="{ '--i': 2 }">
+                  <span class="sn-mark" aria-hidden="true">※</span>
+                  <span>
+                    检测到{{ SIDECHAIN_TOOL_NAMES[srcTool] ? ` ${SIDECHAIN_TOOL_NAMES[srcTool]}` : '' }}旁链语义。
+                    {{ dstTool === 'opencode' || dstTool === 'zcode'
+                      ? '默认展平为顶层消息（可直接续聊）；关闭则压回目标工具的隐藏任务 / 子会话形态。'
+                      : '默认按目标工具的原生旁链形态保留；开启则展平为顶层消息。' }}
                   </span>
                 </div>
-                <dl class="confirm-rows" :style="{ '--i': 2 }">
-                  <div class="cr">
-                    <dt>会话</dt>
-                    <dd class="sm-mono">{{ selected?.title || selected?.sessionId }}</dd>
-                  </div>
-                  <div class="cr">
-                    <dt>写入</dt>
-                    <dd class="sm-mono">{{ dstRoot.trim() || dstToolDefaultRoot }}</dd>
-                  </div>
-                  <div class="cr">
-                    <dt>cwd</dt>
-                    <dd class="sm-mono">{{ targetCwd.trim() || selected?.cwd || '（沿用源 cwd）' }}</dd>
-                  </div>
-                  <div v-if="showFlatten || keepSynthetic" class="cr">
-                    <dt>选项</dt>
-                    <dd>
-                      <template v-if="showFlatten">旁链：{{ flatten ? '展平' : '保留原生' }}</template>
-                      <template v-if="showFlatten && keepSynthetic"> · </template>
-                      <template v-if="keepSynthetic">保留运行时上下文</template>
-                    </dd>
-                  </div>
-                </dl>
-                <p v-if="!dstRoot.trim()" class="confirm-warn" :style="{ '--i': 3 }">
-                  未指定自定义目录，将写入目标工具的默认真实存储位置（新会话，不覆盖已有数据）。
-                </p>
-              </div>
-
-              <div v-if="showFlatten && dstTool && srcTool && dstTool !== srcTool" class="side-note">
-                检测到{{ SIDECHAIN_TOOL_NAMES[srcTool] ? ` ${SIDECHAIN_TOOL_NAMES[srcTool]}` : '' }}旁链语义。
-                {{ dstTool === 'opencode' || dstTool === 'zcode'
-                  ? '默认展平为顶层消息（可直接续聊）；关闭则压回目标工具的隐藏任务 / 子会话形态。'
-                  : '默认按目标工具的原生旁链形态保留；开启则展平为顶层消息。' }}
               </div>
 
               <div v-if="runError" class="pane-error">{{ runError }}</div>
@@ -707,9 +837,6 @@ function startDrag(e: MouseEvent) {
 .pane--fill {
   min-height: 0;
 }
-.pane--scroll {
-  overflow-y: auto;
-}
 
 /* 步骤切换动效 */
 .wz-fwd-enter-active,
@@ -783,38 +910,182 @@ body.sv-resizing .split-divider {
   padding: 0 2px 0 12px;
 }
 
-/* 目标步骤布局 */
-.target-grid {
-  max-width: 760px;
-  min-width: 0;
-  display: flex;
-  flex-direction: column;
+/* ── 目标步骤：宽窗双栏（左配置轨道 · 右凭单），窄窗单列 ───── */
+.target-pane {
   gap: 10px;
 }
+.target-scroll {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding-right: 2px;
+}
+.target-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  align-items: start;
+  gap: 6px 40px;
+  padding: 2px 0 8px;
+}
+.tc-main {
+  min-width: 0;
+}
 .side-note {
+  display: flex;
+  gap: 8px;
   font-size: 12px;
   color: var(--fg-1);
   line-height: 1.7;
-  background: var(--ink-1);
-  border: 1px solid var(--line-0);
-  border-left: 2px solid var(--warn);
-  border-radius: 8px;
-  padding: 10px 14px;
+  padding: 2px 2px 0;
+}
+.sn-mark {
+  flex: none;
+  color: var(--warn);
 }
 
-/* 迁移计划（无卡片：一段悬于页面上的确认信息，仅以虚线与上文分隔） */
-.confirm {
-  padding: 14px 2px 2px;
+@media (min-width: 1100px) {
+  .target-grid {
+    grid-template-columns: minmax(0, 1fr) 336px;
+  }
+  .tc-main {
+    grid-column: 1;
+    grid-row: 1;
+  }
+  .ticket {
+    grid-column: 2;
+    grid-row: 1;
+    position: sticky;
+    top: 2px;
+  }
+  .side-note {
+    grid-column: 1;
+  }
+}
+
+/* 迁移凭单：票根质感（打孔线 + 条码），替代通用计划卡片 */
+.ticket {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  max-width: 420px;
+  background: var(--ink-0);
+  border: 1px solid var(--line-1);
+  border-radius: 12px;
+  padding: 13px 16px 12px;
+}
+.tk-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+}
+.tk-serial {
+  font-size: 10.5px;
+  color: var(--fg-1);
+  letter-spacing: 0.08em;
+}
+.tk-perf {
+  position: relative;
+  margin: 12px -16px;
   border-top: 1px dashed var(--line-1);
 }
-.confirm-tag {
-  margin: 0 0 14px;
+.tk-notch {
+  position: absolute;
+  top: -6px;
+  width: 11px;
+  height: 11px;
+  border-radius: 50%;
+  background: #ffffff;
+  border: 1px solid var(--line-1);
 }
+.tk-notch--l {
+  left: -6px;
+}
+.tk-notch--r {
+  right: -6px;
+}
+.tk-body {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding-top: 2px;
+}
+.tk-run {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 6px 0 2px;
+}
+.tk-run-sk {
+  display: flex;
+  flex-direction: column;
+  gap: 9px;
+}
+.tk-run-sk .sm-sk {
+  display: block;
+  height: 11px;
+  border-radius: 5px;
+}
+.tk-run-hint {
+  margin: 0;
+  font-size: 12px;
+  color: var(--fg-1);
+  line-height: 1.6;
+}
+.tk-run-sec {
+  margin-left: 6px;
+  color: var(--fg-2);
+  font-size: 11px;
+}
+.tk-foot {
+  margin-top: auto;
+  padding-top: 12px;
+  border-top: 1px dashed var(--line-1);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 5px;
+}
+.tk-bar {
+  width: 82%;
+  height: 20px;
+  opacity: 0.62;
+  background: repeating-linear-gradient(
+    90deg,
+    var(--fg-0) 0 1px,
+    transparent 1px 4px,
+    var(--fg-0) 4px 5px,
+    transparent 5px 7px,
+    var(--fg-0) 7px 10px,
+    transparent 10px 12px,
+    var(--fg-0) 12px 13px,
+    transparent 13px 17px
+  );
+}
+.tk-foot-serial {
+  font-size: 9px;
+  letter-spacing: 0.34em;
+  color: var(--fg-2);
+}
+.tk-scan-live {
+  display: flex;
+}
+.tk-scan-flow {
+  width: 120px;
+  margin-top: 7px;
+}
+.tk-scan-err {
+  color: var(--fg-2);
+}
+.tk-scan-n {
+  color: var(--acc-ink);
+  font-weight: 600;
+}
+
 .confirm-flow {
   display: flex;
   align-items: center;
   gap: 12px;
-  margin-bottom: 14px;
 }
 .cf-tool {
   display: inline-flex;
@@ -855,7 +1126,7 @@ body.sv-resizing .split-divider {
 }
 .cr dt {
   flex: none;
-  width: 34px;
+  width: 42px;
   font-size: 12px;
   color: var(--fg-2);
 }
@@ -867,12 +1138,10 @@ body.sv-resizing .split-divider {
   line-height: 1.6;
 }
 .confirm-warn {
-  margin: 12px 0 0;
+  margin: 0;
   font-size: 12px;
   color: var(--warn);
   line-height: 1.7;
-  border-top: 1px dashed var(--line-1);
-  padding-top: 10px;
 }
 
 /* 结果（无卡片，仪式感靠对勾动效本身） */
