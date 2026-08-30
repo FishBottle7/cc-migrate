@@ -211,3 +211,12 @@
 - **turn_context / world_state verbatim 重放**：仅 `session_meta.cwd` 按 targetCwd 重映射；turn 行内嵌的 cwd 不改写（保留源轮次原貌）。
 - **client_authored 信封**：response_item 行的 `metadata.client_authored` 读端入 `meta.codex.clientAuthored`，写端逐行还原。
 - **§8 表格更新**：AGENTS.md 行 `contentKind:'agents_md.instructions'`（非 synthetic）；注入行 contentKind 一律用官方点分 kind 值。
+- **event_msg 回写门控**（§5 持久化子集的写端落实）：`unmappedEvents` 重放默认分支只发内层 `type` 命中**持久化变体名单**的载荷（`task_started`/`token_count`/`thread_rolled_back` 等两模式持久项 + legacy-only 项，两种 wire 拼写都收）；官方已退役的类型（`thread_name_updated`/`guardian_assessment`/`undo_completed`，codex line_parser 以 `Ok(None)` 跳过）和非 codex tag 一律不回写——不发注定被官方工具链丢弃的行（AGENT.md 事件跨工具共识）。另注：unmappedEvents 重放整体包在 `sessionCodex` 守卫内，**外来 IR 的事件本来就不写进 codex 文件**。
+
+### 11.3 待办：外来→codex 的轮边界合成（条件触发，未实现）
+
+外来 IR（dsh/claude/…）写 codex 时，消息投影为裸 `response_item` 流，**不含任何 `task_started`/`task_complete`**（源侧轮边界事件在 `unmappedEvents` 里且被 `sessionCodex` 守卫拦下）。codex resume 重建按 turn 事件对分段（rollout_reconstruction.rs 反向扫描），没有这些事件 = 整个迁移会话被当作**一整轮**：resume/加载正常，但粒度全错——`thread_rolled_back {num_turns:1}` 会回滚整个会话（本应只回滚最后一个 prompt），UI 轮次分组也是一坨。
+
+**方案**（= 给 codex 写端补上 dsh 骨架合成器的对等能力，官方 external-agent-migration 导入器同款做法，见 §6 最小可 resume 集）：写端遍历 `ir.messages`，**真实**用户 prompt（非 synthetic、无 contentKind/kind，与标题推断同规则）开启新轮 `task_started {turn_id: N}`（N 从 1 递增），下一条真实用户 prompt 或流末尾收轮 `task_complete {turn_id: N, last_agent_message: <末条 assistant 文本>}`。是否同时伪造 `user_message`/`agent_message`/`token_count`（官方导入器连这些也伪造）待定——它们是 legacy-only 持久项，paginated 目标不需要。
+
+**触发条件**：迁移会话在 codex 里实际使用后发现轮次粒度影响回滚/展示，再做；实现前须拿真实迁移文件验证 resume 行为（反向扫描对合成事件的接受度）。
