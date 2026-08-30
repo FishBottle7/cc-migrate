@@ -701,9 +701,48 @@ function emitUnmapped(lines: RolloutLineRaw[], ev: MigratedUnmappedEvent, pagina
     return;
   }
   // Default: a persisted EventMsg — its payload (including the inner type tag)
-  // was stored verbatim in `data`.
-  lines.push(line(ts, ordinal, 'event_msg', data));
+  // was stored verbatim in `data`. Only emit payloads carrying a type tag that
+  // policy.rs still persists: retired types (thread_name_updated,
+  // guardian_assessment, undo_completed — codex's own line_parser retires them
+  // via Ok(None)) and foreign harness tags would be rows the official tooling
+  // always drops (AGENT.md 事件共识: 不发注定被跳过的行). They stay in the IR.
+  const innerType = (data as Record<string, unknown> | undefined)?.type;
+  if (typeof innerType === 'string' && PERSISTED_EVENT_MSG_TYPES.has(innerType)) {
+    lines.push(line(ts, ordinal, 'event_msg', data));
+  }
 }
+
+/**
+ * EventMsg variants codex persists (docs/agents/codex.md §5, policy.rs:90-135).
+ * Includes both wire spellings of the turn aliases and the legacy-mode-only
+ * set; anything else (retired / foreign / transient) is not written back.
+ */
+const PERSISTED_EVENT_MSG_TYPES = new Set([
+  // persisted in both modes
+  'item_completed',
+  'token_count',
+  'thread_goal_updated',
+  'thread_rolled_back',
+  'turn_aborted',
+  'turn_started',
+  'task_started',
+  'turn_complete',
+  'task_complete',
+  'thread_settings_applied',
+  // legacy-mode-only persisted
+  'user_message',
+  'agent_message',
+  'agent_reasoning',
+  'agent_reasoning_raw',
+  'entered_review_mode',
+  'exited_review_mode',
+  'patch_apply_end',
+  'context_compacted',
+  'mcp_tool_call_end',
+  'web_search_end',
+  'image_generation_end',
+  'sub_agent_activity',
+]);
 
 const ROLLOUT_RECORD_TAGS = new Set([
   'security_risk_score',

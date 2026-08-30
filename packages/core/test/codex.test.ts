@@ -946,3 +946,30 @@ test('write: foreign sidechains expand to independent subagent rollout files (re
   const childMetaRow = metas.find((m) => m.sessionId === childThreadId);
   assert.equal(childMetaRow?.parentSessionId, mainId);
 });
+
+test('write: unmapped event_msg replay gates on persisted EventMsg variants', async () => {
+  const adapter = new CodexAdapter();
+  const root = await tempRoot();
+  const ir: MigratedSession = {
+    schemaVersion: 2,
+    originTool: 'codex',
+    originSessionId: 'gate-1',
+    createdAt: Date.parse(TS),
+    cwd: 'D:\proj',
+    messages: [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }],
+    meta: { codex: { sessionMetaLine: { ts: TS, payload: { id: 'gate-1', session_id: 'gate-1', cli_version: '1', source: 'cli' } } } },
+    unmappedEvents: [
+      // retired by codex's own line_parser (should_skip_retired_record)
+      { seq: 1, time: 1001, type: 'thread_name_updated', data: { type: 'thread_name_updated', thread_name: 'x' } },
+      // foreign harness tag riding a codex-namespaced IR
+      { seq: 2, time: 1002, type: 'turn/start', data: { type: 'turn/start', turn: 1 } },
+      // a persisted variant — must still replay
+      { seq: 3, time: 1003, type: 'task_started', data: { type: 'task_started', turn_id: 't1' } },
+    ],
+  };
+  const res = await adapter.write(ir, { root, targetCwd: 'D:\proj', keepSynthetic: true });
+  const lines = (await fs.readFile(res.paths[0]!, 'utf8')).split('\n').filter((l) => l.trim()).map((l) => JSON.parse(l)) as Array<{ type: string; payload?: Record<string, unknown> }>;
+  const eventRows = lines.filter((l) => l.type === 'event_msg');
+  const tags = eventRows.map((l) => l.payload?.type);
+  assert.deepEqual(tags, ['task_started'], 'only persisted variants replay; retired + foreign tags stay in the IR');
+});
