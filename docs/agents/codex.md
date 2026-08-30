@@ -164,7 +164,7 @@
 | `security_risk_score` / `realtime_item` / 未知行 | `unmappedEvents[]`（type 保留） | 归档不投影 |
 | 文件名 ts / 目录层级 | 写回按 `createdAt` 本地时间重建目录；文件名 ts 用 UTC 渲染同款格式 | §4 |
 | session_index 标题 | `session.title`；写回时 `session.meta.codex.sessionIndex = {thread_name, updated_at}` | **追加**一行，不改既有行 |
-| 子代理 rollout（`source.subagent.thread_spawn`） | 同层独立会话（`session.meta.codex` 带 parent_thread_id）；选装聚合为 `sidechains[]`（agentId=threadId, kind='subagent', agentType=agent_role） | 深度/昵称/agent_path 均在 meta |
+| 子代理 rollout（`source.subagent.thread_spawn`） | 同层独立会话（`session.meta.codex` 带 parent_thread_id）；**读端已聚合**为 `sidechains[]`（agentId=threadId, kind='subagent', agentType=agent_nickname→agent_role→agent_path 尾段；孙代嵌套 `sidechains[]`；`parentMessageId`=召唤 call id，见 §11.2） | 深度/昵称/agent_path 均在 meta |
 
 ## 9. IR→codex 写回配方
 
@@ -212,6 +212,7 @@
 - **client_authored 信封**：response_item 行的 `metadata.client_authored` 读端入 `meta.codex.clientAuthored`，写端逐行还原。
 - **§8 表格更新**：AGENTS.md 行 `contentKind:'agents_md.instructions'`（非 synthetic）；注入行 contentKind 一律用官方点分 kind 值。
 - **event_msg 回写门控**（§5 持久化子集的写端落实）：`unmappedEvents` 重放默认分支只发内层 `type` 命中**持久化变体名单**的载荷（`task_started`/`token_count`/`thread_rolled_back` 等两模式持久项 + legacy-only 项，两种 wire 拼写都收）；官方已退役的类型（`thread_name_updated`/`guardian_assessment`/`undo_completed`，codex line_parser 以 `Ok(None)` 跳过）和非 codex tag 一律不回写——不发注定被官方工具链丢弃的行（AGENT.md 事件跨工具共识）。另注：unmappedEvents 重放整体包在 `sessionCodex` 守卫内，**外来 IR 的事件本来就不写进 codex 文件**。
+- **子代理读端拼装 + 召唤点锚定**（§8 子代理行的落地）：`parse()` 后对全 home 每个 rollout 做**首行** meta 扫描（子文件首行必为自己的 meta，见 §1 表格第 1 行"多条 session_meta"；64KB 分块 / 512KB 上限 / `.zst` 解压；`subagentIndexCache` 5s TTL），按 `thread_spawn.parent_thread_id` 建 parent→children 索引——严格 `thread_spawn`/`thread_source==='subagent'` 守卫，用户 fork（`forked_from_id`）不算；递归解析子线程拼进 `ir.sidechains[]`（孙代嵌套；agentType = agent_nickname → agent_role → agent_path 尾段；visited 集防环）。**召唤点**：父 rollout 的 `spawn_agent` function_call `task_name` == 子线程 `agent_path` 尾段（0.146 实测 `/root/realtime_preemptive_slice/preemptive_review` ← `task_name:"preemptive_review"`）→ `sidechain.parentMessageId` = 该 call_id，GUI 据此把子代理锚到派发行做「跳转到召唤处」。GUI 投射（worker）：嵌套旁链拍平展示；注入行按 IR `meta.codex.contentKind`（及 kind `iac`/`compaction_summary`）投 `injectionKind`——`agent_message` 是真助手消息，不算注入；AGENTS.md 指令行是非 synthetic 注入的典型（§7.2 规则 5 的 GUI 侧消费）。
 
 ### 11.3 待办：外来→codex 的轮边界合成（条件触发，未实现）
 
