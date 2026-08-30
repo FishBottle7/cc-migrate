@@ -99,7 +99,7 @@ function dshImageToFileBlock(rec: Record<string, unknown>): ContentBlock | undef
 }
 
 import { promises as fs } from 'node:fs';
-import { join, dirname } from 'node:path';
+import { isAbsolute, join, dirname } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import type { Adapter, WriteOptions, WriteResult } from '../../registry.js';
 import type {
@@ -326,7 +326,14 @@ export class DshAdapter implements Adapter {
     validateSession(ir);
     const sessionsRoot = opts?.root ?? defaultDshRoot();
     if (!sessionsRoot) throw new Error('DSH: cannot resolve ~/.dsh/sessions');
-    const cwd = opts?.targetCwd ?? ir.cwd ?? '';
+    const requestedCwd = opts?.targetCwd ?? ir.cwd ?? '';
+    // DSH validates header.cwd with path.isAbsolute and refuses the whole
+    // session otherwise (SessionPersistenceCorruptionError). A cwd that came
+    // from a listing projection (encoded project-dir skeleton like
+    // "D-codes-foo") or a hand-typed relative path must never reach the
+    // header — degrade to a cwd-less session (DSH parks it under `_no-cwd`)
+    // instead of writing an unloadable artifact.
+    const cwd = requestedCwd && isAbsolute(requestedCwd) ? requestedCwd : '';
     const newId = opts?.sessionId ?? `session-${randomUUID()}`;
     // Keep original wall-clock for fidelity. Sorting as "newest" is handled
     // by the (migrated) title suffix + header id ordering; don't bump
@@ -528,15 +535,27 @@ export class DshAdapter implements Adapter {
         try {
           const st = await fs.stat(log);
           let title = titles.get(sid);
-          if (title === undefined) {
-            const buf = await fs.readFile(log);
-            title = scanTitleFromLog(buf);
+          // Real cwd comes from the header line (first zstd frame only).
+          // The project dir name is a one-way encoding — deriving "cwd" from
+          // it yields skeletons like "D-codes-foo" that DSH's header validator
+          // (isAbsolute) rightly refuses if they ever reach a write.
+          let headerCwd: string | undefined;
+          const buf = await fs.readFile(log);
+          if (title === undefined) title = scanTitleFromLog(buf);
+          try {
+            const headLine = readFirstFrameLine(buf);
+            const parsed = headLine ? (JSON.parse(headLine) as { cwd?: unknown }) : undefined;
+            if (parsed && typeof parsed.cwd === 'string' && parsed.cwd && isAbsolute(parsed.cwd)) {
+              headerCwd = parsed.cwd;
+            }
+          } catch {
+            // unreadable header → leave cwd unknown
           }
           metas.push({
             tool: 'dsh',
             sessionId: sid,
             ...(title !== undefined ? { title } : {}),
-            cwd: proj === '_no-cwd' ? undefined : cwdFromProjectKey(proj),
+            ...(headerCwd !== undefined ? { cwd: headerCwd } : {}),
             createdAt: st.mtimeMs,
             sourcePath: log,
             ...(archived.has(sid) ? { archived: true } : {}),
@@ -1258,22 +1277,73 @@ export function irToEvents(ir: MigratedSession, baseTime: number): DshEvent[] {
   // turn/start + step/start context they appear under (a mismatch or an
   // event before its turn/start aborts history load with "received an
   // update before its start Match").
+  //
+  // Foreign-origin IRs (claude/codex/opencode/zcode) carry no turn/step
+  // lifecycle events, so synthesize the skeleton on the fly: `turn/start
+  // {turn}` before the first event of each turn, `step/start {turn,step}`
+  // before the first event of each (turn, step). Sources that already carry
+  // native starts (dsh→dsh) mark their turns/steps as seen and get no
+  // duplicates — a second start match on one context is itself a hard load
+  // error ("received more than one start Match").
   let curTurn = 1;
   let curStep = 1;
+  const startedTurns = new Set<number>();
+  const startedSteps = new Set<string>();
+  const withSkeleton: typeof merged = [];
   for (const entry of merged) {
-    if ((entry as { __packed?: boolean }).__packed) continue;
+    if ((entry as { __packed?: boolean }).__packed) {
+      // packed chunk rows only exist in dsh→dsh logs (native steps already
+      // started); pass through untouched.
+      withSkeleton.push(entry);
+      continue;
+    }
     const r = entry as Raw;
     const d = r.data as Record<string, unknown> | undefined;
     if (r.type === 'turn/start') {
-      if (typeof d?.turn === 'number') curTurn = d.turn;
-    } else if (r.type === 'step/start') {
+      if (typeof d?.turn === 'number') {
+        curTurn = d.turn;
+        curStep = 1;
+        startedTurns.add(curTurn);
+      }
+      withSkeleton.push(entry);
+      continue;
+    }
+    if (r.type === 'step/start') {
       if (typeof d?.turn === 'number') curTurn = d.turn;
       if (typeof d?.step === 'number') curStep = d.step;
+      startedTurns.add(curTurn);
+      startedSteps.add(`${curTurn}:${curStep}`);
+      withSkeleton.push(entry);
+      continue;
+    }
+    // Effective coordinates of this event: tool/call rows carry explicit
+    // turn/step in data; assistant/message + tool/result take the running
+    // cursor (stamped below).
+    let evTurn: number | undefined;
+    let evStep: number | undefined;
+    if (r.type === 'tool/call') {
+      if (typeof d?.turn === 'number') evTurn = d.turn;
+      if (typeof d?.step === 'number') evStep = d.step;
     } else if (r.type === 'assistant/message' || r.type === 'tool/result') {
+      evTurn = curTurn;
+      evStep = curStep;
+    }
+    if (evTurn !== undefined && !startedTurns.has(evTurn)) {
+      startedTurns.add(evTurn);
+      withSkeleton.push({ time: r.time, type: 'turn/start', data: { turn: evTurn } } as unknown as Raw);
+    }
+    if (evTurn !== undefined && evStep !== undefined && !startedSteps.has(`${evTurn}:${evStep}`)) {
+      startedSteps.add(`${evTurn}:${evStep}`);
+      withSkeleton.push({ time: r.time, type: 'step/start', data: { turn: evTurn, step: evStep } } as unknown as Raw);
+    }
+    if (r.type === 'assistant/message' || r.type === 'tool/result') {
       (r.data as Record<string, unknown>).turn = curTurn;
       (r.data as Record<string, unknown>).step = curStep;
     }
+    withSkeleton.push(entry);
   }
+  merged.length = 0;
+  merged.push(...withSkeleton);
 
   // Now assign seq contiguously over the *expanded* event stream.
   // Walk merged; normal events consume 1 seq, packed rows consume
@@ -1397,13 +1467,6 @@ function buildSessionFrame(headerJson: string): Buffer {
 function buildEventsFrame(events: DshEvent[]): Buffer {
   const lines = events.map((e) => JSON.stringify(e)).join('\n');
   return compressFrame(`${lines}\n`);
-}
-
-function cwdFromProjectKey(proj: string): string | undefined {
-  // best-effort: `--D-codes-foo--` -> `D:\codes\foo` here we keep as decoded-ish.
-  // Real decoding is lossy for separators; we just return the inner key for display.
-  const inner = proj.replace(/^--/, '').replace(/--$/, '');
-  return inner.length ? inner : undefined;
 }
 
 /** DSH side-store path derived from a sessions root (`<dshHome>/sessions`). */

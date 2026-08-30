@@ -768,6 +768,7 @@ test('listSessions: title from projcache, log-scan fallback, archived flag, _no-
   assert.equal(byId.get('sess-a')?.archived, undefined);
   assert.ok(byId.has('sess-c'), '_no-cwd sessions are listed');
   assert.equal(byId.get('sess-c')?.cwd, undefined, '_no-cwd has no cwd hint');
+  assert.equal(byId.get('sess-a')?.cwd, 'D:\\proj', 'cwd is the real header value, not the project-key skeleton');
 });
 
 test('readDshAttachment resolves content-addressed bytes (sha256: ref and bare hex)', async () => {
@@ -780,4 +781,75 @@ test('readDshAttachment resolves content-addressed bytes (sha256: ref and bare h
   assert.deepEqual(await readDshAttachment(hash, root), Buffer.from('PNGBYTES'));
   assert.equal(await readDshAttachment('sha256:' + 'cd'.repeat(32), root), null, 'missing object -> null');
   assert.equal(await readDshAttachment('not-a-hash', root), null, 'malformed id -> null');
+});
+
+test('write drops a non-absolute cwd (encoded dir-name skeleton) instead of writing an unloadable header', async () => {
+  // Regression: DSH validates header.cwd with path.isAbsolute and refuses the
+  // whole session ("session header cwd must be an absolute path"). A listing
+  // projection like "D-codes-foo" used to ride into the header verbatim.
+  const adapter = new DshAdapter();
+  const root = await tempRoot();
+  const ir = { schemaVersion: 2 as const, originTool: 'dsh' as const, messages: [{ role: 'user' as const, content: [{ type: 'text' as const, text: 'x' }] }] };
+  const res = await adapter.write(ir as never, { root, sessionId: 'skel-1', targetCwd: 'D-codes-dshPlugins-opencode2dsh' });
+  assert.ok(res.paths[0]!.includes('_no-cwd'), 'session lands in _no-cwd, not in a bogus project dir');
+  const header = JSON.parse(decompressSessionBuffer(await fs.readFile(res.paths[0]!)).split('\n')[0]);
+  assert.equal(header.cwd, undefined, 'header carries no cwd at all');
+  assert.equal(header.version, 0);
+  // parse back fine
+  const back = await adapter.parse('skel-1', root);
+  assert.equal(back.messages.length, 1);
+});
+
+test('foreign-origin IR gets a turn/start + step/start skeleton (DSH assembler requires the start match)', async () => {
+  // DSH's conversation assembler treats assistant/message as an update of the
+  // `assistant-step` context whose only start is step/start {turn,step} —
+  // without it the assistant content never renders. claude/codex/… IRs have
+  // no such events, so irToEvents synthesizes them.
+  const adapter = new DshAdapter();
+  const root = await tempRoot();
+  const ir = {
+    schemaVersion: 2 as const,
+    originTool: 'claude' as const,
+    createdAt: 1000,
+    messages: [
+      { role: 'user' as const, content: [{ type: 'text' as const, text: 'hi' }] },
+      { role: 'assistant' as const, content: [{ type: 'text' as const, text: 'hello' }] },
+    ],
+  };
+  const res = await adapter.write(ir as never, { root, sessionId: 'skel-2', targetCwd: 'D:\\proj' });
+  const events = decompressSessionBuffer(await fs.readFile(res.paths[0]!)).split('\n').filter((l) => l.trim()).slice(1).map((l) => JSON.parse(l)) as Array<{ seq: number; type: string; data: Record<string, unknown> }>;
+  const ai = events.findIndex((e) => e.type === 'assistant/message');
+  assert.ok(ai > 0, 'assistant message present');
+  const before = events.slice(0, ai).map((e) => e.type);
+  assert.ok(before.includes('turn/start'), 'turn/start precedes the assistant message');
+  assert.ok(before.includes('step/start'), 'step/start precedes the assistant message');
+  assert.equal(events.filter((e) => e.type === 'turn/start').length, 1, 'exactly one turn/start (no duplicate start match)');
+  assert.equal(events.filter((e) => e.type === 'step/start').length, 1, 'exactly one step/start');
+  const stepStart = events.find((e) => e.type === 'step/start');
+  assert.deepEqual(stepStart?.data, { turn: 1, step: 1 });
+  const assistant = events[ai];
+  assert.equal(assistant.data.turn, 1, 'assistant carries explicit turn');
+  assert.equal(assistant.data.step, 1, 'assistant carries explicit step');
+  // seq contiguity over the expanded stream
+  events.forEach((e, i) => assert.equal(e.seq, i, 'seq stays contiguous 0..n-1'));
+});
+
+test('dsh->dsh native turn/start + step/start are not duplicated by the skeleton pass', async () => {
+  const adapter = new DshAdapter();
+  const root = await tempRoot();
+  const events: DshEventLike[] = [
+    { seq: 0, type: 'turn/start', time: 1, data: { turn: 1 } },
+    { seq: 1, type: 'step/start', time: 2, data: { turn: 1, step: 1 } },
+    { seq: 2, type: 'user/message', surfaceOp: 'append', time: 3, data: { id: 'u1', role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: 'q' }] } },
+    { seq: 3, type: 'assistant/message', surfaceOp: 'append', time: 4, data: { turn: 1, step: 1, message: { id: 'a1', role: 'assistant', source: { kind: 'model', provider: 'p', model: 'm' }, content: [{ type: 'text', text: 'a' }] } } },
+  ];
+  const ir = buildIrFromEvents({ id: 'src-skel', createdAt: 1 } as never, events as never);
+  const res = await adapter.write(ir, { root, sessionId: 'skel-3', targetCwd: 'D:\\proj' });
+  const written = decompressSessionBuffer(await fs.readFile(res.paths[0]!)).split('\n').filter((l) => l.trim()).slice(1).map((l) => JSON.parse(l)) as Array<{ type: string }>;
+  assert.equal(written.filter((e) => e.type === 'turn/start').length, 1, 'native turn/start kept, no synthesized twin');
+  assert.equal(written.filter((e) => e.type === 'step/start').length, 1, 'native step/start kept, no synthesized twin');
+  const turnIdx = written.findIndex((e) => e.type === 'turn/start');
+  const stepIdx = written.findIndex((e) => e.type === 'step/start');
+  const ai = written.findIndex((e) => e.type === 'assistant/message');
+  assert.ok(turnIdx < stepIdx && stepIdx < ai, 'native order preserved');
 });
