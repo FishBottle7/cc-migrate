@@ -372,6 +372,9 @@ test('read: 11 record types + 17 response_item variants map losslessly to IR', (
 
   // session naming: codex titles sessions after the user's FIRST REAL prompt —
   // injected rows (AGENTS.md, goal steering, permissions) must not win.
+  // ir.title itself must carry it (codex-as-source: targets consume the name),
+  // not just the write-side session_index helper.
+  assert.equal(session.title, '你好，帮我看看');
   assert.equal(sessionIndexTitle(session), '你好，帮我看看');
 });
 
@@ -871,4 +874,75 @@ test('listSessions: title = first real user prompt (injections skipped) + cwd fr
   assert.equal(kinds?.cwd, 'D:\proj-b');
   assert.ok(kinds?.title?.startsWith('second real prompt'), `title: ${kinds?.title}`);
   assert.ok((kinds?.title?.length ?? 0) <= 61, `title not truncated: ${kinds?.title}`);
+});
+
+test('write: foreign sidechains expand to independent subagent rollout files (recursively)', async () => {
+  const adapter = new CodexAdapter();
+  const root = await tempRoot();
+  const ir: MigratedSession = {
+    schemaVersion: 2,
+    originTool: 'claude',
+    originSessionId: 'src-1',
+    title: 'main with subagent',
+    createdAt: Date.parse(TS),
+    cwd: 'D:\proj',
+    messages: [{ role: 'user', content: [{ type: 'text', text: 'main prompt' }] }],
+    sidechains: [
+      {
+        agentId: 'agent-1',
+        kind: 'subagent',
+        agentType: 'Explore',
+        title: 'explore child',
+        messages: [
+          { role: 'user', content: [{ type: 'text', text: 'child task' }] },
+          { role: 'assistant', content: [{ type: 'text', text: 'child answer' }] },
+        ],
+        sidechains: [
+          {
+            agentId: 'agent-2',
+            kind: 'subagent',
+            messages: [{ role: 'user', content: [{ type: 'text', text: 'grandchild task' }] }],
+          },
+        ],
+      },
+    ],
+  };
+  const res = await adapter.write(ir, { root, targetCwd: 'D:\\proj', keepSynthetic: true });
+  assert.equal(res.paths.length, 3);
+  const mainId = res.sessionId;
+
+  const metaOf = async (p: string) =>
+    JSON.parse((await fs.readFile(p, 'utf8')).split('\n')[0]!).payload as Record<string, unknown>;
+  const childMeta = await metaOf(res.paths[1]!);
+  assert.equal(childMeta.thread_source, 'subagent');
+  const childSpawn = ((childMeta.source as Record<string, unknown>).subagent as Record<string, unknown>).thread_spawn as Record<string, unknown>;
+  assert.equal(childSpawn.parent_thread_id, mainId);
+  assert.equal(childSpawn.depth, 1);
+  assert.equal(childMeta.agent_nickname, 'Explore');
+
+  // grandchild links to the CHILD thread id, depth 2
+  const childIr = await parseRolloutFile(res.paths[1]!, root);
+  const childThreadId = childIr.originSessionId!;
+  assert.notEqual(childThreadId, mainId);
+  const gcMeta = await metaOf(res.paths[2]!);
+  const gcSpawn = ((gcMeta.source as Record<string, unknown>).subagent as Record<string, unknown>).thread_spawn as Record<string, unknown>;
+  assert.equal(gcSpawn.parent_thread_id, childThreadId);
+  assert.equal(gcSpawn.depth, 2);
+
+  // child transcript survives as an independent codex session
+  assert.deepEqual(
+    childIr.messages.map((m) => m.content.map((b) => (b.type === 'text' ? b.text : '')).join('')),
+    ['child task', 'child answer'],
+  );
+
+  // session_index: one appended line per written thread, never a rewrite
+  const idx = await fs.readFile(sessionIndexPath(root), 'utf8');
+  const idxIds = idx.trim().split('\n').map((l) => (JSON.parse(l) as { id: string }).id);
+  assert.equal(idxIds.length, 3);
+  assert.ok(idxIds.includes(mainId));
+
+  // and the tree reads back through listSessions: children hang off the parent
+  const metas = await adapter.listSessions(root);
+  const childMetaRow = metas.find((m) => m.sessionId === childThreadId);
+  assert.equal(childMetaRow?.parentSessionId, mainId);
 });

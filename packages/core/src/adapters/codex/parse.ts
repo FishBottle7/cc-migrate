@@ -431,8 +431,12 @@ export function rolloutRecordsToIr(records: RolloutLineRaw[], ctx: IrBuildContex
   if (baseInstructions?.provenance !== undefined) {
     sessionMeta.baseInstructionsProvenance = baseInstructions.provenance;
   }
-  const title = threadId ? ctx.titles?.get(threadId) : undefined;
-  if (title) sessionMeta.sessionIndex = { thread_name: title };
+  const indexTitle = threadId ? ctx.titles?.get(threadId) : undefined;
+  if (indexTitle) sessionMeta.sessionIndex = { thread_name: indexTitle };
+  // codex names sessions after the user's first real prompt — the index rarely
+  // carries thread_name, so infer it here too (targets consume ir.title; the
+  // same rule sessionIndexTitle applies on the write side).
+  const title = indexTitle ?? titleFromMessages(messages);
   if (ctx.sourcePath) {
     sessionMeta.sourceFile = basename(ctx.sourcePath);
     sessionMeta.sourceDir = splitDir(ctx.sourcePath);
@@ -455,6 +459,25 @@ export function rolloutRecordsToIr(records: RolloutLineRaw[], ctx: IrBuildContex
   };
 }
 
+
+/**
+ * First real user prompt, collapsed to one 60-char line — the codex session
+ * naming convention. Harness-injected rows are skipped via the same fields the
+ * classifier sets (synthetic / contentKind / kind). Shared with the write side
+ * (sessionIndexTitle) so parse and write can never diverge on the rule.
+ */
+export function titleFromMessages(messages: MigratedMessage[]): string | undefined {
+  for (const m of messages) {
+    if (m.role !== 'user' || m.synthetic) continue;
+    const codex = (m.meta as Record<string, unknown> | undefined)?.codex as Record<string, unknown> | undefined;
+    if (codex?.contentKind || codex?.kind) continue;
+    const text = m.content.filter((b) => b.type === 'text').map((b) => (b as { text: string }).text).join('\n').trim();
+    if (!text) continue;
+    const one = text.replace(/\s+/g, ' ');
+    return one.length > 60 ? `${one.slice(0, 60)}…` : one;
+  }
+  return undefined;
+}
 
 /** MigratedUnmappedEvent with optional time (spread keeps it absent, not undefined). */
 function unmappedEvent(seq: number, time: number | undefined, type: string, data: unknown): MigratedUnmappedEvent {

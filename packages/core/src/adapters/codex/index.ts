@@ -16,7 +16,7 @@
 import { promises as fs } from 'node:fs';
 import { dirname, join } from 'node:path';
 import type { Adapter, WriteOptions, WriteResult } from '../../registry.js';
-import type { MigratedSession, SessionMeta } from '../../ir.js';
+import type { MigratedSession, MigratedSidechain, SessionMeta } from '../../ir.js';
 import { validateSession } from '../../ir.js';
 import { blocksToText } from '../../content.js';
 import {
@@ -37,6 +37,7 @@ import {
   scanRolloutHead,
 } from './parse.js';
 import { buildRolloutLines, sessionIndexTitle } from './write.js';
+import type { CodexWriteOptions } from './write.js';
 
 export class CodexAdapter implements Adapter {
   readonly tool = 'codex' as const;
@@ -57,38 +58,28 @@ export class CodexAdapter implements Adapter {
     if (!codexHome) throw new Error('Codex: cannot resolve CODEX_HOME/.codex');
     const targetCwd = opts?.targetCwd ?? ir.cwd ?? '';
     const createdAt = ir.createdAt ?? Date.now();
+    const wopts: CodexWriteOptions = {
+      targetCwd,
+      createdAt,
+      threadId: '',
+      systemPromptSource: (opts as { systemPromptSource?: 'source' | 'target' } | undefined)?.systemPromptSource,
+      keepSynthetic: opts?.keepSynthetic,
+    };
 
     // Fresh thread id; on a filename collision (path already exists) pick a
     // new id — never overwrite or append to an existing session (AGENT.md).
     // This applies even when opts.sessionId was requested explicitly.
-    let threadId = opts?.sessionId ?? uuidv7();
-    let finalPath = codexSessionPathFor(codexHome, threadId, createdAt);
-    for (let attempt = 0; attempt < 8; attempt++) {
-      const exists = await fs
-        .stat(finalPath)
-        .then(() => true)
-        .catch(() => false);
-      if (!exists) break;
-      if (attempt === 7) throw new Error(`Codex: cannot find a free rollout path for thread ${threadId}`);
-      threadId = uuidv7();
-      finalPath = codexSessionPathFor(codexHome, threadId, createdAt);
+    const main = await writeRolloutFile(ir, codexHome, wopts, targetCwd, createdAt, opts?.sessionId);
+    await appendSessionIndex(codexHome, main.threadId, sessionIndexTitle(ir));
+
+    // Native subagent form: sidechains expand to INDEPENDENT child rollout
+    // files linked via session_meta source.subagent.thread_spawn.parent_thread_id
+    // (docs/agents/codex.md §10) — never folded into the parent file.
+    const paths: string[] = [main.path];
+    for (const sc of ir.sidechains ?? []) {
+      paths.push(...(await writeSidechainTree(sc, ir, codexHome, wopts, targetCwd, main.threadId, 1)));
     }
-
-    const lines = buildRolloutLines(ir, threadId, targetCwd, createdAt, {
-      targetCwd,
-      createdAt,
-      threadId,
-      systemPromptSource: (opts as { systemPromptSource?: 'source' | 'target' } | undefined)?.systemPromptSource,
-      keepSynthetic: opts?.keepSynthetic,
-    });
-    await fs.mkdir(dirname(finalPath), { recursive: true });
-    await fs.writeFile(finalPath, lines.join('\n') + '\n', 'utf8');
-
-    // session_index.jsonl: append ONE line (append-only, newest wins).
-    const title = sessionIndexTitle(ir);
-    await appendSessionIndex(codexHome, threadId, title);
-
-    return { tool: 'codex', sessionId: threadId, paths: [finalPath] };
+    return { tool: 'codex', sessionId: main.threadId, paths };
   }
 
   async listSessions(root?: string): Promise<SessionMeta[]> {
@@ -144,6 +135,76 @@ async function appendSessionIndex(codexHome: string, threadId: string, threadNam
     updated_at: new Date().toISOString(),
   };
   await fs.appendFile(sessionIndexPath(codexHome), JSON.stringify(entry) + '\n', 'utf8');
+}
+
+/**
+ * Write one rollout file with collision-safe id selection (AGENT.md): a fresh
+ * uuidv7 per file; when the rendered path already exists, re-roll the id —
+ * never overwrite or append to an existing session.
+ */
+async function writeRolloutFile(
+  ir: MigratedSession,
+  codexHome: string,
+  wopts: CodexWriteOptions,
+  targetCwd: string,
+  createdAt: number,
+  requestedId?: string,
+): Promise<{ threadId: string; path: string }> {
+  let threadId = requestedId ?? uuidv7();
+  let finalPath = codexSessionPathFor(codexHome, threadId, createdAt);
+  for (let attempt = 0; attempt < 8; attempt++) {
+    const exists = await fs
+      .stat(finalPath)
+      .then(() => true)
+      .catch(() => false);
+    if (!exists) break;
+    if (attempt === 7) throw new Error(`Codex: cannot find a free rollout path for thread ${threadId}`);
+    threadId = uuidv7();
+    finalPath = codexSessionPathFor(codexHome, threadId, createdAt);
+  }
+  wopts.threadId = threadId;
+  wopts.createdAt = createdAt;
+  const lines = buildRolloutLines(ir, threadId, targetCwd, createdAt, wopts);
+  await fs.mkdir(dirname(finalPath), { recursive: true });
+  await fs.writeFile(finalPath, lines.join('\n') + '\n', 'utf8');
+  return { threadId, path: finalPath };
+}
+
+/**
+ * Sidechains → independent child rollout files, recursively (grandchildren
+ * link to their own parent). Children are mini-sessions (MigratedSidechain):
+ * foreign-shaped messages ride the ordinary write projection; each gets its
+ * own thread id and its own session_index line (append-only, one per file).
+ */
+async function writeSidechainTree(
+  sc: MigratedSidechain,
+  parentIr: MigratedSession,
+  codexHome: string,
+  wopts: CodexWriteOptions,
+  targetCwd: string,
+  parentThreadId: string,
+  depth: number,
+): Promise<string[]> {
+  const child: MigratedSession = {
+    schemaVersion: 2,
+    originTool: parentIr.originTool,
+    originSessionId: sc.originSessionId ?? sc.agentId,
+    ...(sc.title ? { title: sc.title } : {}),
+    createdAt: sc.createdAt ?? parentIr.createdAt ?? Date.now(),
+    ...(sc.cwd ?? parentIr.cwd ? { cwd: sc.cwd ?? parentIr.cwd } : {}),
+    messages: sc.messages,
+    ...(sc.compaction?.length ? { compaction: sc.compaction } : {}),
+    ...(sc.toolCalls?.length ? { toolCalls: sc.toolCalls } : {}),
+    ...(sc.unmappedEvents?.length ? { unmappedEvents: sc.unmappedEvents } : {}),
+    ...(sc.meta ? { meta: sc.meta } : {}),
+  };
+  const { threadId, path } = await writeRolloutFile(child, codexHome, { ...wopts, parentThreadId, subagentDepth: depth, agentNickname: sc.agentType }, targetCwd, child.createdAt ?? Date.now());
+  await appendSessionIndex(codexHome, threadId, sessionIndexTitle(child));
+  const out = [path];
+  for (const kid of sc.sidechains ?? []) {
+    out.push(...(await writeSidechainTree(kid, parentIr, codexHome, wopts, targetCwd, threadId, depth + 1)));
+  }
+  return out;
 }
 
 /** Collect rollout files (thread id → newest mtime wins for revert variants). */async function walkRollouts(

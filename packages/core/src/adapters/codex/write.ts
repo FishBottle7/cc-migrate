@@ -30,9 +30,11 @@ import type {
   MigratedCompaction,
   MigratedMessage,
   MigratedSession,
+  MigratedSidechain,
   MigratedUnmappedEvent,
 } from '../../ir.js';
 import type { CodexMessageMeta, CodexNativeRow, RolloutLineRaw } from './parse.js';
+import { titleFromMessages } from './parse.js';
 
 const PLACEHOLDER_ENCRYPTED = '[encrypted_content omitted by cc-migrate]';
 /** §9.2: cli_version carries the target-adapter identity for synthesized metas. */
@@ -47,6 +49,13 @@ export interface CodexWriteOptions {
   systemPromptSource?: 'source' | 'target';
   /** Keep harness-injected (synthetic) messages; default drops them. */
   keepSynthetic?: boolean;
+  /* ---- internal: sidechain expansion (set by write(), not user-facing) ---- */
+  /** Parent thread when this rollout is an expanded sidechain child (§10). */
+  parentThreadId?: string;
+  /** thread_spawn depth (1 = direct child of the main thread). */
+  subagentDepth?: number;
+  /** MigratedSidechain.agentType stamped as agent_nickname. */
+  agentNickname?: string;
 }
 
 /* ------------------------------------------------------------------ */
@@ -281,6 +290,15 @@ export function buildSessionMetaPayload(
     source: 'cli',
     history_mode: 'legacy',
   };
+  // Expanded sidechain child: independent thread linked to its parent via the
+  // native subagent form (docs/agents/codex.md §10).
+  if (opts.parentThreadId) {
+    payload.source = {
+      subagent: { thread_spawn: { parent_thread_id: opts.parentThreadId, depth: opts.subagentDepth ?? 1 } },
+    };
+    payload.thread_source = 'subagent';
+    if (opts.agentNickname) payload.agent_nickname = opts.agentNickname;
+  }
   if (ir.model?.id) payload.model_provider = ir.model.id;
   if (wantSystemPrompt) payload.base_instructions = { text: ir.systemPrompt, provenance: { type: 'custom' } };
   return payload;
@@ -729,16 +747,5 @@ export function sessionIndexTitle(ir: MigratedSession): string {
     | { thread_name?: unknown }
     | undefined;
   if (typeof nativeIndex?.thread_name === 'string' && nativeIndex.thread_name.trim()) return nativeIndex.thread_name;
-  // Skip harness-injected / project-doc rows when inferring from history —
-  // codex names sessions after the user's first real prompt.
-  for (const m of ir.messages) {
-    if (m.role !== 'user' || m.synthetic) continue;
-    const codex = (m.meta as Record<string, unknown> | undefined)?.codex as Record<string, unknown> | undefined;
-    if (codex?.contentKind || codex?.kind) continue;
-    const text = m.content.filter((b) => b.type === 'text').map((b) => (b as { text: string }).text).join('\n').trim();
-    if (!text) continue;
-    const one = text.replace(/\s+/g, ' ');
-    return one.length > 60 ? `${one.slice(0, 60)}…` : one;
-  }
-  return '(untitled)';
+  return titleFromMessages(ir.messages) ?? '(untitled)';
 }
