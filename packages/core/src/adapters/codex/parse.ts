@@ -29,6 +29,7 @@
 
 import { promises as fs } from 'node:fs';
 import { basename, dirname, join } from 'node:path';
+import { StringDecoder } from 'node:string_decoder';
 import type {
   ContentBlock,
   FileBlock,
@@ -195,10 +196,104 @@ export async function loadSessionIndexTitles(codexHome: string): Promise<Map<str
 }
 
 /* ------------------------------------------------------------------ */
-/* Records → IR                                                        */
+/* Cheap head scan (listSessions)                                      */
 /* ------------------------------------------------------------------ */
 
-export interface IrBuildContext {
+export interface RolloutHeadScan {
+  /** session_meta.cwd of the first meta line (the thread's own working dir). */
+  cwd?: string;
+  /** thread_spawn parent from the first meta line (subagent linkage). */
+  parentThreadId?: string;
+  /** First REAL user prompt — the codex session-naming convention (§9.7). */
+  title?: string;
+}
+
+/** Stop scanning once the title is found; 2 MB covers even goal-steered
+ *  sessions whose first real prompt sits behind large injected blocks. */
+const HEAD_SCAN_BYTE_CAP = 2 * 1024 * 1024;
+
+/**
+ * Streaming head scan for the session LIST: cwd + thread_spawn parent + first
+ * real user prompt, without a full parse. Title classification goes through
+ * the SAME code path as the full parse (`responseItemToMessage` →
+ * `markContentKind`), so list titles can never diverge from parse titles —
+ * including `content_item_kinds` filtering and legacy text-marker sniffing.
+ */
+export async function scanRolloutHead(path: string): Promise<RolloutHeadScan> {
+  const out: RolloutHeadScan = {};
+
+  const consider = (env: RolloutLineRaw): boolean => {
+    const payload = env.payload as Record<string, unknown> | undefined;
+    if (!payload || typeof payload !== 'object') return false;
+    if (env.type === 'session_meta') {
+      if (out.cwd === undefined && typeof payload.cwd === 'string') out.cwd = payload.cwd;
+      if (out.parentThreadId === undefined) {
+        const spawn = (payload.source as Record<string, unknown> | undefined)?.subagent as
+          | Record<string, unknown>
+          | undefined;
+        const parent = (spawn?.thread_spawn as Record<string, unknown> | undefined)?.parent_thread_id;
+        if (typeof parent === 'string') out.parentThreadId = parent;
+      }
+      return false;
+    }
+    if (env.type !== 'response_item') return false;
+    if (payload.type !== 'message' || payload.role !== 'user') return false;
+    const msg = responseItemToMessage(payload, { ts: '', clientAuthored: false, lineSeq: 0 });
+    if (!msg || msg.synthetic) return false;
+    const meta = msg.meta!.codex as CodexMessageMeta;
+    if (meta.contentKind || meta.kind) return false;
+    const text = msg.content.filter((b) => b.type === 'text').map((b) => (b as { text: string }).text).join('\n').trim();
+    if (!text) return false;
+    const one = text.replace(/\s+/g, ' ');
+    out.title = one.length > 60 ? `${one.slice(0, 60)}…` : one;
+    return true;
+  };
+
+  const tryLine = (line: string): boolean => {
+    const trimmed = line.trim();
+    if (!trimmed) return false;
+    try {
+      return consider(JSON.parse(trimmed) as RolloutLineRaw);
+    } catch {
+      return false;
+    }
+  };
+
+  if (path.endsWith('.zst')) {
+    for (const line of (await readRolloutText(path)).split('\n')) {
+      if (tryLine(line)) break;
+    }
+    return out;
+  }
+
+  // Plain file: chunked reads with a StringDecoder so a UTF-8 rune split
+  // across a chunk boundary (Chinese titles!) survives intact.
+  const fh = await fs.open(path, 'r');
+  try {
+    const buf = Buffer.alloc(256 * 1024);
+    const dec = new StringDecoder('utf8');
+    let carry = '';
+    let pos = 0;
+    while (pos < HEAD_SCAN_BYTE_CAP) {
+      const { bytesRead } = await fh.read(buf, 0, buf.length, pos);
+      if (!bytesRead) break;
+      pos += bytesRead;
+      const chunk = carry + dec.write(buf.subarray(0, bytesRead));
+      const lines = chunk.split('\n');
+      carry = lines.pop() ?? '';
+      for (const line of lines) {
+        if (tryLine(line)) return out;
+      }
+    }
+  } finally {
+    await fh.close();
+  }
+  return out;
+}
+
+/* ------------------------------------------------------------------ */
+/* Records → IR                                                        */
+/* ------------------------------------------------------------------ */export interface IrBuildContext {
   /** Newest-wins thread titles (session_index.jsonl). */
   titles?: Map<string, string>;
   /** Absolute path of the source rollout file — recorded into meta.codex. */

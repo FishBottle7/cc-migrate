@@ -34,6 +34,7 @@ import {
   rolloutRecordsToIr,
   parseRolloutLines,
   readRolloutText,
+  scanRolloutHead,
 } from './parse.js';
 import { buildRolloutLines, sessionIndexTitle } from './write.js';
 
@@ -99,15 +100,20 @@ export class CodexAdapter implements Adapter {
     const titles = await loadSessionIndexTitles(codexHome);
     const items: SessionMeta[] = [];
     for (const [threadId, f] of files) {
-      const parent = await parentThreadId(f.path);
+      // One cheap head scan per file: cwd + subagent parent + first real user
+      // prompt (codex naming convention). The index title, when present, wins
+      // — same priority the write side uses.
+      const head = await scanRolloutHead(f.path);
+      const indexTitle = titles.get(threadId);
       items.push({
         tool: 'codex',
         sessionId: threadId,
-        ...(titles.get(threadId) ? { title: titles.get(threadId) } : {}),
+        ...(indexTitle ? { title: indexTitle } : head.title ? { title: head.title } : {}),
+        ...(head.cwd ? { cwd: head.cwd } : {}),
         createdAt: f.createdAt ?? (f.mtime || undefined),
         sourcePath: f.path,
         ...(f.archived ? { archived: true } : {}),
-        ...(parent ? { parentSessionId: parent } : {}),
+        ...(head.parentThreadId ? { parentSessionId: head.parentThreadId } : {}),
       });
     }
     // Deferred-creation threads: registered in the append-only index but no
@@ -138,38 +144,6 @@ async function appendSessionIndex(codexHome: string, threadId: string, threadNam
     updated_at: new Date().toISOString(),
   };
   await fs.appendFile(sessionIndexPath(codexHome), JSON.stringify(entry) + '\n', 'utf8');
-}
-
-/**
- * Subagent linkage from the FIRST rollout line (always session_meta): the
- * thread_spawn parent — enough for the UI tree without parsing every file.
- * Plain files cost one small read; .zst files pay full decompression.
- */
-async function parentThreadId(path: string): Promise<string | undefined> {
-  try {
-    let firstLine: string;
-    if (path.endsWith('.zst')) {
-      const text = await readRolloutText(path);
-      const nl = text.indexOf('\n');
-      firstLine = nl > 0 ? text.slice(0, nl) : text;
-    } else {
-      const fh = await fs.open(path, 'r');
-      try {
-        const buf = Buffer.alloc(65536);
-        const { bytesRead } = await fh.read(buf, 0, buf.length, 0);
-        firstLine = buf.toString('utf8', 0, bytesRead).split('\n')[0];
-      } finally {
-        await fh.close();
-      }
-    }
-    const env = JSON.parse(firstLine) as { type?: string; payload?: Record<string, unknown> };
-    if (env.type !== 'session_meta') return undefined;
-    const spawn = (env.payload?.source as Record<string, unknown> | undefined)?.subagent as Record<string, unknown> | undefined;
-    const parent = (spawn?.thread_spawn as Record<string, unknown> | undefined)?.parent_thread_id;
-    return typeof parent === 'string' ? parent : undefined;
-  } catch {
-    return undefined;
-  }
 }
 
 /** Collect rollout files (thread id → newest mtime wins for revert variants). */async function walkRollouts(

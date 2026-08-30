@@ -840,3 +840,35 @@ test('listSessions: subagent threads expose parentSessionId for the UI tree', as
   assert.ok(main && !main.parentSessionId, 'main session unlinked');
   assert.equal(sub?.parentSessionId, mainId);
 });
+
+test('listSessions: title = first real user prompt (injections skipped) + cwd from session_meta', async () => {
+  const adapter = new CodexAdapter();
+  const root = await tempRoot();
+  const dir = join(root, 'sessions', '2026', '01', '12');
+  await fs.mkdir(dir, { recursive: true });
+
+  // legacy-style: an injected <goal_context> block precedes the real prompt
+  const legacyId = '019b0000-0000-7000-8000-00000000cccc';
+  await fs.writeFile(join(dir, `rollout-2026-01-12T20-55-47-${legacyId}.jsonl`), [
+    JSON.stringify({ timestamp: TS, type: 'session_meta', payload: { id: legacyId, session_id: legacyId, timestamp: TS, cwd: 'D:\proj-a', originator: 'codex_cli_rs', cli_version: '0.146.0' } }),
+    JSON.stringify({ timestamp: TS, type: 'response_item', payload: { type: 'message', role: 'user', content: [{ type: 'input_text', text: '<goal_context>\nGOAL: keep going\n</goal_context>' }] } }),
+    JSON.stringify({ timestamp: TS, type: 'response_item', payload: { type: 'message', role: 'user', content: [{ type: 'input_text', text: '你好，帮我看看这个报错' }] } }),
+  ].join('\n') + '\n', 'utf8');
+
+  // kinds-style: official content_item_kinds channel classifies the injected row
+  const kindsId = '019b0000-0000-7000-8000-00000000dddd';
+  await fs.writeFile(join(dir, `rollout-2026-01-12T20-55-48-${kindsId}.jsonl`), [
+    JSON.stringify({ timestamp: TS, type: 'session_meta', payload: { id: kindsId, session_id: kindsId, timestamp: TS, cwd: 'D:\proj-b', originator: 'codex_cli_rs', cli_version: '0.146.0' } }),
+    JSON.stringify({ timestamp: TS, type: 'response_item', payload: { type: 'message', role: 'user', internal_chat_message_metadata_passthrough: { content_item_kinds: ['environments.environment_context'] }, content: [{ type: 'input_text', text: '<environment_context>cwd etc</environment_context>' }] } }),
+    JSON.stringify({ timestamp: TS, type: 'response_item', payload: { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'second real prompt that is quite long and should be truncated at sixty characters ———— padding padding padding' }] } }),
+  ].join('\n') + '\n', 'utf8');
+
+  const metas = await adapter.listSessions(root);
+  const legacy = metas.find((m) => m.sessionId === legacyId);
+  const kinds = metas.find((m) => m.sessionId === kindsId);
+  assert.equal(legacy?.cwd, 'D:\proj-a');
+  assert.equal(legacy?.title, '你好，帮我看看这个报错');
+  assert.equal(kinds?.cwd, 'D:\proj-b');
+  assert.ok(kinds?.title?.startsWith('second real prompt'), `title: ${kinds?.title}`);
+  assert.ok((kinds?.title?.length ?? 0) <= 61, `title not truncated: ${kinds?.title}`);
+});
