@@ -20,6 +20,9 @@
  *  6. message shapes        — user/message | assistant/message | tool/result
  *                             must carry the identified-message fields
  *                             (id + source.kind) the loader asserts
+ *  7. tool pairing          — every tool/result must reference a callId an
+ *                             EARLIER tool/call introduced; an orphan result
+ *                             renders as a ghost "Tool call <callId>" card
  *
  * Dependency-free by design: this mirrors the host contracts but never
  * imports host packages, so the CLI can verify on any machine.
@@ -38,7 +41,7 @@ export interface VerifyIssue {
   line?: number;
   /** Decoded seq when known. */
   seq?: number;
-  check: 'header' | 'envelope' | 'seq' | 'surface' | 'turn-tail' | 'message-shape' | 'event-type';
+  check: 'header' | 'envelope' | 'seq' | 'surface' | 'turn-tail' | 'message-shape' | 'event-type' | 'tool-pairing';
   message: string;
 }
 
@@ -117,6 +120,7 @@ export function verifySessionLog(plain: string, sessionId: string, path: string)
   const startedTurns = new Map<string, number>();
   const updateTurns = new Set<string>();
   const turnIds = new Set<string>();
+  const seenCallIds = new Set<string>();
   let expected = 0;
 
   for (let i = 1; i < lines.length; i++) {
@@ -223,6 +227,10 @@ export function verifySessionLog(plain: string, sessionId: string, path: string)
 
     // message shapes (the loader asserts identified messages)
     const data = ev.data as Record<string, unknown> | undefined;
+    if (type === 'tool/call') {
+      const cid = (data as { callId?: unknown } | undefined)?.callId;
+      if (typeof cid === 'string' && cid) seenCallIds.add(cid);
+    }
     if (type === 'user/message') {
       const d = data as Record<string, unknown> | undefined;
       if (typeof d?.id !== 'string' || !d.id) fail('message-shape', 'user/message data lacks an identified message (data.id)');
@@ -241,6 +249,9 @@ export function verifySessionLog(plain: string, sessionId: string, path: string)
       if (src?.kind !== 'tool') fail('message-shape', 'tool/result message.source.kind must be "tool"');
       if (typeof src?.callId !== 'string' || !src.callId) fail('message-shape', 'tool/result message.source.callId missing');
       if (!Array.isArray(m?.content)) fail('message-shape', 'tool/result message.content must be an array');
+      if (typeof src?.callId === 'string' && src.callId && !seenCallIds.has(src.callId)) {
+        fail('tool-pairing', `tool/result references callId ${src.callId} with no earlier tool/call — the GUI renders a ghost "Tool call <callId>" fallback card`);
+      }
     }
 
     // turn-tail ordering (exact GUI matcher semantics):

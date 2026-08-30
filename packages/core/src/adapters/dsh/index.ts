@@ -1141,15 +1141,44 @@ export function irToEvents(ir: MigratedSession, baseTime: number): DshEvent[] {
   // callIds the toolCalls bucket will re-emit as tool/call rows (dsh-origin
   // sessions) — block-derived synthesis below must not duplicate them.
   const bucketCallIds = new Set((ir.toolCalls ?? []).map((r) => r.callId));
+  // Every callId that will exist as a tool/call row: bucket re-emissions plus
+  // every assistant tool_use block (block-derived synthesis below). A
+  // tool/result referencing anything else can never pair — DSH renders it as
+  // a ghost "Tool call <callId>" fallback card — so such results must not be
+  // emitted.
+  const plannedCallIds = new Set(bucketCallIds);
+  for (const m of ir.messages) {
+    for (const b of m.content) {
+      if (b.type === 'tool_use' && b.id) plannedCallIds.add(b.id);
+    }
+  }
+  // Runtime guard against duplicate tool/call rows for one callId (the GUI
+  // aborts on a second start Match for the same context key).
+  const emittedCallIds = new Set<string>();
   for (const msg of ir.messages) {
     const t = msg.timestamp;
     const time = typeof t === 'number' && Number.isFinite(t) ? t : msgFallback++;
     const seq = typeof msg.seq === 'number' && Number.isSafeInteger(msg.seq) ? msg.seq : FALLBACK_SEQ_BASE + fallbackIdx++;
     const native = nativeOf(msg);
-    if (msg.role === 'tool') {
+    // Anthropic-style harnesses (claude) carry tool results as USER messages
+    // whose content is solely tool_result blocks; pi/codex/opencode/zcode use
+    // role:'tool' rows. Both shapes must project as a tool/result event —
+    // emitting them as human turns garbles the DSH view and leaves the paired
+    // call card without a result.
+    const isToolResultCarrier = msg.content.length > 0 && msg.content.every((b) => b.type === 'tool_result');
+    if (msg.role === 'tool' || (msg.role === 'user' && isToolResultCarrier)) {
       // Rebuild DSH tool/result shape: {turn,step,message:{source,role,content}}
       // preserve the nested tool-result interior expected by DSH surface.
       const toolBlocks = msg.content.filter((b) => b.type === 'tool_result');
+      // Resolve the pairing callId: native source first (byte-faithful
+      // dsh→dsh), then the block's toolUseId. A result whose call has no
+      // planned tool/call row (or no callId at all) can never pair and would
+      // render as a ghost card — skip it; the content stays in the IR.
+      const nativeSrc = native.source as { callId?: unknown } | undefined;
+      const nativeCallId = typeof nativeSrc?.callId === 'string' && nativeSrc.callId ? nativeSrc.callId : undefined;
+      const blockCallId = (toolBlocks[0] as { toolUseId?: string } | undefined)?.toolUseId;
+      const callId = nativeCallId ?? (blockCallId || undefined);
+      if (!callId || !plannedCallIds.has(callId)) continue;
       const toolData: Record<string, unknown> = {
         ...(native.turn !== undefined || native.step !== undefined
           ? { turn: native.turn ?? 1, step: native.step ?? 1 }
@@ -1161,7 +1190,7 @@ export function irToEvents(ir: MigratedSession, baseTime: number): DshEvent[] {
         message: {
           ...(native.id ? { id: native.id } : { id: `msg_${randomUUID()}` }),
           role: 'user',
-          ...(native.source !== undefined ? { source: native.source } : { source: { kind: 'tool', callId: (toolBlocks[0] as { toolUseId?: string })?.toolUseId ?? `call_${randomUUID()}` } }),
+          ...(native.source !== undefined ? { source: native.source } : { source: { kind: 'tool', callId } }),
           ...(native.rawContent ? { content: native.rawContent } : {
             content: msg.content.map((b) => {
               if (b.type === 'tool_result') {
@@ -1213,8 +1242,10 @@ export function irToEvents(ir: MigratedSession, baseTime: number): DshEvent[] {
       // assistant/message would just render as a dead step in the GUI.
       if (Array.isArray(content) && content.length === 0) continue;
       // DSH validates assistant/message data as {turn,step,message:{id, role:"assistant", source:{kind:"model",provider,model}, content:[]}}
-      const provider = (ir.model?.provider as string) ?? 'abrdns';
-      const model = (ir.model?.id as string) ?? 'GLM-5.3-Flash';
+      // source identity: per-message provider/model first (foreign harnesses
+      // carry it on the message), then session-level, then legacy defaults.
+      const provider = (msg.provider as string) ?? (ir.model?.provider as string) ?? 'abrdns';
+      const model = (msg.model as string) ?? (ir.model?.id as string) ?? 'GLM-5.3-Flash';
       const nativeSource = native.source as Record<string, unknown> | undefined;
       const data = {
         ...(native.turn !== undefined || native.step !== undefined
@@ -1240,7 +1271,8 @@ export function irToEvents(ir: MigratedSession, baseTime: number): DshEvent[] {
       // the missing half (deduped against the IR toolCalls bucket, which is
       // re-emitted further down for dsh-origin sessions).
       for (const b of msg.content) {
-        if (b.type !== 'tool_use' || bucketCallIds.has(b.id)) continue;
+        if (b.type !== 'tool_use' || !b.id || bucketCallIds.has(b.id) || emittedCallIds.has(b.id)) continue;
+        emittedCallIds.add(b.id);
         const args = b.input === undefined ? '' : typeof b.input === 'string' ? b.input : JSON.stringify(b.input);
         raw.push({
           time,
@@ -1263,6 +1295,8 @@ export function irToEvents(ir: MigratedSession, baseTime: number): DshEvent[] {
   // tool/result). metadata.dsh restores the exact turn/step/seq and the RAW
   // model-produced arguments string.
   for (const tc of ir.toolCalls ?? []) {
+    if (emittedCallIds.has(tc.callId)) continue;
+    emittedCallIds.add(tc.callId);
     const dsh = (tc.metadata as { dsh?: { turn?: number; step?: number; seq?: number; time?: number; arguments?: string } } | undefined)?.dsh;
     const time = typeof dsh?.time === 'number' && Number.isFinite(dsh.time) ? dsh.time : baseTime;
     raw.push({

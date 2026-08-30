@@ -19,7 +19,7 @@ import { promises as fs } from 'node:fs';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import type { Adapter, WriteOptions, WriteResult } from '../../registry.js';
-import type { MigratedMessage, MigratedSession, SessionMeta } from '../../ir.js';
+import type { ContentBlock, FileBlock, MigratedMessage, MigratedSession, SessionMeta } from '../../ir.js';
 import { validateSession } from '../../ir.js';
 import { blocksToText, normalizeContent } from '../../content.js';
 
@@ -260,6 +260,65 @@ async function findPiFile(sessionsDir: string, sessionId: string): Promise<strin
   return null;
 }
 
+/**
+ * One pi message payload → IR. pi's vocabulary differs from the generic blocks
+ * (pi-main packages/ai/src/types.ts + docs/session-format.md):
+ *  - assistant content carries {type:'toolCall', id, name, arguments} blocks;
+ *  - tool results are standalone messages {role:'toolResult', toolCallId,
+ *    toolName, content:(text|image)[], isError} with the pairing id at
+ *    MESSAGE level.
+ * Both must fold into the generic tool_use/tool_result vocabulary — left
+ * as-is, tool calls degrade to JSON-stringified text (renders as garbled
+ * assistant bubbles downstream) and results lose their callId (targets emit
+ * ghost tool cards; pi write-back produces an unpairable toolResult).
+ */
+function piMessageToIr(raw: Record<string, unknown>): MigratedMessage | null {
+  const ts = typeof raw.timestamp === 'number' ? raw.timestamp : undefined;
+  if (raw.role === 'toolResult') {
+    const arr = Array.isArray(raw.content) ? raw.content : typeof raw.content === 'string' ? [{ type: 'text', text: raw.content }] : [];
+    const inner = normalizeContent(arr);
+    const text = inner
+      .filter((b): b is { type: 'text'; text: string } => b.type === 'text')
+      .map((b) => b.text)
+      .join('\n');
+    const attachments = inner.filter((b): b is FileBlock => b.type === 'file');
+    const block: ContentBlock & { attachments?: FileBlock[] } = {
+      type: 'tool_result',
+      toolUseId: String(raw.toolCallId ?? ''),
+      content: text,
+      isError: raw.isError === true,
+    };
+    if (attachments.length) block.attachments = attachments;
+    const msg: MigratedMessage = { role: 'tool', content: [block] };
+    if (ts !== undefined) msg.timestamp = ts;
+    const meta: Record<string, unknown> = {};
+    if (typeof raw.toolName === 'string' && raw.toolName) meta.toolName = raw.toolName;
+    if (raw.details !== undefined) meta.details = raw.details;
+    if (Object.keys(meta).length) msg.meta = { pi: meta };
+    return msg;
+  }
+  const role: MigratedMessage['role'] = raw.role === 'user' ? 'user' : 'assistant';
+  const arr = Array.isArray(raw.content) ? raw.content : typeof raw.content === 'string' ? [{ type: 'text', text: raw.content }] : [];
+  const content = normalizeContent(arr.map(foldPiBlock));
+  if (!content.length) return null;
+  const msg: MigratedMessage = { role, content };
+  if (ts !== undefined) msg.timestamp = ts;
+  if (typeof raw.provider === 'string') msg.provider = raw.provider;
+  if (typeof raw.model === 'string') msg.model = raw.model;
+  return msg;
+}
+
+/** pi {type:'toolCall', id, name, arguments} → generic tool_use block. */
+function foldPiBlock(b: unknown): unknown {
+  if (typeof b === 'object' && b !== null && !Array.isArray(b)) {
+    const rec = b as Record<string, unknown>;
+    if (rec.type === 'toolCall') {
+      return { type: 'tool_use', id: String(rec.id ?? ''), name: String(rec.name ?? 'tool'), input: rec.arguments };
+    }
+  }
+  return b;
+}
+
 export async function parsePiFile(path: string): Promise<MigratedSession> {
   const text = await fs.readFile(path, 'utf8');
   const lines = text.split('\n').filter((l) => l.trim());
@@ -286,16 +345,11 @@ export async function parsePiFile(path: string): Promise<MigratedSession> {
   for (const e of msgEntries) {
     const raw = e.message as unknown;
     if (!raw || typeof raw !== 'object') continue;
-    const roleRaw = (raw as { role?: string }).role;
-    const role: MigratedMessage['role'] =
-      roleRaw === 'user' ? 'user' : roleRaw === 'assistant' ? 'assistant' : roleRaw === 'toolResult' ? 'tool' : 'assistant';
-    const contentSrc = (raw as { content?: unknown }).content;
-    const arr = Array.isArray(contentSrc) ? contentSrc : typeof contentSrc === 'string' ? [{ type: 'text', text: contentSrc }] : [];
-    const content = normalizeContent(arr);
-    const ts = (raw as { timestamp?: number }).timestamp ?? (e.timestamp ? new Date(e.timestamp).getTime() : undefined);
-    const provider = (raw as { provider?: string }).provider;
-    const modelId = (raw as { model?: string }).model;
-    allMessages.push({ role, content, timestamp: ts, provider, model: modelId });
+    const msg = piMessageToIr(raw as Record<string, unknown>);
+    if (msg) {
+      if (msg.timestamp === undefined && e.timestamp) msg.timestamp = new Date(e.timestamp).getTime();
+      allMessages.push(msg);
+    }
   }
 
   // Derive tree siblings as sidechains: group messages that are not on the leaf path.
@@ -331,12 +385,16 @@ export async function parsePiFile(path: string): Promise<MigratedSession> {
       for (const [rootId, group] of groups) {
         // order by timestamp
         group.sort((a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime());
-        const msgs: MigratedMessage[] = group.map((e) => {
-          const raw2 = e.message as { role?: string; content?: unknown; timestamp?: number; provider?: string; model?: string };
-          const role2: MigratedMessage['role'] = raw2.role === 'user' ? 'user' : 'assistant';
-          const arr2 = Array.isArray(raw2.content) ? raw2.content : typeof raw2.content === 'string' ? [{ type: 'text', text: raw2.content }] : [];
-          return { role: role2, content: normalizeContent(arr2), timestamp: raw2.timestamp ?? new Date(e.timestamp).getTime(), provider: raw2.provider, model: raw2.model };
-        });
+        const msgs: MigratedMessage[] = [];
+        for (const e of group) {
+          const raw2 = e.message as unknown;
+          if (!raw2 || typeof raw2 !== 'object') continue;
+          const msg = piMessageToIr(raw2 as Record<string, unknown>);
+          if (msg) {
+            if (msg.timestamp === undefined) msg.timestamp = new Date(e.timestamp).getTime();
+            msgs.push(msg);
+          }
+        }
         sidechains.push({ agentId: `pi-${rootId.slice(0, 8)}`, kind: 'subagent', messages: msgs });
       }
     }
@@ -357,12 +415,47 @@ export async function parsePiFile(path: string): Promise<MigratedSession> {
 }
 
 function piMessageFromMigrated(msg: MigratedMessage): Record<string, unknown> {
-  const role = msg.role === 'tool' ? 'toolResult' : msg.role;
+  // pi ToolResultMessage shape (packages/ai/src/types.ts): role:'toolResult'
+  // with toolCallId/toolName/isError at MESSAGE level and content limited to
+  // (TextContent|ImageContent)[] — a nested toolResult block inside content is
+  // invalid and reparses as garbled text. Anthropic-style IR (claude) carries
+  // results as user-role tool_result carriers; route both here.
+  const isToolResultCarrier =
+    msg.role === 'user' && msg.content.length > 0 && msg.content.every((b) => b.type === 'tool_result');
+  if (msg.role === 'tool' || isToolResultCarrier) {
+    const piMeta = (msg.meta as { pi?: { toolName?: string; details?: unknown } } | undefined)?.pi;
+    const tr = msg.content.find((b) => b.type === 'tool_result') as
+      | Extract<ContentBlock, { type: 'tool_result' }>
+      | undefined;
+    const content: unknown[] = [];
+    if (tr) {
+      content.push({ type: 'text', text: tr.content });
+      for (const att of tr.attachments ?? []) {
+        if (att.data) content.push({ type: 'image', data: att.data, mimeType: att.mediaType ?? 'image/png' });
+        else content.push({ type: 'text', text: `[file: ${att.filename ?? att.url ?? 'attachment'}]` });
+      }
+    }
+    for (const b of msg.content) {
+      if (b.type === 'text') content.push({ type: 'text', text: b.text });
+      else if (b.type === 'file' && b.data) content.push({ type: 'image', data: b.data, mimeType: b.mediaType ?? 'image/png' });
+    }
+    const out: Record<string, unknown> = {
+      role: 'toolResult',
+      ...(tr ? { toolCallId: tr.toolUseId } : {}),
+      toolName: piMeta?.toolName ?? 'tool',
+      content: content.length ? content : [{ type: 'text', text: '' }],
+      isError: tr?.isError ?? false,
+      timestamp: msg.timestamp ?? Date.now(),
+    };
+    if (piMeta?.details !== undefined) out.details = piMeta.details;
+    return out;
+  }
+  const role: MigratedMessage['role'] = msg.role;
   const content = msg.content.map((b) => {
     if (b.type === 'text') return { type: 'text', text: b.text };
     if (b.type === 'thinking') return { type: 'thinking', thinking: b.thinking };
     if (b.type === 'tool_use') return { type: 'toolCall', id: b.id, name: b.name, arguments: b.input };
-    if (b.type === 'tool_result') return { type: 'toolResult', toolCallId: b.toolUseId, content: b.content, isError: b.isError ?? false };
+    if (b.type === 'tool_result') return { type: 'text', text: b.content };
     // FileBlock: no tool-result semantics — render as a text placeholder.
     return { type: 'text', text: `[file: ${b.filename ?? b.url ?? b.mediaType ?? 'attachment'}]` };
   });

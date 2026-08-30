@@ -951,3 +951,54 @@ test('dsh->dsh: unknown-to-DSH source types are dropped, known types replay verb
   const verdict = verifySessionLog(decompressSessionBuffer(await fs.readFile(res.paths[0]!)), 'ign-2', res.paths[0]!);
   assert.ok(verdict.ok, `verifySessionLog passes: ${JSON.stringify(verdict.issues ?? []).slice(0, 200)}`);
 });
+
+test('claude-style user tool_result carriers project as paired tool/results; orphan results are dropped', async () => {
+  const adapter = new DshAdapter();
+  const root = await tempRoot();
+  const ir = {
+    schemaVersion: 2 as const,
+    originTool: 'claude' as const,
+    createdAt: 1000,
+    messages: [
+      { role: 'user' as const, content: [{ type: 'text' as const, text: 'run it' }] },
+      { role: 'assistant' as const, content: [{ type: 'tool_use' as const, id: 'callu_1', name: 'bash', input: 'ls' }] },
+      // Anthropic shape: the result rides a USER message as a tool_result block
+      { role: 'user' as const, content: [{ type: 'tool_result' as const, toolUseId: 'callu_1', content: 'file-a\nfile-b' }] },
+      // orphan result: no tool/call exists for this id — emitting it would render
+      // as a ghost "Tool call <callId>" fallback card
+      { role: 'tool' as const, content: [{ type: 'tool_result' as const, toolUseId: 'call_missing', content: 'lost' }] },
+    ],
+  };
+  const res = await adapter.write(ir as never, { root, sessionId: 'carrier-1', targetCwd: 'D:\\proj' });
+  const events = decompressSessionBuffer(await fs.readFile(res.paths[0]!)).split('\n').filter((l) => l.trim()).slice(1).map((l) => JSON.parse(l)) as Array<{ type: string; data: Record<string, unknown> }>;
+  const results = events.filter((e) => e.type === 'tool/result');
+  assert.equal(results.length, 1, 'the user-carried tool_result becomes exactly one tool/result event');
+  const msg = (results[0].data as Record<string, unknown>).message as Record<string, unknown>;
+  const src = msg.source as Record<string, unknown>;
+  assert.equal(src.kind, 'tool');
+  assert.equal(src.callId, 'callu_1');
+  const userRows = events.filter((e) => e.type === 'user/message');
+  assert.equal(userRows.length, 1, 'the carrier user row does not render as a human turn');
+  assert.ok(!JSON.stringify(userRows[0].data).includes('file-a'), 'tool output is not user speech');
+  assert.ok(!events.some((e) => JSON.stringify(e.data).includes('call_missing')), 'orphan result not emitted');
+  const verdict = verifySessionLog(decompressSessionBuffer(await fs.readFile(res.paths[0]!)), 'carrier-1', res.paths[0]!);
+  assert.ok(verdict.ok, `verifySessionLog passes: ${JSON.stringify(verdict.issues ?? []).slice(0, 200)}`);
+});
+
+test('verifySessionLog flags an orphan tool/result as a tool-pairing issue', () => {
+  const plain = [
+    JSON.stringify({ type: 'session', version: 0, id: 'v-ghost', createdAt: 1, cwd: 'D:\\\\x' }),
+    JSON.stringify({ seq: 0, time: 1, type: 'tool/result', surfaceOp: 'append', data: { turn: 1, step: 1, message: { id: 'm1', role: 'user', source: { kind: 'tool', callId: 'call_ghost' }, content: [{ type: 'tool-result', toolCallId: 'call_ghost', content: [{ type: 'text', text: 'x' }] }] } } }),
+  ].join('\n') + '\n';
+  const verdict = verifySessionLog(plain, 'v-ghost', 'mem');
+  assert.equal(verdict.ok, false);
+  assert.ok(verdict.issues.some((i) => i.check === 'tool-pairing'), `tool-pairing issue raised: ${JSON.stringify(verdict.issues)}`);
+  // the paired variant is clean
+  const paired = [
+    JSON.stringify({ type: 'session', version: 0, id: 'v-pair', createdAt: 1, cwd: 'D:\\\\x' }),
+    JSON.stringify({ seq: 0, time: 1, type: 'tool/call', data: { turn: 1, step: 1, callId: 'call_ok', name: 'bash', arguments: '{}' } }),
+    JSON.stringify({ seq: 1, time: 2, type: 'tool/result', surfaceOp: 'append', data: { turn: 1, step: 1, message: { id: 'm1', role: 'user', source: { kind: 'tool', callId: 'call_ok' }, content: [{ type: 'tool-result', toolCallId: 'call_ok', content: [{ type: 'text', text: 'x' }] }] } } }),
+  ].join('\n') + '\n';
+  const ok = verifySessionLog(paired, 'v-pair', 'mem');
+  assert.ok(ok.ok, `paired log passes: ${JSON.stringify(ok.issues)}`);
+});
