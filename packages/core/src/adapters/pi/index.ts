@@ -20,7 +20,7 @@ import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import type { Adapter, WriteOptions, WriteResult } from '../../registry.js';
 import type { ContentBlock, FileBlock, MigratedMessage, MigratedSession, SessionMeta } from '../../ir.js';
-import { validateSession } from '../../ir.js';
+import { IR_VERSION, validateSession } from '../../ir.js';
 import { blocksToText, normalizeContent } from '../../content.js';
 
 type PiEntryType = 'session' | 'message' | 'compaction' | 'branch_summary' | 'custom_message' | 'model_change' | 'thinking_level_change' | 'custom' | 'label' | 'session_info';
@@ -77,6 +77,7 @@ function generateId(existing: Set<string>): string {
 
 export class PiAdapter implements Adapter {
   readonly tool = 'pi' as const;
+  readonly irVersion = IR_VERSION;
 
   async parse(sessionId: string, root?: string): Promise<MigratedSession> {
     const sessionsDir = root ?? defaultPiSessionsDir();
@@ -449,6 +450,19 @@ function piMessageFromMigrated(msg: MigratedMessage): Record<string, unknown> {
     };
     if (piMeta?.details !== undefined) out.details = piMeta.details;
     return out;
+  }
+  // v3.1 developer-role rule: pi's native vocabulary is only
+  // user/assistant/toolResult. Writing a raw 'developer'/'system' role would
+  // produce a row pi cannot parse — and pi's own reader maps any non-user
+  // message back to 'assistant', so the verbatim role both corrupts the store
+  // and distorts on round-trip. Degrade to a visible user row instead.
+  if (msg.role === 'system' || msg.role === 'developer') {
+    const text = blocksToText(msg.content).trim();
+    return {
+      role: 'user',
+      content: text,
+      timestamp: msg.timestamp ?? Date.now(),
+    };
   }
   const role: MigratedMessage['role'] = msg.role;
   const content = msg.content.map((b) => {

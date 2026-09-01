@@ -30,7 +30,7 @@ function uuidValidate(s: string): boolean {
 import { join } from 'node:path';
 import type { Adapter, WriteOptions, WriteResult } from '../../registry.js';
 import type { MigratedSession, SessionMeta } from '../../ir.js';
-import { validateSession } from '../../ir.js';
+import { IR_VERSION, validateSession } from '../../ir.js';
 import { blocksToText } from '../../content.js';
 import { claudeProjectDirName, defaultClaudeProjectsRoot } from './path.js';
 import { parseClaudeFile, readClaudeLinesForList } from './parse.js';
@@ -53,6 +53,7 @@ interface ListLiteHead {
 
 export class ClaudeAdapter implements Adapter {
   readonly tool = 'claude' as const;
+  readonly irVersion = IR_VERSION;
 
   /** Read one Claude session jsonl (main + sidechains) into IR. */
   async parse(sessionId: string, root?: string): Promise<MigratedSession> {
@@ -60,7 +61,7 @@ export class ClaudeAdapter implements Adapter {
     if (!projectsRoot) throw new Error('Claude: cannot resolve ~/.claude/projects');
     const path = await this.findJsonl(projectsRoot, sessionId);
     if (!path) throw new Error(`Claude: session "${sessionId}" not found under ${projectsRoot}`);
-    return parseClaudeFile(path);
+    return validateSession(await parseClaudeFile(path));
   }
 
   /**

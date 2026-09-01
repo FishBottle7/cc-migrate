@@ -17,7 +17,7 @@ import { promises as fs } from 'node:fs';
 import { dirname, join } from 'node:path';
 import type { Adapter, WriteOptions, WriteResult } from '../../registry.js';
 import type { MigratedSession, MigratedSidechain, SessionMeta } from '../../ir.js';
-import { validateSession } from '../../ir.js';
+import { IR_VERSION, validateSession } from '../../ir.js';
 import { blocksToText } from '../../content.js';
 import {
   defaultCodexHome,
@@ -42,6 +42,7 @@ import type { CodexWriteOptions } from './write.js';
 
 export class CodexAdapter implements Adapter {
   readonly tool = 'codex' as const;
+  readonly irVersion = IR_VERSION;
 
   async parse(sessionId: string, root?: string): Promise<MigratedSession> {
     const codexHome = root ?? defaultCodexHome();
@@ -57,7 +58,7 @@ export class CodexAdapter implements Adapter {
     const byParent = await subagentChildIndex(codexHome);
     const stitched = await loadSubagentTree(sessionId, ir, byParent, titles, new Set([sessionId]));
     if (stitched.length) ir.sidechains = stitched;
-    return ir;
+    return validateSession(ir);
   }
 
   async write(ir: MigratedSession, opts?: WriteOptions): Promise<WriteResult> {

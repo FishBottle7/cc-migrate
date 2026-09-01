@@ -489,6 +489,24 @@ test('zcode parse+write: subagent sidechain round-trips with engine id conventio
   });
 });
 
+test('zcode listSessions: roots only — parent-linked children are not listed standalone', async () => {
+  await withoutRealZcodeHome(async () => {
+    const fx = await makeFixture();
+    try {
+      fx.insertSession({ id: 'sess_root', title: 'root conversation', time_created: T0 });
+      // two agent retries of the same prompt → identical titles, "duplicate" rows
+      fx.insertSession({ id: 'sess_subagent_agent_11111111-2222-3333-4444-555555555555', parent_id: 'sess_root', task_type: 'subagent_child', title: 'same prompt', time_created: T0 + 1 });
+      fx.insertSession({ id: 'sess_subagent_agent_66666666-2222-3333-4444-555555555555', parent_id: 'sess_root', task_type: 'subagent_child', title: 'same prompt', time_created: T0 + 2 });
+      fx.insertSession({ id: 'sess_side_chat', parent_id: 'sess_root', task_type: 'selection_side_chat', title: 'side chat', time_created: T0 + 3 });
+
+      const metas = await new ZcodeAdapter().listSessions(fx.root);
+      assert.deepEqual(metas.map((m) => m.sessionId), ['sess_root']);
+    } finally {
+      await fx.close();
+    }
+  });
+});
+
 /* ------------------------------------------------------------------ */
 /* Write: IR shapes from OTHER tools fuse into zcode-native rows       */
 /* ------------------------------------------------------------------ */
@@ -843,4 +861,13 @@ test('zcode real db: listSessions returns SessionMeta rows', { skip: !existsSync
   assert.ok(metas.every((m) => m.tool === 'zcode' && m.sessionId.startsWith('sess_')));
   const withTitle = metas.find((m) => m.title);
   assert.ok(withTitle, 'no titled session in real db list');
+  // roots only: no parent-linked child row may leak into the list
+  const db = new DatabaseSync(REAL_DB, { readOnly: true });
+  try {
+    const total = (db.prepare('SELECT COUNT(*) AS n FROM session').get() as { n: number }).n;
+    const children = (db.prepare('SELECT COUNT(*) AS n FROM session WHERE parent_id IS NOT NULL').get() as { n: number }).n;
+    assert.equal(metas.length, total - children);
+  } finally {
+    db.close();
+  }
 });

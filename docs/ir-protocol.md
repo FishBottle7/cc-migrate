@@ -9,7 +9,7 @@
 2. **目的是完整保全所有信息（加密内容除外）。** 源存储里存在、而 IR 没有槽位的信息，不允许静默丢弃，也不允许永远寄居在非类型化的 extensions 字符串里——extensions 是过渡方案，不是归宿。
 3. **不允许"不好分清"的信息存在。** 任何信息必须能无歧义地归属到它描述的实体（会话 / 消息 / 块 / 单次工具调用），且关联方式必须跟随实体本身（挂在实体字段上），而不是靠源存储 id 的旁路映射表约定——旁路表在消息被过滤、重排、跨工具转换后即失联。
 4. **扩展模式：typed bucket / 可选字段。** 新概念优先加类型化桶（参照 `goals` / `planModes` / `todos` / `toolCalls` 的既有模式）或实体上的可选字段；必须向后兼容——旧适配器不认识新桶时忽略即可，`validateSession` 同步校验。
-5. **每次扩展三件事同步落地**：validateSession 校验、至少一个适配器完成读写两端、本文档登记（桶清单 + 适配器状态）。
+5. **每次扩展四件事同步落地**：validateSession 校验、**全部写端**按需补分支（v3.1 教训：只要求"至少一个适配器"会让其余写端静默腐烂）、`IR_VERSION` bump + 各适配器 `irVersion` 同步（registry 硬闸门强制，见「IR 版本与同步闸门」）、本文档登记。
 6. **允许填空，但只在目标端写侧。** 源框架未记录的字段在 IR 里保持缺失（缺失 = 源端缺失 = 无损，禁止用猜测值污染 IR）；目标端为展示/回放所需，可按下方《填空（合成值）政策》合成可推导的近似值。
 
 ## 填空（合成值）政策
@@ -133,45 +133,79 @@ messages[] 里**全量保留**（含被遮蔽消息）——无损原则；"哪�
 
 > 残留小项：sidechain 子会话里无块投影的 assistant 载体行（timeline-event 宿主等）目前仍整体丢弃（主会话同类行已进 `zcode.syntheticMessages` 原始档案桶，且档案桶不参与写回——它保存的是读端原始行，重新物化超出 IR 契约）。待 sidechain 获得独立 extensions/meta 槽位时一并收敛。
 
-## IR 加固清单（2026-08-30 定稿，随 claude 适配器重写执行）
+## IR 版本与同步闸门（2026-08-30 落地）
+
+> 背景：v3.1 `developer` 角色"需同步的适配器：全部（写端）"实际只有 dsh 落地，
+> 其余 4 个写端静默违反（见下节登记）。版本配对此前只靠这张表的人工自觉，无机器约束。
+
+**机制（三件套，全部机器强制）：**
+
+1. **`IR_VERSION`**（ir.ts）——IR 协议版本常量。**每次协议变更（含加性扩展）必须随同 commit bump**。与数据面的 `schemaVersion`（序列化载荷判别符，破坏性改形才动）是两个概念。
+2. **`Adapter.irVersion`**（registry.ts）——每个适配器声明"最近一次按哪个协议版本审计过"。**registry.register() 硬闸门：irVersion 落后于 IR_VERSION 的适配器直接拒绝注册**——未同步的适配器根本无法运行（CLI/GUI/plugin 全部经 registry 构造），不存在"先跑着再说"。
+3. **契约测试**（test/ir-hardening.test.ts）——坏例电池 + 闸门测试 + developer 角色全端契约测试，由 CI（`.github/workflows/ci.yml`）执行。
+
+**变更流程**：改 IR（类型/桶/角色/校验）→ 同 commit 内 bump `IR_VERSION` + 同步全部内置适配器（写端行为 + `irVersion` 字段）+ validateSession 校验 + 本文档登记。适配器想"先忽略新字段"？可以——读端本就忽略可选字段，但 `irVersion` 必须到位，即必须**审计过**而非实现过。
+
+## 各端未同步问题登记（2026-08-30 调查驱动，✅ 已当日修复）
+
+> 调查方法：代码分支核查 + 每个 IR 角色注入三端实测（`developer`/`system` 消息喂给各写端看原生产物）。
+> 结论：v3.1 developer 降级规则 6 个写端只有 codex（原生）/dsh 落地；另发现 claude 旁链 assistant 独立 bug。
+
+| 适配器 | 问题 | 实测证据 | 状态 |
+|--------|------|----------|------|
+| zcode | 写端只分支 `user\|system`+skip `tool`，**developer 落入 assistant fall-through**，写成 `role:'assistant'`+`assistant_response` 行——v3.1 明令禁止的降级 | 探针实测：DEV-MSG → assistant 行 | ✅ developer 并入 user/system 行（system_reminder 语义，provider 可见，引擎注入形态） |
+| opencode | DB 写入路径同样 fall-through 成 assistant（只有 user/tool/system 分支）；mirror 路径无损保留 | 探针实测 | ✅ developer 并入 user 分支（可见 user 行）；mirror 分支本就原样保留 |
+| pi | **把 `role:'developer'`/`role:'system'` 原样写进 pi 原生存储**——pi 词汇表只有 user/assistant/toolResult，属非法行；且 pi 自己的 parse 把非 user 角色读回 `assistant`，写入/读出自相矛盾，往返即失真 | 探针实测：round-trip roles = assistant, assistant | ✅ developer/system 降为 user 文本行，round-trip 稳定为 user |
+| claude | ① developer/system 落入 user-family，写成模型可见的 `type:'user'` 行（协议要求"并入或降为 system"）；② **旁链 assistant 被写成 `type:'user'` 记录**——`emitMessage` assistant 分支误加 `isSidechain === false` 门（write.ts），旁链无独立 raw 通道（claude/index.ts:115 注释），claude→claude 旁链往返与跨工具→claude 子代理迁移全部损坏；测试无旁链 assistant 写回用例，未拦截 | 探针实测：旁链 "done" → user 行；DEV-MSG/SYS-MSG → user 行 | ✅ ① 新增 system/developer → `type:'system'` 行分支（未知 subtype 经 parse 回 sessionEvents 桶保数据）；② 去掉 isSidechain 门，旁链 assistant 正常走 assistant 分支 |
+| codex | 读端 parse 出口不跑 validateSession（只有写端跑） | 代码核查 | ✅ parse 出口补 validateSession |
+| dsh | 无问题（developer → plugin 注入 user 消息，代码有注释；与本文档"降为 system"措辞有出入，属有意选择，措辞以此为准） | — | ✅（补记措辞） |
+
+**同一轮加固顺带发现**：codex 原生 rollout 存在**无 `call_id` 的孤儿 `function_call_output`**，codex 读端以空串 `toolUseId: ''` 表示"无配对"。按填空政策（关联指针宁缺勿错）**不得伪造非空 id**，故块级校验对 `tool_result.toolUseId` 放宽为"string 即可，空串 = 合法孤儿标记"，消费端必须把空串当"无配对"处理。
+
+## IR 加固清单（2026-08-30 定稿，✅ 当日全部落地）
 
 > 背景：现有三层约束（TS 类型 / `validateSession` / 每适配器 round-trip 测试）骨架成立，但有四个缺口：① 校验深度浅——`isMigratedMessage`（ir.ts:281）只查 role 合法 + content 是数组，**块级形状完全不查**，缺 `callId` 的 tool_result 也能过；② `extensions` 是 `Record<string, unknown>`（ir.ts:271），无任何形状；③ 引擎无统一卡点——`migrate.ts` 的 `readSource`/`writeTarget` 是纯透传（migrate.ts:17-28），校验全靠适配器自觉；④ 仓库无 CI。四层加固，**零新依赖**（不引 zod：ContentBlock 联合小而稳定，手写守卫贴合仓库风格；将来 IR 拆独立包对外发布给第三方适配器时再评估）。
+>
+> **执行结果（2026-08-30 当日）**：第一/二/三层全部落地于 `ir.ts`/`migrate.ts`；第四层坏例电池 + 闸门/契约测试落在 `test/ir-hardening.test.ts`，CI 为 `.github/workflows/ci.yml`。金丝雀如期奏效：codex 孤儿 tool_result（空 `toolUseId`）被块级校验拦下，按填空政策放宽为合法孤儿标记（见上节登记），其余 111 个既有测试零回归。唯一与原清单的差异：`tool_use.id/name` 非空、`tool_result.toolUseId` 允许空串（孤儿标记），其余照单全收。
 
-### 第一层：校验下探到块级（只动 `ir.ts`，与 claude 重写解耦，先做）
+### 第一层：校验下探到块级（✅ 已落地，只动了 `ir.ts`）
 
 - 新增 `isContentBlock()`，按判别式逐型校验：
   - `text`：`text` 为 string
   - `tool_use`：`id`/`name` 非空 string，`input` 有定义
-  - `tool_result`：`toolUseId` 非空 string，`content` 为 string，`isError` 出现时为 boolean，`attachments` 出现时为合法 FileBlock 数组（每块 `filename`/`mediaType`/`data`/`url` 出现时均为 string）
+  - `tool_result`：`toolUseId` 为 string（**空串 = 合法孤儿标记**，见「各端未同步问题登记」末段——按填空政策不伪造非空 id），`content` 为 string，`isError` 出现时为 boolean，`attachments` 出现时为合法 FileBlock 数组（每块 `filename`/`mediaType`/`data`/`url` 出现时均为 string）
   - `thinking`：`thinking` 为 string；**`signature` 出现时必须为 string**（逐字节透传的无损关键件，绝不允许被换成非字符串占位）
   - `file`：`data`/`url`/`filename` 至少其一存在，四个字段出现时均为 string
   - 未知 `type` → **拒绝**（闭集：新块类型必须走 IR 演进流程登记，临时扩展走 extensions 桶——设计共识 #4）
-- `isMigratedMessage` 加深：`synthetic`/`seq`/`timestamp` 类型校验、`meta` 必须是对象
+- `isMigratedMessage` 加深：`synthetic`/`seq`/`timestamp` 类型校验、`meta` 必须是对象、块级全查
 - `isValidToolCall` 加深：`output`/`error`/`title` 出现时为 string、`time.{start,end}` 为 number、`source` 形状完整
-- 错误信息带完整定位路径（`message[i].content[j]...`）
-- 兼作**金丝雀**：加深后若现有 6 适配器有产出过不了块级校验，先修适配器再叠新功能
+- 错误信息带完整定位路径（`message[i].content[j]...`，含坏块 JSON 预览）
+- 兼作**金丝雀**：加深后现有 6 适配器的产出全部过检（codex 孤儿 tool_result 按"空串孤儿标记"放行）
 
 ### 第二层：扩展槽位最小形状（✅ 已随 claude 重写落地，见 v3.2 登记）
 
 - `extensions` 守卫：已知命名空间（`claude` 等）出现时必须是对象；`recordsRaw` 必须是数组；**`rawResult` 保持 `unknown` 不加强约束**（toolUseResult 原样透传，形状由各工具自己定义）
 - `systemPrompt`（ir.ts:224，语义已冻结于上表 #8）：出现时必须为 string，空串合法（= claude 源恒空的语义）
 
-### 第三层：收口到引擎（`migrate.ts` 两处 + `ir.ts` 一处）
+### 第三层：收口到引擎（✅ 已落地，`migrate.ts` 两处 + `ir.ts` 一处）
 
 - `readSource` 出口、`writeTarget` 入口各加一次 `validateSession`——校验从"适配器自觉"升级为"引擎强制"，任何适配器无法绕过；适配器内部现有调用保留作双保险
-- `schemaVersion` 改严格必填 `= 2`（去掉"未定义放行"分支，ir.ts:335-340）
+- `schemaVersion` 改严格必填 `= 2`（"未定义放行"分支已删除）
+- 附带：`originTool` 闭集校验、会话级 `goals`/`planModes`/`todos`/`unmappedEvents`/`sessionEvents`/`branchSummaries`/`compaction.*` 逐项校验（此前会话级这些桶完全不查）
 
-### 第四层：测试与 CI（当前最大缺口）
+### 第四层：测试与 CI（✅ 已落地）
 
-- 坏例电池：每块型/每关键字段各构造一个畸形 IR，断言 `validateSession` 抛错且错误信息带正确路径
-- 契约测试：对每个已注册适配器喂毒 IR 调 `write()`，必须抛错——证明引擎卡点真实生效
-- 新增 `.github/workflows/ci.yml`：install + typecheck + test——没有 CI，"三同步"永远只是流程约定
+- 坏例电池：`test/ir-hardening.test.ts`——每块型/每关键字段畸形 IR，断言 `validateSession` 抛错且错误信息带路径
+- 契约测试：引擎卡点（喂毒 IR 给 `writeTarget`，断言适配器从未被执行）+ registry 版本闸门 + developer 角色全写端契约（claude/pi/zcode/opencode 各一）+ claude 旁链 assistant 契约
+- `.github/workflows/ci.yml`：ubuntu + windows 矩阵，install + typecheck + test
 
 ### 执行顺序
 
 第一/三/四层与 claude 重写完全解耦（只碰 `ir.ts`/`migrate.ts`/测试），**先做**——小 diff、现有测试立即验回归；第二层绑重写（依赖 #6/#7 落地时一并守卫）。
 
 ## 适配器适配状态
+
+> 下表的"✅"不再是自述——`Adapter.irVersion` 已由 registry 硬闸门机器强制（落后 = 无法注册），契约测试锁定各写端行为。
 
 | 适配器 | 状态 |
 |--------|------|

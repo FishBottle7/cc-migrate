@@ -82,7 +82,7 @@ import type {
   MigratedToolCall,
   SessionMeta,
 } from '../../ir.js';
-import { validateSession } from '../../ir.js';
+import { IR_VERSION, validateSession } from '../../ir.js';
 import { blocksToText } from '../../content.js';
 
 /* ------------------------------------------------------------------ */
@@ -400,6 +400,7 @@ async function readProviderRegistry(configPath: string): Promise<Record<string, 
 
 export class ZcodeAdapter implements Adapter {
   readonly tool = 'zcode' as const;
+  readonly irVersion = IR_VERSION;
 
   async parse(sessionId: string, root?: string): Promise<MigratedSession> {
     const dbPath = resolveDbPath(root);
@@ -421,8 +422,12 @@ export class ZcodeAdapter implements Adapter {
     const opened = await openLiveReadOnly(dbPath);
     if (!opened) return [];
     try {
+      // roots only (engine session/list roots:true): subagent_child /
+      // selection_side_chat / workflow_* rows carry parent_id and are already
+      // folded into their parent by parse() as sidechains — listing them here
+      // would surface every agent retry as a standalone "duplicate" session.
       const rows = opened.db.prepare(
-        'SELECT id, title, time_created, directory FROM session ORDER BY time_created DESC',
+        'SELECT id, title, time_created, directory FROM session WHERE parent_id IS NULL ORDER BY time_created DESC',
       ).all() as Row[];
       return rows.map((r) => ({
         tool: 'zcode' as const,
@@ -1466,8 +1471,12 @@ function writeMessages(
 
     if (msg.role === 'tool') continue; // fused into the preceding assistant's tool parts
 
-    if (msg.role === 'user' || msg.role === 'system') {
-      const isSystem = msg.role === 'system' && !zmeta?.semantics;
+    if (msg.role === 'user' || msg.role === 'system' || msg.role === 'developer') {
+      // developer (v3.1): project as an engine-injected user row —
+      // system_reminder semantics stay provider-visible on replay; never fall
+      // through to the assistant branch (the model would read it as its own
+      // words).
+      const isSystem = (msg.role === 'system' || msg.role === 'developer') && !zmeta?.semantics;
       // compaction-summary rows carry their native semantics in meta.zcode —
       // restore them as the engine wrote them, not as real_user prompts (gap #3)
       const isSummary = !isSystem &&

@@ -6,10 +6,20 @@
  * core — so the format logic lives exactly once.
  */
 
+import { compareIrVersions, IR_VERSION } from './ir.js';
 import type { MigratedSession, SessionMeta, ToolId } from './ir.js';
 
 export interface Adapter {
   readonly tool: ToolId;
+  /**
+   * IR protocol version this adapter was last audited against (see
+   * `IR_VERSION` in ir.ts). The registry REFUSES to register an adapter whose
+   * version is older than the core's — an un-synced adapter must be brought
+   * up to date (write-side handling of new slots/roles per
+   * docs/ir-protocol.md) before it can run at all. Bump both sides in the
+   * same commit that extends the IR.
+   */
+  readonly irVersion: string;
 
   /** List available sessions in a given root/dir (or default). Lightweight. */
   listSessions(root?: string): Promise<SessionMeta[]>;
@@ -76,6 +86,15 @@ export interface AdapterRegistry {
 class MapRegistry implements AdapterRegistry {
   #map = new Map<ToolId, Adapter>();
   register(adapter: Adapter): void {
+    if (compareIrVersions(adapter.irVersion, IR_VERSION) < 0) {
+      throw new Error(
+        `registry: adapter "${adapter.tool}" targets IR v${adapter.irVersion} but this core speaks v${IR_VERSION} — ` +
+        `sync the adapter first (write-side handling of new slots/roles, docs/ir-protocol.md「适配器适配状态」), then bump its irVersion`,
+      );
+    }
+    if (this.#map.has(adapter.tool)) {
+      throw new Error(`registry: adapter for tool "${adapter.tool}" already registered`);
+    }
     this.#map.set(adapter.tool, adapter);
   }
   get(tool: ToolId): Adapter {

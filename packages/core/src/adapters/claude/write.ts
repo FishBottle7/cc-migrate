@@ -139,6 +139,18 @@ function lastLeafUuidOf(records: Record<string, unknown>[]): string | undefined 
   return undefined;
 }
 
+/** Join a message's text blocks (file/attachments render as placeholders, mirroring claudeNativeBlock). */
+function plainOf(msg: MigratedMessage): string {
+  return msg.content
+    .map((b) => {
+      if (b.type === 'text') return b.text;
+      if (b.type === 'file') return `[file: ${b.filename ?? b.url ?? b.mediaType ?? 'attachment'}]`;
+      return '';
+    })
+    .filter(Boolean)
+    .join('\n');
+}
+
 function envelopeFromMeta(meta: Record<string, unknown>): Partial<Record<string, unknown>> {
   const out: Record<string, unknown> = {};
   // teamName/agentName/promptId precede the message in the native stamp order
@@ -171,8 +183,11 @@ function emitMessage(ctx: EmitCtx, msg: MigratedMessage, opts: { compactSummary?
   };
   const isSidechain = ctx.isSidechain;
 
-  if (isSidechain === false && msg.role === 'assistant') {
+  if (msg.role === 'assistant') {
     // ---- assistant: tool_use blocks; tool_results are separate user rows ----
+    // Applies to sidechains too: a sidechain assistant gated out of this
+    // branch would fall into the user-family path below and be written as a
+    // type:'user' record (subagent output re-read as human input).
     const content = msg.content.filter((b) => b.type !== 'tool_result').map(claudeNativeBlock);
     if (!content.length) return;
     let message: Record<string, unknown>;
@@ -281,6 +296,42 @@ function emitMessage(ctx: EmitCtx, msg: MigratedMessage, opts: { compactSummary?
       timestamp: ts,
       uuid,
       ...(meta.isMeta === true ? { isMeta: true } : {}),
+      userType: st.userType ?? 'external',
+      entrypoint: st.entrypoint ?? 'cli',
+      cwd: st.cwd,
+      sessionId: st.sessionId,
+      ...(st.snakeSessionId ? { session_id: st.sessionId } : {}),
+      version: st.version,
+      gitBranch: st.gitBranch,
+      slug: st.slug,
+      sessionKind: st.sessionKind,
+    };
+    stripUndefined(record);
+    state.records.push(record);
+    state.parentUuid = uuid;
+    trackEmitted();
+    return;
+  }
+
+  // v3.1 developer-role rule (docs/ir-protocol.md): claude 并入 system。A
+  // foreign system/developer row must NOT reach the user-family below — that
+  // would write it as a model-visible type:'user' row (the model reads it as
+  // human input). type:'system' with an unknown subtype round-trips into the
+  // sessionEvents bucket on re-parse (parse.ts classifies non-transcript
+  // subtypes there), so the payload survives claude→claude.
+  if (msg.role === 'system' || msg.role === 'developer') {
+    const text = plainOf(msg);
+    const uuid = randomUUID();
+    const record: Record<string, unknown> = {
+      parentUuid: state.parentUuid,
+      isSidechain,
+      type: 'system',
+      subtype: typeof meta.systemSubtype === 'string' ? meta.systemSubtype : msg.role === 'developer' ? 'external_developer' : 'external',
+      ...(text ? { content: text } : {}),
+      ...(meta.level !== undefined ? { level: meta.level } : {}),
+      timestamp: ts,
+      uuid,
+      ...(msg.synthetic === true ? { isMeta: true } : {}),
       userType: st.userType ?? 'external',
       entrypoint: st.entrypoint ?? 'cli',
       cwd: st.cwd,

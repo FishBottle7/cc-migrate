@@ -112,7 +112,7 @@ import type {
   MessageRole,
   SessionMeta,
 } from '../../ir.js';
-import { validateSession } from '../../ir.js';
+import { IR_VERSION, validateSession } from '../../ir.js';
 import { blocksToNative, blocksToText, normalizeContent } from '../../content.js';
 import {
   compressFrame,
@@ -241,6 +241,7 @@ function hasEncrypted(obj: unknown): boolean {
 
 export class DshAdapter implements Adapter {
   readonly tool = 'dsh' as const;
+  readonly irVersion = IR_VERSION;
 
   /** Parse one DSH session artifact file into IR. */
   async parse(sessionId: string, root?: string): Promise<MigratedSession> {

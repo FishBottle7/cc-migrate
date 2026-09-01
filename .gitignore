@@ -10,6 +10,8 @@ docs/_probe*
 # audit scratch homes & probe scripts
 .tmp-*/
 packages/core/scratch/
+# 08-30 opencode parent_id 抢救的本地残留（docs/agents/opencode.md 有引用，仅本地保留）
+.db-rescue/
 
 # generic temp files / editor droppings
 *.tmp

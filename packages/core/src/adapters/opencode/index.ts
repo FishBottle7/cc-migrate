@@ -49,7 +49,7 @@ import { randomUUID } from 'node:crypto';
 import { existsSync } from 'node:fs';
 import type { Adapter, WriteOptions, WriteResult } from '../../registry.js';
 import type { ContentBlock, FileBlock, MigratedCompaction, MigratedMessage, MigratedSession, MigratedSidechain, SessionMeta } from '../../ir.js';
-import { validateSession } from '../../ir.js';
+import { IR_VERSION, validateSession } from '../../ir.js';
 import { blocksToText, normalizeContent } from '../../content.js';
 
 type OpRow = Record<string, unknown>;
@@ -160,6 +160,7 @@ async function openDb(dbPath: string, opts?: { readOnly?: boolean }): Promise<Db
 
 export class OpenCodeAdapter implements Adapter {
   readonly tool = 'opencode' as const;
+  readonly irVersion = IR_VERSION;
 
   async parse(sessionId: string, root?: string): Promise<MigratedSession> {
     const dbPath = resolveDbPath(root);
@@ -891,7 +892,10 @@ function writeMessages(
     const time = m.timestamp ?? now;
     const id = scope.newMsgId(time);
 
-    if (m.role === 'user') {
+    if (m.role === 'user' || m.role === 'developer') {
+      // developer (v3.1) degrades to a visible user row here — OpenCode has no
+      // developer channel, and falling through to the assistant branch below
+      // would put the text in the model's own mouth. system stays dropped.
       // Compaction checkpoint -> boundary pair (native OpenCode semantics).
       // tail_start_id is intentionally NOT re-emitted: message ids are
       // regenerated on write and a preserved source id would dangle — the
