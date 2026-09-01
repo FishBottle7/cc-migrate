@@ -162,6 +162,11 @@ export function buildRolloutLines(
   }
   emitters.sort((a, b) => a.key - b.key || a.order - b.order);
 
+  // Foreign turn synthesis state (§11.3): N-th turn counter + trailing text.
+  let turnSeq = 0;
+  let openTurnId: string | undefined;
+  let lastAssistantText: string | undefined;
+
   for (const em of emitters) {
     if (em.kind === 'event') {
       emitUnmapped(lines, em.ev, paginated);
@@ -200,12 +205,34 @@ export function buildRolloutLines(
       continue;
     }
 
+    // Foreign turn-boundary synthesis (§11.3): a real user prompt opens a turn
+    // (task_started right before its first row), and the next real prompt or
+    // end-of-stream closes it (task_complete with the last assistant text).
+    // Without these rows codex's reverse-scan reconstruction treats the whole
+    // migrated session as ONE turn — thread_rolled_back {num_turns:1} would
+    // rewind the entire session. Codex-native IR already carries its own turn
+    // events in unmappedEvents (guarded above by sessionCodex).
+    if (!sessionCodex && isTurnBoundaryUser(msg)) {
+      if (openTurnId) {
+        lines.push(taskCompleteLine(msg.timestamp ?? createdAt, openTurnId, lastAssistantText));
+      }
+      openTurnId = syntheticTurnId(msg.timestamp ?? createdAt, ++turnSeq);
+      lines.push(taskStartedLine(msg.timestamp ?? createdAt, openTurnId));
+    }
+    if (msg.role === 'assistant') {
+      const text = textOfBlocks(msg.content);
+      if (text) lastAssistantText = text;
+    }
+
     for (const row of em.inlineRows) {
       emitNativeRow(lines, row, paginated);
     }
     for (const item of messageToResponseItems(msg, ir, createdAt)) {
       lines.push(item);
     }
+  }
+  if (!sessionCodex && openTurnId) {
+    lines.push(taskCompleteLine(createdAt, openTurnId, lastAssistantText));
   }
 
   // Stitched paginated chains merge several files' ordinal spaces into one
@@ -665,6 +692,58 @@ function messageToSingleResponseItem(msg: MigratedMessage, ir: MigratedSession):
     if (payload) return payload;
   }
   return foreignBlocksToPayloads(msg, ir, 0)[0] ?? { type: 'message', role: 'assistant', content: [] };
+}
+
+/* ------------------------------------------------------------------ */
+/* foreign turn-boundary synthesis (§11.3)                             */
+/* ------------------------------------------------------------------ */
+
+/**
+ * A real user prompt opens a codex turn. Same rule as titleFromMessages
+ * (parse.ts): user role, not synthetic, no harness contentKind markers —
+ * dsh/claude/zcode injected rows must not fragment the turn stream.
+ */
+function isTurnBoundaryUser(msg: MigratedMessage): boolean {
+  if (msg.role !== 'user' || msg.synthetic) return false;
+  const codex = (msg.meta as Record<string, unknown> | undefined)?.codex as Record<string, unknown> | undefined;
+  if (codex?.contentKind || codex?.kind) return false;
+  return msg.content.some((b) => b.type === 'text' && b.text.trim());
+}
+
+/**
+ * task_started / task_complete event_msg rows shaped like the official
+ * external-agent-migration importer's (session_importer.rs:457-497) — field
+ * set verified against real rollouts on this machine (both spellings
+ * task_started/task_complete are the wire aliases codex persists, §5).
+ * turn_id is a fresh uuid per synthesized turn; timestamps derive from the
+ * source messages, never fabricated wall-clock "now"s mid-history.
+ */
+function taskStartedLine(atMs: number, turnId: string): RolloutLineRaw {
+  return line(rolloutTimestamp(atMs), undefined, 'event_msg', {
+    type: 'task_started',
+    turn_id: turnId,
+    started_at: Math.floor(atMs / 1000),
+    collaboration_mode_kind: 'default',
+  });
+}
+
+function taskCompleteLine(atMs: number, turnId: string, lastAssistantText: string | undefined): RolloutLineRaw {
+  const payload: Record<string, unknown> = {
+    type: 'task_complete',
+    turn_id: turnId,
+  };
+  if (lastAssistantText) payload.last_agent_message = lastAssistantText;
+  return line(rolloutTimestamp(atMs), undefined, 'event_msg', payload);
+}
+
+/**
+ * Deterministic uuid-shaped turn id derived from the session timestamp + the
+ * N-th synthesized turn (real events use uuidv7s; the seed keeps re-writes of
+ * the same IR reproducible and can never collide with a source uuidv7 space).
+ */
+function syntheticTurnId(atMs: number, turnSeq: number): string {
+  const seed = `${(atMs >>> 0).toString(16).padStart(8, '0')}${(turnSeq * 2654435761 >>> 0).toString(16).padStart(8, '0')}`;
+  return `${seed}-0000-4000-8000-${(turnSeq >>> 0).toString(16).padStart(12, '0')}`;
 }
 
 /* ------------------------------------------------------------------ */

@@ -477,6 +477,102 @@ test('write: foreign compaction bucket → native compacted record with synthesi
   assert.ok(messages.some((m) => JSON.stringify(m.payload.content).includes('folded question')));
 });
 
+test('write: foreign IR synthesizes task_started/task_complete turn boundaries (§11.3)', () => {
+  const ir = fallbackIr();
+  ir.createdAt = 1_800_000_000_000;
+  ir.messages = [
+    { role: 'user', timestamp: ir.createdAt + 1000, content: [{ type: 'text', text: 'first prompt' }] },
+    { role: 'assistant', timestamp: ir.createdAt + 2000, content: [{ type: 'text', text: 'first answer' }] },
+    // harness-injected row (dsh plugin) must NOT open its own turn
+    { role: 'user', timestamp: ir.createdAt + 3000, synthetic: true, content: [{ type: 'text', text: '<system-reminder>…</system-reminder>' }] },
+    { role: 'user', timestamp: ir.createdAt + 4000, content: [{ type: 'text', text: 'second prompt' }] },
+    { role: 'assistant', timestamp: ir.createdAt + 5000, content: [{ type: 'text', text: 'second answer' }] },
+  ];
+  const lines = buildRolloutLines(ir, 'x', 'D:\\w', ir.createdAt, { targetCwd: 'D:\\w', createdAt: ir.createdAt, threadId: 'x' });
+  const records = lines.map((l) => JSON.parse(l) as { type: string; payload: Record<string, unknown>; timestamp: string });
+  const events = records.filter((r) => r.type === 'event_msg');
+
+  // exactly one paired boundary per real prompt turn: started(1) complete(1) started(2) complete(2)
+  assert.deepEqual(events.map((e) => e.payload.type), ['task_started', 'task_complete', 'task_started', 'task_complete']);
+  // pairing: same turn_id within each turn, distinct across turns
+  assert.equal(events[0].payload.turn_id, events[1].payload.turn_id);
+  assert.equal(events[2].payload.turn_id, events[3].payload.turn_id);
+  assert.notEqual(events[0].payload.turn_id, events[2].payload.turn_id);
+  // last_agent_message carries the turn's final assistant text
+  assert.equal(events[1].payload.last_agent_message, 'first answer');
+  assert.equal(events[3].payload.last_agent_message, 'second answer');
+  // position: task_started right before the turn's first message row; task_complete after the turn's rows
+  const idx = (needle: string) => records.findIndex((r) => JSON.stringify(r.payload).includes(needle));
+  const ts1 = idx('first prompt');
+  const ev0 = records.indexOf(events[0]);
+  assert.ok(ev0 < ts1 && ts1 - ev0 === 1, 'task_started sits immediately before the prompt row');
+  const ev1 = records.indexOf(events[1]);
+  const ts2 = idx('second prompt');
+  assert.ok(ev1 < ts2, 'task_complete for turn 1 precedes the next turn\'s prompt');
+  const ev3 = records.indexOf(events[3]);
+  assert.equal(records.length - 1, ev3, 'final task_complete closes the stream');
+  // timestamps derive from source messages, not wall-clock
+  assert.equal(events[0].timestamp, '2027-01-15T08:00:01.000Z');
+  assert.equal(events[0].payload.started_at, 1800000001);
+});
+
+test('write: turn synthesis edge cases — assistant-less turns, empty prompts, foreign tool rows', () => {
+  const t0 = 1_800_000_000_000;
+  // 1) no assistant text → task_complete without last_agent_message (real
+  //    rollouts carry it as Option; an interrupted first turn looks like this)
+  const ir = fallbackIr();
+  ir.createdAt = t0;
+  ir.messages = [{ role: 'user', timestamp: t0 + 1000, content: [{ type: 'text', text: 'only prompt' }] }];
+  let records = buildRolloutLines(ir, 'x', 'D:\\w', t0, { targetCwd: 'D:\\w', createdAt: t0, threadId: 'x' }).map((l) => JSON.parse(l) as Record<string, unknown>);
+  let events = records.filter((r) => r.type === 'event_msg') as Array<{ payload: Record<string, unknown> }>;
+  assert.deepEqual(events.map((e) => e.payload.type), ['task_started', 'task_complete']);
+  assert.equal('last_agent_message' in events[1].payload, false);
+
+  // 2) whitespace-only / non-text prompts open no turn (titleFromMessages rule)
+  ir.messages = [
+    { role: 'user', timestamp: t0, content: [{ type: 'text', text: '   ' }] },
+    { role: 'user', timestamp: t0 + 1000, content: [{ type: 'tool_result', toolUseId: 'c1', content: 'orphan result' }] },
+  ];
+  records = buildRolloutLines(ir, 'x', 'D:\\w', t0, { targetCwd: 'D:\\w', createdAt: t0, threadId: 'x' }).map((l) => JSON.parse(l) as Record<string, unknown>);
+  assert.equal(records.filter((r) => r.type === 'event_msg').length, 0, 'no real prompt → no synthesized turn rows');
+});
+
+test('write: codex-native IR never double-synthesizes turn boundaries', () => {
+  // Source already carries its own task_started/task_complete in unmappedEvents;
+  // replay is the codex-native path — the synthesis branch must not fire.
+  const srcRecords = lines(richFixture());
+  const ir1 = rolloutRecordsToIr(srcRecords, {});
+  assert.ok(ir1.unmappedEvents!.some((u) => u.type === 'task_started' || u.type === 'task_complete'));
+  const ir2 = buildRolloutLines(ir1, '019b-new-thread', 'D:\\proj', Date.parse('2026-01-12T12:55:47.732Z'), {
+    targetCwd: 'D:\\proj', createdAt: Date.parse('2026-01-12T12:55:47.732Z'), threadId: '019b-new-thread', keepSynthetic: true,
+  }).map((l) => JSON.parse(l) as Record<string, unknown>);
+  // every task_* event in the rewrite comes from the replayed source rows — count preserved, no additions
+  const srcEvents = srcRecords.filter((r) => r.type === 'event_msg' && String((r.payload as Record<string, unknown>)?.type ?? '').startsWith('task_'));
+  const outEvents = ir2.filter((r) => r.type === 'event_msg' && String((r.payload as Record<string, unknown>)?.type ?? '').startsWith('task_'));
+  assert.equal(outEvents.length, srcEvents.length);
+});
+
+test('write: foreign IR round-trips through codex parse with turn events intact', () => {
+  // E2E shape: foreign write → codex's own parse picks the synthesized events
+  // up as unmappedEvents (type = inner tag) — resume segmentation data present.
+  const ir = fallbackIr();
+  ir.createdAt = 1_800_000_000_000;
+  const out = buildRolloutLines(ir, 'x', 'D:\\w', ir.createdAt, { targetCwd: 'D:\\w', createdAt: ir.createdAt, threadId: 'x' });
+  const back = rolloutRecordsToIr(parseRolloutLines(out.join('\n')), {});
+  const turnEvents = (back.unmappedEvents ?? []).filter((u) => u.type === 'task_started' || u.type === 'task_complete');
+  assert.equal(turnEvents.length, 2, 'started+complete for the single demo turn');
+  const started = turnEvents.find((u) => u.type === 'task_started')!;
+  assert.equal((started.data as Record<string, unknown>).turn_id, (turnEvents.find((u) => u.type === 'task_complete')!.data as Record<string, unknown>).turn_id, 'pairing survives parse');
+  // messages untouched by the synthesis itself: same count, same roles in order
+  // (the assistant row splits into message+function_call items on the codex
+  // side — that's the native projection, not a synthesis artifact)
+  assert.deepEqual(
+    back.messages.filter((m) => m.role !== 'assistant' || (m.content.some((b) => b.type === 'text'))).map((m) => m.role),
+    ir.messages.map((m) => m.role),
+  );
+});
+
+
 test('write: session_index.jsonl gets exactly one appended line, never rewritten', async () => {
   const adapter = new CodexAdapter();
   const root = await tempRoot();

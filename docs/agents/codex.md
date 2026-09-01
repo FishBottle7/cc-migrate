@@ -214,10 +214,15 @@
 - **event_msg 回写门控**（§5 持久化子集的写端落实）：`unmappedEvents` 重放默认分支只发内层 `type` 命中**持久化变体名单**的载荷（`task_started`/`token_count`/`thread_rolled_back` 等两模式持久项 + legacy-only 项，两种 wire 拼写都收）；官方已退役的类型（`thread_name_updated`/`guardian_assessment`/`undo_completed`，codex line_parser 以 `Ok(None)` 跳过）和非 codex tag 一律不回写——不发注定被官方工具链丢弃的行（AGENT.md 事件跨工具共识）。另注：unmappedEvents 重放整体包在 `sessionCodex` 守卫内，**外来 IR 的事件本来就不写进 codex 文件**。
 - **子代理读端拼装 + 召唤点锚定**（§8 子代理行的落地）：`parse()` 后对全 home 每个 rollout 做**首行** meta 扫描（子文件首行必为自己的 meta，见 §1 表格第 1 行"多条 session_meta"；64KB 分块 / 512KB 上限 / `.zst` 解压；`subagentIndexCache` 5s TTL），按 `thread_spawn.parent_thread_id` 建 parent→children 索引——严格 `thread_spawn`/`thread_source==='subagent'` 守卫，用户 fork（`forked_from_id`）不算；递归解析子线程拼进 `ir.sidechains[]`（孙代嵌套；agentType = agent_nickname → agent_role → agent_path 尾段；visited 集防环）。**召唤点**：父 rollout 的 `spawn_agent` function_call `task_name` == 子线程 `agent_path` 尾段（0.146 实测 `/root/realtime_preemptive_slice/preemptive_review` ← `task_name:"preemptive_review"`）→ `sidechain.parentMessageId` = 该 call_id，GUI 据此把子代理锚到派发行做「跳转到召唤处」。GUI 投射（worker）：嵌套旁链拍平展示；注入行按 IR `meta.codex.contentKind`（及 kind `iac`/`compaction_summary`）投 `injectionKind`——`agent_message` 是真助手消息，不算注入；AGENTS.md 指令行是非 synthetic 注入的典型（§7.2 规则 5 的 GUI 侧消费）。
 
-### 11.3 待办：外来→codex 的轮边界合成（条件触发，未实现）
+### 11.3 外来→codex 的轮边界合成（✅ 2026-08-31 已落地）
 
-外来 IR（dsh/claude/…）写 codex 时，消息投影为裸 `response_item` 流，**不含任何 `task_started`/`task_complete`**（源侧轮边界事件在 `unmappedEvents` 里且被 `sessionCodex` 守卫拦下）。codex resume 重建按 turn 事件对分段（rollout_reconstruction.rs 反向扫描），没有这些事件 = 整个迁移会话被当作**一整轮**：resume/加载正常，但粒度全错——`thread_rolled_back {num_turns:1}` 会回滚整个会话（本应只回滚最后一个 prompt），UI 轮次分组也是一坨。
+外来 IR（dsh/claude/…）写 codex 时，消息投影曾为裸 `response_item` 流，**不含任何 `task_started`/`task_complete`**（源侧轮边界事件在 `unmappedEvents` 里且被 `sessionCodex` 守卫拦下）。codex resume 重建按 turn 事件对分段（rollout_reconstruction.rs 反向扫描），没有这些事件 = 整个迁移会话被当作**一整轮**：resume/加载正常，但粒度全错——`thread_rolled_back {num_turns:1}` 会回滚整个会话（本应只回滚最后一个 prompt），UI 轮次分组也是一坨。
 
-**方案**（= 给 codex 写端补上 dsh 骨架合成器的对等能力，官方 external-agent-migration 导入器同款做法，见 §6 最小可 resume 集）：写端遍历 `ir.messages`，**真实**用户 prompt（非 synthetic、无 contentKind/kind，与标题推断同规则）开启新轮 `task_started {turn_id: N}`（N 从 1 递增），下一条真实用户 prompt 或流末尾收轮 `task_complete {turn_id: N, last_agent_message: <末条 assistant 文本>}`。是否同时伪造 `user_message`/`agent_message`/`token_count`（官方导入器连这些也伪造）待定——它们是 legacy-only 持久项，paginated 目标不需要。
+**已实现**（`write.ts` 轮合成分支，`!sessionCodex` 守卫——codex 原生源的事件重放路径不受影响，不会双份）：写端遍历 `ir.messages`，**真实**用户 prompt（非 synthetic、无 contentKind/kind，与标题推断 `titleFromMessages` 同规则）开启新轮 `task_started`，下一条真实 prompt 或流末尾收轮 `task_complete {last_agent_message: <末条 assistant 文本>}`。要点：
 
-**触发条件**：迁移会话在 codex 里实际使用后发现轮次粒度影响回滚/展示，再做；实现前须拿真实迁移文件验证 resume 行为（反向扫描对合成事件的接受度）。
+- `turn_id` 为确定性 uuid 形状（会话时间戳 + 轮序号种子），同 IR 重写可复现；时间戳取自源消息，不伪造 wall-clock。
+- 载荷字段集对齐真实 rollout 实测（`started_at` 秒级、`collaboration_mode_kind:'default'`、`last_agent_message` 仅在有 assistant 文本时出现）——本机 0.146 官方 external-agent-migration 导入器产物 + 后续两次成功 resume 的 rollout 同款形状。
+- `user_message`/`agent_message`/`token_count` **不伪造**：它们是 legacy-only 持久项，paginated 目标不需要，少发行少噪音。
+- 注入行（dsh skill-catalog、claude system-reminder 等 `synthetic`）不切轮——轮边界只认人类发言，与官方对 turn 的语义一致。
+
+**已知残留**：合成事件未经真实 codex CLI resume 实测（反向扫描对合成 turn_id 的接受度与官方导入器同源，风险低但未闭环）；`thread_rolled_back` 的 num_turns 语义在外来源侧无对应记录，不合成。

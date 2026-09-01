@@ -50,6 +50,23 @@
 
 `meta` 的契约要点：键是适配器命名空间；写回端只消费自己命名空间的键，未知键忽略。rawParts 还原时排在投影块之后（模型可见回放只来自 text/reasoning/tool part，块序已保真；raw 序只影响引擎记账部分）。extensions 里的 `zcode.messageExtras` / `zcode.compactions` / `zcode.compactionSummaries` 已随 #1/#2/#3 落地**废除**。
 
+## v3.3 登记（2026-09-01，pi 适配器重写前调查驱动；形状与理由详见 `docs/agents/pi.md` §8/§14）
+
+> 落地规则：本节为**调查定稿的拟变更**，随 pi 适配器重写同一 commit 落地——届时 bump `IR_VERSION` 至 3.3 并同步全部适配器 `irVersion`（闸门强制），本文表格转为「已落地」。全部为可选字段/命名空间载荷，旧端读取忽略即可。
+
+| 槽位 | 类型 | 语义 | 读写端 |
+|------|------|------|--------|
+| `branchSummaries[]` 条目扩形 | `{fromId, summary, anchorIndex?, time?, meta?}` | pi `branch_summary` entry 全保真：`anchorIndex` 指向 messages[] 里的投影 user 消息（anchor 契约，同 compaction 模式）；`meta` 承原生残件（details/usage/fromHook/entryId/timestamp）。旧形状 `{fromId, summary}` 仍合法 | pi 读写两端；其余忽略 |
+| `MigratedSession.meta.pi` | 会话级命名空间 | `header`（header 原文含 parentSession）、`settingsEvents`（model_change/thinking_level_change 全序列，写回按序重放）、`labels`（{targetId, label?, time}，含清除语义）、`customEntries`（{customType, data, time}）、`titleCleared`（session_info 显式清除） | pi 读写两端；其余忽略 |
+| `MigratedMessage.meta.pi` 扩展 | 消息级命名空间 | `message`（assistant 无槽位字段：api/responseModel/responseId/deferred/errorMessage/rawStopReason/endTurn/diagnostics/usage 补全）、`bash`（bashExecution 全字段 + excludeFromContext）、`customMessage`（customType/display/details）、`anchor`（{kind:'compaction'\|'branch_summary', entryId}，标记桶投影消息）、`addedToolNames`/`usage`（toolResult 补全） | pi 读写两端；其余忽略 |
+| pi `compaction[]` 消费 | 既有桶补全 | pi 写端开始消费 `compaction[]`（此前只 dsh/zcode/claude 消费）：桶 → 原生 compaction entry（summary/firstKeptEntryId/tokensBefore + meta 残件）；**anchor 消息跳过防双写**；v3 计划丢弃策略表「Pi 保留 branchSummaries/compaction」至此兑现 | pi 写端 |
+
+**anchor 消息契约（pi 端具体化，通用规则延续 compaction[].anchorIndex 先例）**：pi 的 compaction/branch_summary 在原生 context 里是 user 消息（`convertToLlm` 加 prefix/suffix 渲染）。IR 双载体：messages[] 插渲染文本 user 消息（`synthetic:true` + `meta.pi.anchor`），桶条目 `anchorIndex` 指向它。写回 pi：桶→原生 entry（summary 字段存纯摘要，渲染是 pi 运行时行为），anchor 消息跳过。写往其他工具：只消费 anchor 消息（文本随 messages 流动）。
+
+**pi 活跃面折叠选择（「压缩折叠坑」契约三选一的 pi 落点）**：选 3（完整归档）——IR messages[] 全量进 pi 文件，不伪造 compaction cut point。理由：pi 的 `firstKeptEntryId` 是 pi 运行时算出的 cut，迁移侧伪造会破坏摘要与保留段对应关系；代价是 pi resume 后上下文变大，属已知代价、语义诚实。
+
+**pi 系统提示词契约（v3.2 #8 的 pi 端执行细则）**：pi 会话文件不存提示词正文（运行时由 `.pi/SYSTEM.md`→`~/.pi/agent/SYSTEM.md`（替换）/ `APPEND_SYSTEM.md`（追加）/ AGENTS.md 家族重建，`docs/agents/pi.md` §9 全链路）。读端 `ir.systemPrompt` 恒空；写端**恒不注入**（pi 无会话级原生槽位，写正文必双叠），源提示词的正确通道是用户在 pi 侧配置 SYSTEM.md/APPEND_SYSTEM.md——迁移工具只提示不代写。
+
 ## v3.2 登记（2026-08-30，claude 适配器重写驱动）
 
 全部为可选字段，旧适配器忽略即可。登记范围 = `docs/agents/claude.md` §8 缺口 #6/#7/#8 的落地形状（`packages/core/src/ir.ts` 头注释 v3.2 节同步）。
@@ -131,7 +148,7 @@ messages[] 里**全量保留**（含被遮蔽消息）——无损原则；"哪�
 | 7 | ~~claude 非对话行~~ | ✅ 已落地（v3.2）：`sessionEvents` 桶（system subtype 行）+ 类型化字段（`tag`/`permissionMode`/`prLink`/`worktreeSession`/`costState`）+ `extensions.claude.recordsRaw` 保底；`local_command` 投影 user text + `synthetic:true`；`isMeta` → `synthetic:true`；attachment file → FileBlock | — | — |
 | 8 | ~~系统提示词无契约~~ | ✅ 已落地（v3.2）：`ir.systemPrompt` 语义冻结——源端无原生提示词则留空（claude 恒空）；目标端有原生通道走原生槽位（claude = 进程 flag `--append-system-prompt`）；claude 写端显式忽略 IR 值；禁止写进会话正文双叠 | — | 全体适配器 |
 
-> 残留小项：sidechain 子会话里无块投影的 assistant 载体行（timeline-event 宿主等）目前仍整体丢弃（主会话同类行已进 `zcode.syntheticMessages` 原始档案桶，且档案桶不参与写回——它保存的是读端原始行，重新物化超出 IR 契约）。待 sidechain 获得独立 extensions/meta 槽位时一并收敛。
+> ~~残留小项~~（✅ 2026-08-31 收敛）：sidechain 子会话里无块投影的 assistant 载体行（timeline-event 宿主等）此前整体丢弃——现归档到 `MigratedSidechain.meta['zcode.syntheticMessages']`（`MigratedSidechain` 自带 meta 槽位），与主会话 `zcode.syntheticMessages` 扩展桶同契约；档案桶仍不参与写回（保存读端原始行，重新物化超出 IR 契约）。
 
 ## IR 版本与同步闸门（2026-08-30 落地）
 
@@ -210,10 +227,10 @@ messages[] 里**全量保留**（含被遮蔽消息）——无损原则；"哪�
 | 适配器 | 状态 |
 |--------|------|
 | dsh | ✅ **全部落地**（meta.dsh 消息级+会话级，headerRaw 写回消费 / usage+interrupted / tool-result 事件级 error+meta / FileBlock 图像投影 + tool_result attachments / compaction 折叠 + 锚 / synthetic 判定 / toolCalls 桶读写 / 嵌套子代理（孙代+子会话全桶+深度保真+防覆盖）/ 列表标题 projcache→日志兜底 + 归档 + `_no-cwd` / 附件字节解析 `readDshAttachment`） |
-| zcode | ✅ 已落地（toolCalls / signature / meta / FileBlock / compaction 锚，读写两端） |
+| zcode | ✅ 已落地（toolCalls / signature / meta / FileBlock / compaction 锚，读写两端 / sidechain 载体行归档 `meta['zcode.syntheticMessages']`——2026-08-31 收敛，见上文残留小项） |
 | claude | ✅ **已重写**（2026-08-30，消费 #6/#7/#8 槽位）：读侧 DAG 链重建（`parentUuid` 主链 + `sourceToolAssistantUUID` 回指 + 同 `message.id` 兄弟并行 tool_result 恢复 + compact 边界 preservedMessages/preservedSegment relink + 死枝剪除 + trailing 深度先序）；三类记录全收（transcript 消息 / B 类元数据行 last-wins / C 类结构化行 + `sessionEvents` 桶）；`isMeta`→`synthetic`；`local_command`→user 文本+synthetic；attachment 67 类型投影 + 原样 meta；`toolUseResult`→`rawResult`；`path.ts` 200 截断 + hash；listSessions §1.0 过滤（uuid 门 + 首行 isSidechain + head teamName + mtime 去重）；subagent（agentId+isSidechain 过滤→leaf→链，teammate 前缀聚合）；写侧双路径：**claude→claude 走 `recordsRaw` 字节级还原**（逐行回写仅重盖 sessionId/session_id，行 uuid 保留——取舍见 docs/agents/claude.md §13）；跨工具走投影 native 盖章（insertMessageChain 盖章顺序、原始 `msg.timestamp` 优先、每条 tool_result 独立 user 记录 + `sourceToolAssistantUUID` 回指、attachment/local_command 原生形状回写、last-prompt 带 leafUuid 不带 cwd、toolUseResult 写前 sanitize、compaction boundary 对回放不双写、sidecar agentMeta 合并、leafUuid 指认活跃 leaf、`wx` 原子写防覆盖拒绝） |
-| pi | ✅ 兼容——新桶均为可选字段，忽略即可；pi 已带 FileBlock 文本降级 |
-| codex | ✅ **全部落地**（11 类 rollout 记录全量读写 / response_item 17 变体 1:1 消息投影 + native payload 重建（reasoning summary+content、function/custom/local_shell/tool_search/web_search/image_generation、agent_message+inter_agent_communication 模型可见、developer 角色保留）/ turn_context+world_state 挂轮首消息、孤行归档重放 / compacted→compaction 桶（RH+窗口字段+锚）/ event_msg 全量→unmappedEvents（seq=行号）写回重放 / additional_tools、compaction_trigger、other 归档重放 / session_meta 继承链 + source/thread_source/git/agent_* 原生保真 / session_index append-only 写回 / .zst + `_<rolloutId>` revert 变体 + archived_sessions / **harness 注入行官方分类**：`content_item_kinds` 主通道 + codex rollback.rs 冻结文本标记 fallback——goal resume、system reminder、AGENTS.md、user_shell_command 等不再误判为用户提示词 / `meta.codex.sourceDir/sourceFile` 源文件夹捕获 / **paginated history_mode 按源保真 + history_base 跨文件链式拼接**（byte 精确截断、防环递归，写端自足单文件）+ `SessionMeta.parentSessionId` 子代理树 / `deferredCreation` 空会话 / 标题=首条真实用户 prompt） |
+| pi | 🔄 **待重写**（2026-09-01 深度调查定稿，见 `docs/agents/pi.md` 全文 + §8/§13 任务清单）：现状 parse 仅覆盖 3/10 条目类型（compaction/branch_summary/custom_message/custom/label/session_info 整体丢弃，含 v3 计划明确承诺保留的 compaction/branchSummaries——写端也不消费两桶），七 role 消息词汇缺 4（bashExecution/custom/branchSummary/compactionSummary），assistant 字段级（usage 等 9 字段）丢弃；leaf 判定用「最后 message」而 pi 是「最后 entry」；系统提示词/删除红线/树-sidechain 契约已定稿。v3.3 槽位（§v3.3 登记）随重写落地 |
+| codex | ✅ **全部落地**（11 类 rollout 记录全量读写 / response_item 17 变体 1:1 消息投影 + native payload 重建（reasoning summary+content、function/custom/local_shell/tool_search/web_search/image_generation、agent_message+inter_agent_communication 模型可见、developer 角色保留）/ turn_context+world_state 挂轮首消息、孤行归档重放 / compacted→compaction 桶（RH+窗口字段+锚）/ event_msg 全量→unmappedEvents（seq=行号）写回重放 / additional_tools、compaction_trigger、other 归档重放 / session_meta 继承链 + source/thread_source/git/agent_* 原生保真 / session_index append-only 写回 / .zst + `_<rolloutId>` revert 变体 + archived_sessions / **harness 注入行官方分类**：`content_item_kinds` 主通道 + codex rollback.rs 冻结文本标记 fallback——goal resume、system reminder、AGENTS.md、user_shell_command 等不再误判为用户提示词 / `meta.codex.sourceDir/sourceFile` 源文件夹捕获 / **paginated history_mode 按源保真 + history_base 跨文件链式拼接**（byte 精确截断、防环递归，写端自足单文件）+ `SessionMeta.parentSessionId` 子代理树 / `deferredCreation` 空会话 / 标题=首条真实用户 prompt / **外来轮边界合成**（§11.3 已落地：外来 IR 写 codex 时按真实用户 prompt 合成 task_started/task_complete，turn_id 确定性、时间戳取自源消息；codex 原生源事件重放不受影响） |
 | opencode | ✅ 已落地（写端消费 compaction 桶 → 原生边界对；synthetic 默认丢弃 / `--keep-runtime-context` 惰性保留；TUI 工具/思考渲染契约对齐） |
 
 ### dsh 待适配清单（✅ 已全部完成，留档）

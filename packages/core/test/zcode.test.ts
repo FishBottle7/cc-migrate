@@ -431,6 +431,15 @@ test('zcode parse+write: subagent sidechain round-trips with engine id conventio
       assert.equal((sc.messages[0].content[0] as { text: string }).text, 'explore the repo');
       // prompt-match fallback links the Agent call
       assert.equal(sc.parentMessageId, 'call_agent1');
+      // the timeline carrier row (no block projection) is archived on the
+      // sidechain meta slot instead of dropped — same contract as the main
+      // session's zcode.syntheticMessages extension bucket
+      const scSynthetics = (sc.meta as Record<string, unknown> | undefined)?.['zcode.syntheticMessages'] as
+        Array<{ id: string; sequence: number | null; data: Record<string, unknown> }> | undefined;
+      assert.ok(scSynthetics, 'timeline carrier row archived on sidechain.meta');
+      assert.equal(scSynthetics!.length, 1);
+      assert.equal(scSynthetics![0].id, 'msg_child_c0');
+      assert.equal((scSynthetics![0].data as { semantics?: { kind?: string } }).semantics?.kind, 'timeline_event');
 
       // ---- write into a fresh sandbox and re-parse ----
       const dstRoot = await fs.mkdtemp(join(tmpdir(), 'sm-zcode-dst-'));

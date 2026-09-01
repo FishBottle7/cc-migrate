@@ -1095,18 +1095,25 @@ async function buildSidechains(
 
     const irMessages: MigratedMessage[] = [];
     const childToolCalls: MigratedToolCall[] = [];
+    const childSynthetics: Array<{ id: string; sequence: number | null; data: Row }> = [];
     let agentType: string | undefined;
     for (const m of trimmed.messages) {
       const parts = childParts.get(m.id) ?? [];
       const exp = expandMessageRow(m, parts, ctx);
       irMessages.push(...exp.ir);
       if (exp.toolCalls) childToolCalls.push(...exp.toolCalls);
+      // Same archival contract as the main session's zcode.syntheticMessages
+      // extension: carrier rows with no block projection (timeline-event hosts
+      // etc.) are preserved raw on the sidechain's own meta slot instead of
+      // being dropped (docs/ir-protocol.md 残留小项 — closed by the
+      // MigratedSidechain.meta bucket).
+      if (exp.synthetic) childSynthetics.push(exp.synthetic);
       if (!agentType) {
         const d = parseJsonObject(m.data) as { agent?: string };
         if (d.agent) agentType = agentTypeOf(d.agent);
       }
     }
-    if (!irMessages.length) continue;
+    if (!irMessages.length && !childSynthetics.length) continue;
 
     // sidecar supplement: agentId / parentToolUseId / systemPrompt / usage
     const scUuid = childId.startsWith('sess_subagent_agent_') ? childId.slice('sess_subagent_agent_'.length) : childId;
@@ -1142,6 +1149,7 @@ async function buildSidechains(
       ...(parentCallId ? { parentMessageId: parentCallId } : {}),
       messages: irMessages,
       ...(childToolCalls.length ? { toolCalls: childToolCalls } : {}),
+      ...(childSynthetics.length ? { meta: { 'zcode.syntheticMessages': childSynthetics } } : {}),
     });
   }
 
