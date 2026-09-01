@@ -42,6 +42,8 @@ pnpm --filter @session-migrate/desktop-app run build && pnpm --filter @session-m
 每个工具只需 `listSessions / preview / parse / write / resolveCwd` 五个能力，
 GUI 与 CLI 共用，不重复实现格式逻辑。详见 `docs/design.md`。
 
+> **安全红线**：引擎只读源会话、只写**新**文件——不含任何删除/覆盖源会话的代码路径；会话删除永远只能由人在源工具里执行（如 pi `/resume` 的 `Ctrl+D`，走 trash 回收站通道），防止误操作打到有价值的会话。
+
 ## 里程碑
 
 - ✅ Phase 0：monorepo + IR + DSH 适配器 + round-trip

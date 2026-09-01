@@ -295,6 +295,8 @@ SessionHistory.load(db, sessionID)
 
 ## 5. Pi — `~/.pi/agent/sessions/--<path>--/<ts>_<uuid>.jsonl`
 
+> ⚠️ 本节为 2026-08 初审记录，已于 2026-09-01 被 `docs/agents/pi.md` 深度调查取代（主要修订：`_no-cwd` 分支已不存在；`list` 是流式读全文件而非只读首行；`retainedTail` 是 v4 harness 字段而非 v3 现役——v3 `CompactionEntry` 无此字段；另发现 v4 harness/sqlite 双层并存）。迁移实现一律以 pi.md 为准，本节仅留档。
+
 > 源码锚点：`pi-main/packages/coding-agent/src/core/session-manager.ts`、`docs/session-format.md`、`src/config.ts`
 
 ### 存储位置
