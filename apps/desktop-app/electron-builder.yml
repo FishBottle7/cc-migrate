@@ -53,6 +53,9 @@ win:
       arch: [x64]
     - target: dir # 未打包目录树：冒烟测试用（scripts/smoke-packaged.mjs 指向它）
       arch: [x64]
+  # 应用图标（scripts/gen-icon.mjs 生成；assets/ 方案绕开 build/ 约定，
+  # 根 .gitignore 无需改动）。nsis 安装器/卸载器图标默认沿用 win.icon。
+  icon: assets/icons/icon.ico
   # signAndElevate 等默认关闭；无证书不配 certificateFile
 
 nsis:
@@ -62,17 +65,20 @@ nsis:
   artifactName: ${productName}-${version}-setup.${ext}
   shortcutName: ${productName}
   # perMachine=false（默认）→ per-user 安装，免 UAC，卸载干净
+  # installerIcon/uninstallerIcon 未配置 —— NSIS 默认从 win.icon 派生安装/卸载器图标
 
 # 以下平台配置就绪但本机（Windows）不构建：
 mac:
   target:
     - dmg
   category: public.app-category.developer-tools
+  icon: assets/icons/icon.icns # gen-icon.mjs 已生成（ic07..ic14）；真机 mac 构建时生效
 
 linux:
   target:
     - AppImage
   category: Development
+  icon: assets/icons # 目录：electron-builder 按文件名尺寸（16..512x512.png）自动选取
 
 # 压缩：normal（默认）。worker + core 是纯 JS，体积小，不值得 maximum 的构建耗时
 compression: normal

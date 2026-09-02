@@ -293,16 +293,16 @@ DSH 插件 = `core` 的薄消费者。命令示例：
 **Phase 3 —— DSH 插件打包 + GUI 集成**
 13. ✅ 把 core 打进 DSH 插件（`apps/dsh-plugin`，cordis 薄封装）：注册 `/session-migrate list-sources|preview|import` 三命令 + `cordis.patch.yml` bundle 行 + 冒烟测试（mock ctx 全绿、import 恒 mint 新 id 不覆盖）。命令层与宿主解耦（结构类型 PluginContext，零 cordis 依赖）；GUI 接入点已在 `apply(config)` 预留
 14. ✅ 建 `packages/ui`（SessionPicker / SessionPreview / MigrateWizard，Vue 3）
-15. 🔶 DSH GUI 向导：选会话 + 预览 + 转换并写入（三问交互：源目录 → 选 session+预览 → 转换 → 写目标存储）——命令层三函数可直接作 GUI 数据源，组件挂载待做
+15. ✅ DSH GUI 向导（2026-09-03）：`apps/dsh-plugin/src/gui.ts` 挂载层——`GuiHost` 协议（mount + 三条数据通道，结构类型最小假设）桥接 ui 的 `MigrateWizard`（整用组件状态机，与 desktop-app 同款 `MigrationBackend` 契约）；GUI 层零 core import（沙箱纪律），目标钉死 any→dsh；无头协议冒烟 10 节全绿（挂载/dispose/数据通道真实走命令层/非 dsh 目标拒绝/可选服务降级）。真机宿主联调清单见 `apps/dsh-plugin/README.md`（容器形状、ui 打包、主题注入、IPC 转发）
 
 **Phase 4 —— 独立 App（Electron）**
 16. ✅ 初始化 `apps/desktop-app`（Electron 主进程 import core + Vue 3 渲染进程复用 `packages/ui`）
 17. ✅ 完整 GUI 向导：选源/目录 → 浏览会话 + 离线预览 → 配置目标 + cwd 映射 → 一键写入
-18. 🔶 跨平台打包分发（2026-09-02 落地 Windows 本机构建）：electron-builder 就绪——nsis 安装包 + portable + dir 三 target（88MB/88MB/318MB 实测产出）；打包核心约束成立（worker + core asarUnpack 到真实文件系统，系统 Node 加载——Electron 内置 Node 的 zstd 崩溃规避架构在打包形态完整成立，打包 exe 真解析 2011 条消息大 DSH 会话通过）；冒烟 `smoke:packaged`（asar 布局 + worker JSON-RPC 一键验证）；mac(dmg)/linux(AppImage) 配置就绪未本机构建；代码签名/自动更新/应用图标待配
+18. ✅ 跨平台打包分发（2026-09-02/03 落地 Windows 本机构建）：electron-builder——nsis 安装包 + portable + dir 三 target（88MB/88MB/318MB 实测产出）；打包核心约束成立（worker + core asarUnpack 到真实文件系统，系统 Node 加载——zstd 崩溃规避架构在打包形态完整成立，打包 exe 真解析 2011 条消息大 DSH 会话通过）；**应用图标**（2026-09-03：`gen:icon` 纯 JS 生成 SDF 栅格化 + 手写 PNG/ICO/ICNS 容器，零图像依赖，幂等；dist-check 字节级验证图标进包，负例旧包正确 FAIL）；**dist:win:check 一键链**（出包→产物齐全→冒烟→图标校验→汇总表）；mac(dmg)/linux(AppImage) 配置就绪未本机构建；代码签名/自动更新待配
 
 **Phase 5 —— 健壮性**
-19. 工具调用 id 重映射、cwd 迁移、模型映射
-20. 测试矩阵 + 损坏文件容错 + 幂等（不重复导入）+ ~~OpenCode 真实写采样复核~~（✅ 2026-09-02 完成）
+19. ✅ 工具调用 id 重映射（2026-09-03，dsh 写端席位制：同会话重复 tool_use id 换 `call_<uuid>`、配对 result 同步 FIFO 重映射、乱序 IR 回退首席位无孤儿；IR 保持源值零丢弃——测试含乱序/交叉配对探针）+ ✅ 会话 id 碰撞防护（显式 `--session-id` 冲突即抛错拒绝（对齐 zcode UNIQUE 纪律），引擎自生成走 claim，`wx` 独占创建封 TOCTOU——AGENT.md「永不覆盖」铁律的写端卡点，5 项 `dsh-robustness.test`）；cwd 迁移、模型映射已随各适配器 resolveCwd/模型透传落地
+20. 测试矩阵 + 损坏文件容错 + 幂等（不重复导入）（幂等 = 写端碰撞防护：显式 id 冲突拒绝 + wx 兜底，2026-09-03 随第 19 项落地）+ ~~OpenCode 真实写采样复核~~（✅ 2026-09-02 完成）——残余：更广的损坏文件容错测试矩阵（claude 读端已容忍断行，其余各家按需补）
 
 ## 7. 诚实的边界与风险
 

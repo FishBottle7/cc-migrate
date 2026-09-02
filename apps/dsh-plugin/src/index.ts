@@ -21,6 +21,7 @@ import {
   preview,
   SOURCE_TOOLS,
 } from './commands.js';
+import type { GuiHost } from './gui.js';
 
 /**
  * Minimal structural type against the DSH host ctx (same discipline as the
@@ -37,6 +38,13 @@ interface PluginContext {
   logger: { info(...args: unknown[]): void; warn(...args: unknown[]): void; error(...args: unknown[]): void };
   /** Minimal assumed shape of DSH's slash-command service. */
   commands?: { register(name: string, handler: (...args: string[]) => unknown): () => void };
+  /**
+   * Optional GUI service (design.md Phase 3 §15): when the host exposes one,
+   * the session-migrate wizard mounts through it. Same structural-typing
+   * discipline — see src/gui.ts's GuiHost for the full protocol. Hosts
+   * without a GUI keep the commands-only behavior (backward compatible).
+   */
+  gui?: GuiHost;
   /** cordis fiber cleanup: the returned disposer runs on plugin unload. */
   effect?(fn: () => () => void): unknown;
 }
@@ -176,10 +184,34 @@ export function apply(ctx: PluginContext, config: SessionMigrateConfig = {}): vo
   });
 
   logger.info(`session-migrate: registered ${COMMAND_NAMES.length} commands (/session-migrate ${COMMAND_NAMES.join(' | ')})`);
+
+  // -- optional GUI wizard: only when the host exposes a gui service --
+  // 挂载走动态 import（src/gui.ts 再动态 import ui 组件），老宿主没有
+  // ctx.gui 时这里完全零成本；unmount 也走 ctx.effect，和命令同一套 fiber 清理。
+  if (ctx.gui) {
+    ctx.effect?.(() => {
+      let disposed = false;
+      void (async () => {
+        const { createSessionMigrateWizard } = await import('./gui.js');
+        if (disposed) return;
+        const handle = await createSessionMigrateWizard(ctx.gui!, {
+          container: undefined,
+          dstRoot: defaultRoot,
+        });
+        if (disposed) handle.dispose();
+      })().catch((e) => {
+        ctx.logger.warn(`session-migrate gui: wizard mount skipped/failed: ${e instanceof Error ? e.message : String(e)}`);
+      });
+      return () => {
+        disposed = true;
+      };
+    });
+  }
 }
 
 // Re-export the command layer so hosts/tests can import everything from the
-// plugin entry without reaching into internals.
+// plugin entry without reaching into internals. The GUI layer stays on its own
+// entry (`./gui`): importing this entry must not drag in the Vue-side module.
 export { importSession, listSources, preview, SOURCE_TOOLS } from './commands.js';
 export type {
   CommandError,

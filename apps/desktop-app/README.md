@@ -50,6 +50,8 @@ preload/        contextBridge 桥（.cjs 直接加载，无需构建）
 worker/worker.mjs  system-Node worker：core 全能力 + PreviewMessageDTO 组装
 scripts/dev.mjs dev 编排：先起 vite(5183) 就绪后拉起 Electron
 scripts/set-dist-dir.mjs dist:* 前置：选产物目录（盘满回退桌面）并转调 electron-builder
+scripts/gen-icon.mjs 应用图标生成：纯 JS 栅格化 + PNG/ICO/ICNS 手写编码（assets/icons/）
+scripts/dist-check.mjs dist:win:check 收尾：产物齐全 + 图标进包 + 冒烟 + 汇总表
 scripts/smoke-packaged.mjs 打包产物冒烟：asar 布局 + worker JSON-RPC 一条链路
 electron-builder.yml 打包配置（win 本机构建；mac/linux 就绪未构建）
 ```
@@ -67,8 +69,10 @@ electron-builder.yml 打包配置（win 本机构建；mac/linux 就绪未构建
 ## 打包分发（electron-builder）
 
 ```bash
+pnpm --filter @session-migrate/desktop-app run gen:icon       # 生成应用图标（assets/icons/，幂等可重跑）
 pnpm --filter @session-migrate/desktop-app run dist:win      # nsis 安装包 + portable + dir（本机 Windows）
 pnpm --filter @session-migrate/desktop-app run dist:win:dir  # 只出未打包目录树（冒烟用，快）
+pnpm --filter @session-migrate/desktop-app run dist:win:check # 出包 + 自动产物校验 + 冒烟 + 汇总表（推荐）
 pnpm --filter @session-migrate/desktop-app run smoke:packaged # 打包产物冒烟（见下）
 # node scripts/smoke-packaged.mjs <dir产物路径>  等效
 ```
@@ -79,6 +83,14 @@ pnpm --filter @session-migrate/desktop-app run smoke:packaged # 打包产物冒�
   显式指定。
 - 产物：`session-migrate-<版本>-setup.exe`（nsis 安装包，非一键、可改安装目录）、
   `session-migrate <版本>.exe`（portable 免安装版）、`win-unpacked/`（dir 目录树）。
+- 应用图标：`scripts/gen-icon.mjs` 用纯 JS 栅格化生成（零外部依赖 —— 本机无
+  ImageMagick/sharp，几何用签名距离函数逐像素采样，PNG 用 node:zlib 编码，ICO/ICNS
+  容器手写），产物在 `assets/icons/`（win .ico / mac .icns / linux png set，矢量源
+  `assets/icon.svg`）。`electron-builder.yml` 的 `win.icon`/`mac.icon`/`linux.icon`
+  显式指路。改动设计后 `pnpm run gen:icon` 再 `dist:win` 即可。
+- `dist:win:check`（`scripts/dist-check.mjs`）：出包后自动定位产物目录（同 set-dist-dir
+  的回退逻辑），校验三产物齐全 + 新图标真实嵌入 exe（在 PE 资源里匹配 icon.ico 各层
+  PNG 字节，非默认图标）+ spawn 既有冒烟脚本，输出汇总表，exit code 反映成败。
 - macOS（dmg）/ Linux（AppImage）：`electron-builder.yml` 已配置就绪，本机未构建
   （mac 需真机 + 签名身份；linux 可在 WSL/CI 出）。
 - 无代码签名：Windows 会弹 SmartScreen 警告，个人工具可接受；有证书后配

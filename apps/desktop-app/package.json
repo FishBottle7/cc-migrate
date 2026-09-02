@@ -13,9 +13,11 @@
     "test": "pnpm run typecheck",
     "dev": "node scripts/dev.mjs",
     "start": "pnpm run build && electron .",
+    "gen:icon": "node scripts/gen-icon.mjs --verify",
     "dist": "pnpm run build && node scripts/set-dist-dir.mjs",
     "dist:win": "pnpm run build && node scripts/set-dist-dir.mjs --win",
     "dist:win:dir": "pnpm run build && node scripts/set-dist-dir.mjs --win dir",
+    "dist:win:check": "pnpm run dist:win && node scripts/dist-check.mjs",
     "smoke:packaged": "node scripts/smoke-packaged.mjs"
   },
   "dependencies": {

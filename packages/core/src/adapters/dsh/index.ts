@@ -405,7 +405,30 @@ export class DshAdapter implements Adapter {
     // header — degrade to a cwd-less session (DSH parks it under `_no-cwd`)
     // instead of writing an unloadable artifact.
     const cwd = requestedCwd && isAbsolute(requestedCwd) ? requestedCwd : '';
-    const newId = opts?.sessionId ?? `session-${randomUUID()}`;
+    // 会话 id 碰撞防护（AGENT.md「读旧写新、永不覆盖」铁律的写端卡点）：
+    // 主会话此前是「随机 id 直接落盘」，而调用方（dsh-plugin 的
+    // --session-id flag）可以显式指定 id——一旦目标目录已有旧会话，
+    // writeFile 会把真实会话静默覆盖掉。这里与 sidechain 的
+    // claimFreeSessionId 同一纪律，但语义按 id 来源分流：
+    //  - 引擎自生成（未传 sessionId）：照走 claim——randomUUID 撞上已有
+    //    会话的概率≈0，但一次 access 的成本换来「永不覆盖」的硬保证，
+    //    且不会让返回的 sessionId 与任何预期不符；
+    //  - 调用方显式指定：占用即抛错，绝不静默 re-roll——write 返回的
+    //    sessionId 必须与调用方传入的一致（隐式换 id 属于隐式失败，对齐
+    //    zcode UNIQUE 冲突即抛错的纪律），也绝不覆盖旧会话。
+    let newId: string;
+    if (opts?.sessionId !== undefined) {
+      const taken = await this.sessionLogExists(sessionsRoot, cwd, opts.sessionId);
+      if (taken) {
+        const takenPath = join(sessionsRoot, dshProjectDirName(cwd), encodeSegment(opts.sessionId), 'session.jsonl.zstd');
+        throw new Error(
+          `DSH: target session "${opts.sessionId}" already exists at ${takenPath} — refusing to overwrite an existing session (never clobber). Pass a different --session-id, or omit it to let the engine mint a fresh id.`,
+        );
+      }
+      newId = opts.sessionId;
+    } else {
+      newId = await this.claimFreeSessionId(sessionsRoot, cwd, `session-${randomUUID()}`);
+    }
     // Keep original wall-clock for fidelity. Sorting as "newest" is handled
     // by the (migrated) title suffix + header id ordering; don't bump
     // createdAt — that would break irToEvents time ordering and make
@@ -464,7 +487,21 @@ export class DshAdapter implements Adapter {
     // DSH uses concatenated frames: header (own frame) + event batches (own frames)
     const payload = Buffer.concat([frame1, frame2]);
     const finalPath = join(dir, 'session.jsonl.zstd');
-    await fs.writeFile(finalPath, payload);
+    // claim 之后的 TOCTOU 兜底（与 pi 写端同款纪律）：claim 检查与落盘之间
+    // 目录可能被并发写入者占住，wx 独占创建保证这一步物理上不可能覆盖
+    // 已有会话文件。EEXIST 时错误信息必须指向「已有会话、绝不覆盖」，
+    // 而不是裸抛一个文件系统错误让调用方猜。
+    try {
+      await fs.writeFile(finalPath, payload, { flag: 'wx' });
+    } catch (e) {
+      const code = (e as { code?: string } | null)?.code;
+      if (code === 'EEXIST') {
+        throw new Error(
+          `DSH: target session "${newId}" already exists at ${finalPath} — refusing to overwrite an existing session (never clobber). Pass a different --session-id, or omit it to let the engine mint a fresh id.`,
+        );
+      }
+      throw e;
+    }
 
     const paths: string[] = [finalPath];
 
@@ -548,7 +585,21 @@ export class DshAdapter implements Adapter {
       await fs.mkdir(cDir, { recursive: true });
       const cPayload = Buffer.concat([cFrame1, cFrame2]);
       const cPath = join(cDir, 'session.jsonl.zstd');
-      await fs.writeFile(cPath, cPayload);
+      // 子会话同样走 wx 独占创建：claimFree 只在落盘前检查，两个同名
+      // agentId 的 sidechain（或与已有子会话撞名）会让 claim 先后都通过，
+      // wx 保证后写者在这里失败而不是覆盖前者（AGENTS.md「绝不清理、
+      // 绝不替换、永不覆盖」同样适用于子会话产物）。
+      try {
+        await fs.writeFile(cPath, cPayload, { flag: 'wx' });
+      } catch (e) {
+        const code = (e as { code?: string } | null)?.code;
+        if (code === 'EEXIST') {
+          throw new Error(
+            `DSH: sidechain session "${childId}" already exists at ${cPath} — refusing to overwrite an existing session (never clobber).`,
+          );
+        }
+        throw e;
+      }
       paths.push(cPath);
       if (isDefaultRoot && cwd) {
         try {
@@ -673,23 +724,26 @@ export class DshAdapter implements Adapter {
     return null;
   }
 
+  /** True when a session artifact already occupies the (root, cwd, id) slot —
+   * the single occupancy test shared by the main-session collision gate and
+   * claimFreeSessionId's re-roll loop. */
+  private async sessionLogExists(root: string, cwd: string, id: string): Promise<boolean> {
+    try {
+      await fs.access(join(root, dshProjectDirName(cwd), encodeSegment(id), 'session.jsonl.zstd'));
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
   /** Return `preferred` when its artifact path is free; otherwise mint a fresh
    * id. Writing over an existing log would clobber a real session (dsh->dsh
    * copies share root+cwd, so a preserved source id collides by design). */
   private async claimFreeSessionId(root: string, cwd: string, preferred: string): Promise<string> {
-    const logFor = (id: string): string => join(root, dshProjectDirName(cwd), encodeSegment(id), 'session.jsonl.zstd');
-    try {
-      await fs.access(logFor(preferred));
-    } catch {
-      return preferred;
-    }
+    if (!(await this.sessionLogExists(root, cwd, preferred))) return preferred;
     for (let i = 0; i < 5; i++) {
       const fresh = `session-${randomUUID()}`;
-      try {
-        await fs.access(logFor(fresh));
-      } catch {
-        return fresh;
-      }
+      if (!(await this.sessionLogExists(root, cwd, fresh))) return fresh;
     }
     throw new Error(`DSH: cannot find a free session dir for "${preferred}" under ${root}`);
   }
@@ -1142,20 +1196,60 @@ export function irToEvents(ir: MigratedSession, baseTime: number): DshEvent[] {
   // callIds the toolCalls bucket will re-emit as tool/call rows (dsh-origin
   // sessions) — block-derived synthesis below must not duplicate them.
   const bucketCallIds = new Set((ir.toolCalls ?? []).map((r) => r.callId));
-  // Every callId that will exist as a tool/call row: bucket re-emissions plus
-  // every assistant tool_use block (block-derived synthesis below). A
-  // tool/result referencing anything else can never pair — DSH renders it as
-  // a ghost "Tool call <callId>" fallback card — so such results must not be
-  // emitted.
+  // Every SOURCE callId that will exist as a tool/call row: bucket
+  // re-emissions plus every assistant tool_use block (block-derived synthesis
+  // below). A tool/result referencing anything else can never pair — DSH
+  // renders it as a ghost "Tool call <callId>" fallback card — so such
+  // results must not be emitted. This is the SOURCE-id gate; the written-id
+  // resolution happens through the seat queues below.
   const plannedCallIds = new Set(bucketCallIds);
   for (const m of ir.messages) {
     for (const b of m.content) {
       if (b.type === 'tool_use' && b.id) plannedCallIds.add(b.id);
     }
   }
-  // Runtime guard against duplicate tool/call rows for one callId (the GUI
-  // aborts on a second start Match for the same context key).
-  const emittedCallIds = new Set<string>();
+  // 写端 callId 席位（同会话 tool_use id 去重）。IR 的 tool_use.id 跨工具
+  // 直通（零丢弃原则——IR 保持源端原值），但跨工具合并（codex subagent
+  // 展平、claude 子链并入主链）可能让两个不同调用共享同一 id；DSH 读回
+  // 按 callId 配对 tool/call↔tool/result，GUI 还会对同一 callId 的第二个
+  // start Match 直接中止加载——重复 id 落盘会让配对错乱甚至拒绝加载。
+  // 席位规则：源 id 首次占席保留原值（无人占用时），之后每次出现都换
+  // `call_<uuid>` 新值；配对的 tool_result 经席位 FIFO 取到「它那一行」的
+  // 写端 id，配对不会因去重而断裂。只影响写回产物，不改 IR 本身。
+  const writtenCallIds = new Set<string>();
+  const callSeats = new Map<string, { first: string; pending: string[] }>();
+  const claimCallSeat = (sourceId: string): string => {
+    const written = writtenCallIds.has(sourceId) ? `call_${randomUUID()}` : sourceId;
+    writtenCallIds.add(written);
+    const seats = callSeats.get(sourceId);
+    if (seats) seats.pending.push(written);
+    else callSeats.set(sourceId, { first: written, pending: [written] });
+    return written;
+  };
+  /** tool/result 配对解析：FIFO 出队该源 id 最旧未配对席位；队列已空
+   * （同 id 结果多于调用，或结果先于调用到达的乱序 IR）时回退首席位——
+   * 引用必须始终指向一个真实存在的 tool/call 行，绝不生成孤儿。 */
+  const seatForPairing = (sourceId: string): string | undefined => {
+    const seats = callSeats.get(sourceId);
+    if (!seats) return undefined;
+    return seats.pending.shift() ?? seats.first;
+  };
+  // toolCalls 桶 + tool_use 块席位预分配（与消息循环同序）：桶行先占
+  // （桶序=源流序），其后各 assistant 的 tool_use 块按消息序占席（已被桶
+  // 覆盖的 id 跳过——那一条调用由桶行代表）。预分配而不是在循环里即时
+  // 占席，是因为配对的 tool/result 可能在乱序 IR 中先于调用出现——席位
+  // 先行存在，配对解析永远有席可查，不会因去重机制把结果行丢掉。
+  const bucketSeatIds = (ir.toolCalls ?? []).map((r) => claimCallSeat(r.callId));
+  const blockSeatQueues = new Map<string, string[]>();
+  for (const m of ir.messages) {
+    for (const b of m.content) {
+      if (b.type !== 'tool_use' || !b.id || bucketCallIds.has(b.id)) continue;
+      const seat = claimCallSeat(b.id);
+      const q = blockSeatQueues.get(b.id);
+      if (q) q.push(seat);
+      else blockSeatQueues.set(b.id, [seat]);
+    }
+  }
   for (const msg of ir.messages) {
     const t = msg.timestamp;
     const time = typeof t === 'number' && Number.isFinite(t) ? t : msgFallback++;
@@ -1172,14 +1266,18 @@ export function irToEvents(ir: MigratedSession, baseTime: number): DshEvent[] {
       // preserve the nested tool-result interior expected by DSH surface.
       const toolBlocks = msg.content.filter((b) => b.type === 'tool_result');
       // Resolve the pairing callId: native source first (byte-faithful
-      // dsh→dsh), then the block's toolUseId. A result whose call has no
-      // planned tool/call row (or no callId at all) can never pair and would
-      // render as a ghost card — skip it; the content stays in the IR.
+      // dsh→dsh), then the block's toolUseId — both are SOURCE ids; the
+      // written id comes out of the seat queue so the pairing survives
+      // duplicate-id remapping. A result whose call has no planned tool/call
+      // row (or no callId at all) can never pair and would render as a ghost
+      // card — skip it; the content stays in the IR.
       const nativeSrc = native.source as { callId?: unknown } | undefined;
       const nativeCallId = typeof nativeSrc?.callId === 'string' && nativeSrc.callId ? nativeSrc.callId : undefined;
       const blockCallId = (toolBlocks[0] as { toolUseId?: string } | undefined)?.toolUseId;
-      const callId = nativeCallId ?? (blockCallId || undefined);
-      if (!callId || !plannedCallIds.has(callId)) continue;
+      const sourceCallId = nativeCallId ?? (blockCallId || undefined);
+      if (!sourceCallId || !plannedCallIds.has(sourceCallId)) continue;
+      const pairedWrittenId = seatForPairing(sourceCallId);
+      if (pairedWrittenId === undefined) continue;
       const toolData: Record<string, unknown> = {
         ...(native.turn !== undefined || native.step !== undefined
           ? { turn: native.turn ?? 1, step: native.step ?? 1 }
@@ -1191,8 +1289,17 @@ export function irToEvents(ir: MigratedSession, baseTime: number): DshEvent[] {
         message: {
           ...(native.id ? { id: native.id } : { id: `msg_${randomUUID()}` }),
           role: 'user',
-          ...(native.source !== undefined ? { source: native.source } : { source: { kind: 'tool', callId } }),
-          ...(native.rawContent ? { content: native.rawContent } : {
+          // 配对引用一律用席位解析出的写端 id。source 里若带着源 callId
+          // （native.source 整体保留时）必须改写成写端 id——tool/result 的
+          // 配对契约在 message.source.callId 上，源 id 在这里可能已被
+          // tool/call 侧的席位重映射换掉，裸写源值会配对断裂。
+          source: { ...(native.source as Record<string, unknown> ?? { kind: 'tool' }), kind: 'tool', callId: pairedWrittenId },
+          ...(native.rawContent ? { content: (native.rawContent as unknown[]).map((b) =>
+            b && typeof b === 'object' && !Array.isArray(b) &&
+            (b as Record<string, unknown>).type === 'tool-result' &&
+            (b as Record<string, unknown>).toolCallId === sourceCallId
+              ? { ...(b as Record<string, unknown>), toolCallId: pairedWrittenId }
+              : b) } : {
             content: msg.content.map((b) => {
               if (b.type === 'tool_result') {
                 const inner: unknown[] = [{ type: 'text', text: b.content }];
@@ -1201,7 +1308,7 @@ export function irToEvents(ir: MigratedSession, baseTime: number): DshEvent[] {
                   if (nativeImage) inner.push(nativeImage);
                   else inner.push({ type: 'text', text: `[file: ${att.filename ?? att.url ?? 'attachment'}]` });
                 }
-                return { type: 'tool-result', toolCallId: b.toolUseId, content: inner, isError: !!b.isError };
+                return { type: 'tool-result', toolCallId: pairedWrittenId, content: inner, isError: !!b.isError };
               }
               if (b.type === 'text') return { type: 'text', text: b.text };
               return { type: 'text', text: (b as { thinking?: string }).thinking ?? '' };
@@ -1269,16 +1376,21 @@ export function irToEvents(ir: MigratedSession, baseTime: number): DshEvent[] {
       // inside the assistant content. Native DSH logs pair every tool-result
       // with a standalone tool/call event — without it the GUI renders ghost
       // "Tool call <callId>" fallback cards from the orphan tool/results. Emit
-      // the missing half (deduped against the IR toolCalls bucket, which is
-      // re-emitted further down for dsh-origin sessions).
+      // the missing half: written callIds come from the PRE-CLAIMED block seat
+      // queues (duplicate source ids got fresh call_<uuid> seats up front), so
+      // message order can never double-claim and blocks already covered by an
+      // IR toolCalls-bucket seat are skipped (the bucket re-emission further
+      // down owns that seat for dsh-origin sessions).
       for (const b of msg.content) {
-        if (b.type !== 'tool_use' || !b.id || bucketCallIds.has(b.id) || emittedCallIds.has(b.id)) continue;
-        emittedCallIds.add(b.id);
+        if (b.type !== 'tool_use' || !b.id || bucketCallIds.has(b.id)) continue;
+        const seatQ = blockSeatQueues.get(b.id);
+        if (!seatQ || seatQ.length === 0) continue;
+        const writtenId = seatQ.shift()!;
         const args = b.input === undefined ? '' : typeof b.input === 'string' ? b.input : JSON.stringify(b.input);
         raw.push({
           time,
           type: 'tool/call',
-          data: { turn: 1, step: 1, callId: b.id ?? `call_${randomUUID()}`, name: b.name ?? 'tool', arguments: args } as unknown as DshEvent['data'],
+          data: { turn: 1, step: 1, callId: writtenId, name: b.name ?? 'tool', arguments: args } as unknown as DshEvent['data'],
           _seq: seq,
         });
       }
@@ -1294,10 +1406,12 @@ export function irToEvents(ir: MigratedSession, baseTime: number): DshEvent[] {
   // additionally pair with the tool/result events emitted from tool-role
   // messages above, matching the native trio (assistant block + tool/call +
   // tool/result). metadata.dsh restores the exact turn/step/seq and the RAW
-  // model-produced arguments string.
-  for (const tc of ir.toolCalls ?? []) {
-    if (emittedCallIds.has(tc.callId)) continue;
-    emittedCallIds.add(tc.callId);
+  // model-produced arguments string. 写端 callId 用消息循环前预分配的席位
+  //（bucketSeatIds）——配对的 tool/result 在消息循环里已经按 FIFO 消费同一
+  // 席位队列，这里必须出同一批 id 才能对上；同 id 的第二条桶记录由此
+  // 自动获得去重后的新 id，不再产生 GUI 会拒绝加载的重复 callId。
+  (ir.toolCalls ?? []).forEach((tc, i) => {
+    const writtenId = bucketSeatIds[i];
     const dsh = (tc.metadata as { dsh?: { turn?: number; step?: number; seq?: number; time?: number; arguments?: string } } | undefined)?.dsh;
     const time = typeof dsh?.time === 'number' && Number.isFinite(dsh.time) ? dsh.time : baseTime;
     raw.push({
@@ -1306,13 +1420,13 @@ export function irToEvents(ir: MigratedSession, baseTime: number): DshEvent[] {
       data: {
         turn: dsh?.turn ?? 1,
         step: dsh?.step ?? 1,
-        callId: tc.callId,
+        callId: writtenId,
         name: tc.tool,
         arguments: typeof dsh?.arguments === 'string' ? dsh.arguments : JSON.stringify(tc.input ?? {}),
       } as unknown as DshEvent['data'],
       _seq: isSafeSeq(dsh?.seq) ? dsh.seq : undefined,
     });
-  }
+  });
   for (const p of ir.planModes ?? []) {
     const time = typeof p.time === 'number' && Number.isFinite(p.time) ? p.time : baseTime;
     raw.push({ time, type: 'plan/mode', data: p.data as unknown as DshEvent['data'], _seq: p.seq });

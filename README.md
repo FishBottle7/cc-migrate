@@ -49,6 +49,6 @@ GUI 与 CLI 共用，不重复实现格式逻辑。详见 `docs/design.md`。
 - ✅ Phase 0：monorepo + IR + DSH 适配器 + round-trip
 - ✅ Phase 1：Claude Code 适配器（`claude ⇄ dsh`）
 - ✅ Phase 2：Codex + OpenCode + Pi + ZCode，全矩阵 `任意 ⇄ 任意`
-- 🔶 Phase 3：DSH 插件（`apps/dsh-plugin` 命令层 ✅ —— `/session-migrate list-sources|preview|import` 三命令 + 冒烟；GUI 向导组件挂载待做）
-- 🔶 Phase 4：独立 Electron App（GUI 向导 ✅；Windows 打包 ✅ electron-builder nsis+portable 实测出包；mac/linux 构建与签名待做）
-- ⬜ Phase 5：健壮性
+- ✅ Phase 3：DSH 插件（`apps/dsh-plugin`：三命令 ✅ + GUI 向导挂载层 ✅ `GuiHost` 协议 + 无头冒烟；真机宿主联调待做）
+- ✅ Phase 4：独立 Electron App（GUI 向导 ✅；Windows 打包 ✅ nsis+portable+图标 ✅+dist:win:check 一键校验；mac/linux 构建与签名待做）
+- 🔶 Phase 5：健壮性（写端碰撞防护 + callId 去重 ✅；残余：损坏文件容错矩阵补全）
