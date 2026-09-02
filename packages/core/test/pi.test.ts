@@ -407,3 +407,133 @@ test('v3.3 read: session_info empty name is an explicit title clear', async () =
   assert.ok(!ir.title, 'latest empty session_info clears the title');
   assert.equal((ir.meta as { pi: { titleCleared?: boolean } }).pi.titleCleared, true, 'clear semantics recorded');
 });
+
+test('v1 legacy file: entries without id/parentId chain in file order; firstKeptEntryIndex converts', async () => {
+  const root = await tempRoot();
+  const dir = join(root, '--tmp-proj--');
+  await fs.mkdir(dir, { recursive: true });
+  const path = join(dir, '2024-12-03T14-00-00-000Z_legacyv100.jsonl');
+  // v1: header has NO version field; entries carry no id/parentId; compaction
+  // still uses the array-index firstKeptEntryIndex (converted on read, never
+  // rewriting the source file — pi.md §2.2/§10)
+  const lines = [
+    JSON.stringify({ type: 'session', id: 'legacyv100', timestamp: '2024-12-03T14:00:00.000Z', cwd: '/tmp/proj' }),
+    JSON.stringify({ type: 'message', timestamp: '2024-12-03T14:00:01.000Z', message: { role: 'user', content: 'v1 question', timestamp: 1 } }),
+    JSON.stringify({ type: 'message', timestamp: '2024-12-03T14:00:02.000Z', message: { role: 'assistant', content: [{ type: 'text', text: 'v1 answer' }], timestamp: 2 } }),
+    JSON.stringify({ type: 'compaction', timestamp: '2024-12-03T14:00:03.000Z', summary: 'v1 fold', firstKeptEntryIndex: 3, tokensBefore: 90 }),
+    JSON.stringify({ type: 'message', timestamp: '2024-12-03T14:00:04.000Z', message: { role: 'user', content: 'kept turn', timestamp: 3 } }),
+  ].join('\n') + '\n';
+  await fs.writeFile(path, lines, 'utf8');
+  const ir = await parsePiFile(path);
+  assert.equal(ir.originTool, 'pi');
+  const texts = ir.messages.map((m) => (m.content[0] as { text?: string } | undefined)?.text ?? '');
+  assert.ok(texts.includes('v1 question') && texts.includes('v1 answer') && texts.includes('kept turn'),
+    'v1 chain (linear, file order) fully recovered — no silent empty session');
+  assert.equal(ir.compaction?.length, 1, 'v1 compaction read');
+  // firstKeptEntryIndex 3 (full-array index incl. header) → the compaction's
+  // own entry id, matching pi's migrateV1ToV2 positional lookup
+  assert.ok(ir.compaction![0]!.firstKeptId, 'firstKeptEntryIndex converted to an entry id');
+  const raw = await fs.readFile(path, 'utf8');
+  assert.ok(!raw.includes('firstKeptEntryId'), 'source file untouched (in-memory migration only)');
+});
+
+test('v2 legacy file: hookMessage role renames to custom (in memory)', async () => {
+  const root = await tempRoot();
+  const dir = join(root, '--tmp-proj--');
+  await fs.mkdir(dir, { recursive: true });
+  const path = join(dir, '2024-12-03T14-00-00-000Z_legacyv200.jsonl');
+  const lines = [
+    JSON.stringify({ type: 'session', version: 2, id: 'legacyv200', timestamp: '2024-12-03T14:00:00.000Z', cwd: '/tmp/proj' }),
+    JSON.stringify({ type: 'message', id: 'aaaaaaaa', parentId: null, timestamp: '2024-12-03T14:00:01.000Z', message: { role: 'hookMessage', customType: 'old-hook', content: 'hook payload', timestamp: 1 } }),
+    JSON.stringify({ type: 'message', id: 'bbbbbbbb', parentId: 'aaaaaaaa', timestamp: '2024-12-03T14:00:02.000Z', message: { role: 'assistant', content: [{ type: 'text', text: 'r' }], timestamp: 2 } }),
+  ].join('\n') + '\n';
+  await fs.writeFile(path, lines, 'utf8');
+  const ir = await parsePiFile(path);
+  const hook = ir.messages.find((m) => (m.meta as { pi?: { customMessage?: { customType?: string } } } | undefined)?.pi?.customMessage?.customType === 'old-hook');
+  assert.ok(hook, 'hookMessage renamed to custom and projected as a user row');
+  assert.equal(hook!.role, 'user');
+  assert.equal(hook!.synthetic, true);
+});
+
+test('stray summary-role message rows survive pi→pi round-trip (no bucket twin, no anchor skip)', async () => {
+  const root = await tempRoot();
+  const dir = join(root, '--tmp-proj--');
+  await fs.mkdir(dir, { recursive: true });
+  const path = join(dir, '2024-12-03T14-00-00-000Z_stray0000.jsonl');
+  const lines = [
+    JSON.stringify({ type: 'session', version: 3, id: 'stray0000', timestamp: '2024-12-03T14:00:00.000Z', cwd: '/tmp/proj' }),
+    // hand-edited / extension-written raw message row carrying a summary role
+    // — NOT an entry twin, so it must NOT get the anchor marker (an anchor
+    // marker would make write-back skip it with no bucket entry to restore it)
+    JSON.stringify({ type: 'message', id: 'aaaaaaaa', parentId: null, timestamp: '2024-12-03T14:00:01.000Z', message: { role: 'compactionSummary', summary: 'stray inline fold', tokensBefore: 12, timestamp: 1 } }),
+    JSON.stringify({ type: 'message', id: 'bbbbbbbb', parentId: 'aaaaaaaa', timestamp: '2024-12-03T14:00:02.000Z', message: { role: 'assistant', content: [{ type: 'text', text: 'ok' }], timestamp: 2 } }),
+  ].join('\n') + '\n';
+  await fs.writeFile(path, lines, 'utf8');
+  const adapter = new PiAdapter();
+  const ir = await parsePiFile(path);
+  const stray = ir.messages.find((m) => m.content.some((b) => b.type === 'text' && b.text.includes('stray inline fold')));
+  assert.ok(stray, 'stray summary row projected as a user row');
+  assert.ok(!(stray!.meta as { pi?: { anchor?: unknown } }).pi?.anchor, 'no anchor marker — nothing in the bucket is paired with it');
+  const res = await adapter.write(ir, { root: join(root, 'out'), targetCwd: '/tmp/proj' });
+  const back = await parsePiFile(res.paths[0]!);
+  const backStray = back.messages.find((m) => m.content.some((b) => b.type === 'text' && b.text.includes('stray inline fold')));
+  assert.ok(backStray, 'stray summary row SURVIVES the round-trip (no silent drop)');
+});
+
+test('multi-root / orphan entries: dangling parentId never crashes, orphans archive as sidechains', async () => {
+  const root = await tempRoot();
+  const dir = join(root, '--tmp-proj--');
+  await fs.mkdir(dir, { recursive: true });
+  const path = join(dir, '2024-12-03T14-00-00-000Z_orphan000.jsonl');
+  const lines = [
+    JSON.stringify({ type: 'session', version: 3, id: 'orphan000', timestamp: '2024-12-03T14:00:00.000Z', cwd: '/tmp/proj' }),
+    JSON.stringify({ type: 'message', id: 'aaaaaaaa', parentId: null, timestamp: '2024-12-03T14:00:01.000Z', message: { role: 'user', content: 'main', timestamp: 1 } }),
+    JSON.stringify({ type: 'message', id: 'bbbbbbbb', parentId: 'aaaaaaaa', timestamp: '2024-12-03T14:00:02.000Z', message: { role: 'assistant', content: [{ type: 'text', text: 'main reply' }], timestamp: 2 } }),
+    // resetLeaf-style second root (parentId:null mid-file) + a dangling-parent
+    // orphan — both are legal tree shapes (pi.md §4 multi-root)
+    JSON.stringify({ type: 'message', id: 'c1c1c1c1', parentId: null, timestamp: '2024-12-03T14:00:03.000Z', message: { role: 'user', content: 'second root', timestamp: 3 } }),
+    JSON.stringify({ type: 'message', id: 'd1d1d1d1', parentId: 'ghost000', timestamp: '2024-12-03T14:00:04.000Z', message: { role: 'assistant', content: [{ type: 'text', text: 'orphan reply' }], timestamp: 4 } }),
+  ].join('\n') + '\n';
+  await fs.writeFile(path, lines, 'utf8');
+  const ir = await parsePiFile(path);
+  // pi semantics (buildSessionPath, sm.ts:340): the leaf is the LAST entry —
+  // here the dangling orphan d1d1d1d1 — and its broken walk yields a
+  // one-entry "main chain". The REAL original chain (aaaaaaaa→bbbbbbbb) and
+  // the second root both land off-path, archived as sidechains. Zero drop,
+  // no crash, faithful to what pi's own resume would see.
+  const allTexts = [
+    ...ir.messages.map((m) => (m.content[0] as { text?: string } | undefined)?.text ?? ''),
+    ...(ir.sidechains ?? []).flatMap((sc) => sc.messages.map((m) => (m.content[0] as { text?: string } | undefined)?.text ?? '')),
+  ];
+  assert.ok(allTexts.includes('main') && allTexts.includes('main reply') && allTexts.includes('second root') && allTexts.includes('orphan reply'),
+    'every message survives somewhere (main chain or sidechain archive) — zero drop, no crash');
+  assert.ok(ir.messages.length >= 1, 'the leaf walk produced a (degenerate) main chain instead of throwing');
+});
+
+test('round-trip symmetry: session_info sequence replays without duplicate final rows', async () => {
+  const adapter = new PiAdapter();
+  const root = await tempRoot();
+  const dir = join(root, '--tmp-proj--');
+  await fs.mkdir(dir, { recursive: true });
+  const path = join(dir, '2024-12-03T14-00-00-000Z_seqinfo00.jsonl');
+  const lines = [
+    JSON.stringify({ type: 'session', version: 3, id: 'seqinfo00', timestamp: '2024-12-03T14:00:00.000Z', cwd: '/tmp/proj' }),
+    JSON.stringify({ type: 'message', id: 'aaaaaaaa', parentId: null, timestamp: '2024-12-03T14:00:01.000Z', message: { role: 'user', content: 'hi', timestamp: 1 } }),
+    JSON.stringify({ type: 'message', id: 'bbbbbbbb', parentId: 'aaaaaaaa', timestamp: '2024-12-03T14:00:02.000Z', message: { role: 'assistant', content: [{ type: 'text', text: 'yo' }], timestamp: 2 } }),
+    JSON.stringify({ type: 'session_info', id: 'cccccccc', parentId: 'bbbbbbbb', timestamp: '2024-12-03T14:00:03.000Z', name: 'First Name' }),
+    JSON.stringify({ type: 'model_change', id: 'dddddddd', parentId: 'cccccccc', timestamp: '2024-12-03T14:00:04.000Z', provider: 'openai', modelId: 'gpt-5' }),
+    JSON.stringify({ type: 'session_info', id: 'eeeeeeee', parentId: 'dddddddd', timestamp: '2024-12-03T14:00:05.000Z', name: 'Final Name' }),
+  ].join('\n') + '\n';
+  await fs.writeFile(path, lines, 'utf8');
+  const ir = await parsePiFile(path);
+  const events = (ir.meta as { pi: { settingsEvents?: Array<Record<string, unknown>> } }).pi.settingsEvents ?? [];
+  assert.equal(events.filter((e) => e.type === 'session_info').length, 2, 'both session_info rows ride the sequence');
+  const res = await adapter.write(ir, { root: join(root, 'out'), targetCwd: '/tmp/proj' });
+  const raw = await fs.readFile(res.paths[0]!, 'utf8');
+  const siRows = raw.split('\n').filter((l) => l.includes('"type":"session_info"'));
+  assert.equal(siRows.length, 2, 'session_info sequence replays exactly once per row (no duplicate final title row)');
+  const names = siRows.map((l) => (JSON.parse(l) as { name?: string }).name);
+  assert.deepEqual(names, ['First Name', 'Final Name'], 'order preserved');
+  const back = await parsePiFile(res.paths[0]!);
+  assert.equal(back.title, 'Final Name', 'last-wins title after replay');
+});

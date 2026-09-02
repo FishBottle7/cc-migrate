@@ -58,7 +58,7 @@ entry 基座 `{type, id, parentId, timestamp(ISO)}`；`id` 8-char hex（`randomU
 
 ### 2.2 版本迁移（读端要容忍）
 
-- v1→v2：补 `id`/`parentId` 链 + `firstKeptEntryIndex` → `firstKeptEntryId`（按**数组下标**换算，`sm.ts:246`）
+- v1→v2：补 `id`/`parentId` 链 + `firstKeptEntryIndex` → `firstKeptEntryId`（按**数组下标**换算，`sm.ts:246`；⚠️ 下标基准是**含 header 的全 entries 数组**——`migrateV1ToV2` 直接 `entries[comp.firstKeptEntryIndex]`，header 是 entries[0]）
 - v2→v3：`hookMessage` role 改名 `custom`（`sm.ts:267`）
 - `migrateToCurrentVersion`（`sm.ts:281`）在 `open` 时**原地改写文件**（`_rewriteFile`）。适配器读旧文件时按同规则解析即可，但**绝不能触发 pi 自己的 open 迁移来代写**——我们只读不写源文件（见 §10 删除/改动红线）
 - `loadEntriesFromFile`（`sm.ts:514`）**跳过 malformed 行**（不报错）+ 末行无换行自动补 `\n`（`sm.ts:555`）+ 首行非 session header 则整体判非法返回空。适配器 parse 必须同样宽容逐行、但**不能像 pi 一样静默重写源文件**

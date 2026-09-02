@@ -53,7 +53,8 @@ type PiEntryType =
 
 interface PiHeader {
   type: 'session';
-  version: 3;
+  /** v1 headers carry no version field */
+  version?: number;
   id: string;
   timestamp: string;
   cwd: string;
@@ -63,12 +64,14 @@ interface PiHeader {
 /** Any non-header v3 entry (the base fields + a union of the loose payloads). */
 interface PiEntry {
   type: PiEntryType;
-  id: string;
-  parentId: string | null;
-  timestamp: string;
+  id?: string;
+  parentId?: string | null;
+  timestamp?: string;
   message?: { role?: string } & Record<string, unknown>;
   summary?: string;
   firstKeptEntryId?: string;
+  /** v1 compaction used an array index; converted on read (sm.ts:246 migrateV1ToV2) */
+  firstKeptEntryIndex?: number;
   tokensBefore?: number;
   retainedTail?: unknown;
   fromId?: string;
@@ -113,6 +116,8 @@ interface PiMessageMeta {
   bash?: Record<string, unknown>;
   customMessage?: Record<string, unknown>;
   anchor?: { kind: PiAnchorKind; entryId: string };
+  /** stray summary-role message row (no bucket twin) — kept as plain user text */
+  straySummary?: Record<string, unknown>;
   addedToolNames?: unknown;
   usage?: unknown;
 }
@@ -307,7 +312,10 @@ export class PiAdapter implements Adapter {
     // sequence — write-back replays in order after the main chain. When the
     // session has no recorded events (cross-tool), the derived ir.model /
     // ir.thinkingLevel still get a final-state entry so resume derives them.
+    // session_info rows ride the same sequence for round-trip symmetry; when
+    // replayed, the title-writing step below skips its duplicate final row.
     const settingsEvents = piHeaderMeta?.settingsEvents;
+    let sessionInfoReplayed = false;
     if (Array.isArray(settingsEvents) && settingsEvents.length > 0) {
       for (const ev of settingsEvents) {
         if (!isRecord(ev)) continue;
@@ -320,6 +328,12 @@ export class PiAdapter implements Adapter {
           const id = nextId();
           appendLine({ type: 'thinking_level_change', id, parentId, timestamp: entryTimestamp(time), thinkingLevel: ev.thinkingLevel });
           parentId = id;
+        } else if (ev.type === 'session_info') {
+          const id = nextId();
+          const name = typeof ev.name === 'string' ? ev.name : '';
+          appendLine({ type: 'session_info', id, parentId, timestamp: entryTimestamp(time), name });
+          parentId = id;
+          sessionInfoReplayed = true;
         }
       }
     } else {
@@ -344,6 +358,11 @@ export class PiAdapter implements Adapter {
     if (ir.sidechains?.length) {
       const mainFirstId = entryIdByMsg.get(writeMessages[0]) ?? null;
       for (const sc of ir.sidechains) {
+        // A meta-only sidechain (branch carried labels/compactions but no
+        // messages — the read side archives these) has no branch to draw: its
+        // native form was dead-branch state that cannot attach without a host
+        // entry. The IR keeps it losslessly for cross-tool consumers; a pi
+        // write-back skips the empty branch rather than fabricating entries.
         if (!sc.messages.length) continue;
         let branchParent = mainFirstId;
         let branchLeaf = branchParent;
@@ -416,15 +435,19 @@ export class PiAdapter implements Adapter {
       }
     }
     // title: latest non-empty session_info wins in pi (getSessionName walks in
-    // reverse); explicit clears ride an empty-name row (pi.md §8 #3).
-    if (ir.title) {
-      const id = nextId();
-      appendLine({ type: 'session_info', id, parentId, timestamp: entryTimestamp(undefined), name: ir.title });
-      parentId = id;
-    } else if (piHeaderMeta?.titleCleared === true) {
-      const id = nextId();
-      appendLine({ type: 'session_info', id, parentId, timestamp: entryTimestamp(undefined), name: '' });
-      parentId = id;
+    // reverse); explicit clears ride an empty-name row (pi.md §8 #3). When the
+    // settingsEvents replay already restored every session_info row, the final
+    // title row is already the last one — skip the duplicate.
+    if (!sessionInfoReplayed) {
+      if (ir.title) {
+        const id = nextId();
+        appendLine({ type: 'session_info', id, parentId, timestamp: entryTimestamp(undefined), name: ir.title });
+        parentId = id;
+      } else if (piHeaderMeta?.titleCleared === true) {
+        const id = nextId();
+        appendLine({ type: 'session_info', id, parentId, timestamp: entryTimestamp(undefined), name: '' });
+        parentId = id;
+      }
     }
 
     // Exclusive create (wx): migration never overwrites anything — a colliding
@@ -627,7 +650,11 @@ function piMessageToIr(raw: Record<string, unknown>, entryMeta?: PiEntry): Migra
     // These are ENTRY-level twins in well-formed files (they arrive via the
     // anchor path, never as message entries). If one shows up here anyway
     // (hand-edited file, extension writing raw message rows), degrade to the
-    // same rendered user row rather than dropping it.
+    // same rendered user row — WITHOUT the anchor marker: no bucket entry is
+    // paired with this row, and an anchor-marked message would be SKIPPED on
+    // write-back (anchor contract skips the message because the bucket twin
+    // provides the native entry) — the text would silently vanish. A plain
+    // synthetic user row keeps it lossless both directions.
     const summary = typeof raw.summary === 'string' ? raw.summary : '';
     const text = role === 'compactionSummary'
       ? COMPACTION_SUMMARY_PREFIX + summary + COMPACTION_SUMMARY_SUFFIX
@@ -635,7 +662,10 @@ function piMessageToIr(raw: Record<string, unknown>, entryMeta?: PiEntry): Migra
     const msg: MigratedMessage = { role: 'user', content: [{ type: 'text', text }] };
     if (ts !== undefined) msg.timestamp = ts;
     msg.synthetic = true;
-    msg.meta = { pi: { anchor: { kind: role === 'compactionSummary' ? 'compaction' : 'branch_summary', entryId: '' } } };
+    const stray: Record<string, unknown> = { kind: role };
+    if (summary) stray.summary = summary;
+    if (role === 'compactionSummary' && typeof raw.tokensBefore === 'number') stray.tokensBefore = raw.tokensBefore;
+    msg.meta = { pi: { straySummary: stray } };
     return msg;
   }
 
@@ -708,19 +738,56 @@ export async function parsePiFile(path: string): Promise<MigratedSession> {
   const header = first as PiHeader;
 
   const sessionEntries = entries.slice(1).filter((e): e is PiEntry => (e as { type?: string }).type !== 'session') as PiEntry[];
+
+  // ---- v1/v2 normalization (IN MEMORY ONLY — we never rewrite the source
+  // file, unlike pi's own `open` which migrates in place; pi.md §2.2/§10).
+  // Mirrors migrateToCurrentVersion (sm.ts:281):
+  //  - v1→v2: entries carry no id/parentId — assign sequential ids chained in
+  //    file order; compaction `firstKeptEntryIndex` (array index) converts to
+  //    `firstKeptEntryId` via the same positional lookup;
+  //  - v2→v3: message role `hookMessage` renames to `custom`.
+  const version = typeof header.version === 'number' ? header.version : 1;
+  if (version < 2) {
+    const ids = new Set<string>();
+    let prevId: string | null = null;
+    for (const e of sessionEntries) {
+      e.id = typeof e.id === 'string' && e.id ? e.id : generateId(ids);
+      ids.add(e.id);
+      e.parentId = e.parentId === undefined ? prevId : e.parentId;
+      prevId = e.id;
+      if (e.type === 'compaction' && typeof e.firstKeptEntryIndex === 'number') {
+        // positional lookup includes the header offset: pi indexes into the
+        // FULL entries array (header is entries[0], sm.ts:246)
+        const target = entries[e.firstKeptEntryIndex];
+        if (target && (target as { type?: string }).type !== 'session') {
+          e.firstKeptEntryId = (target as PiEntry).id;
+        }
+        delete e.firstKeptEntryIndex;
+      }
+    }
+  }
+  if (version < 3) {
+    for (const e of sessionEntries) {
+      if (e.type === 'message' && e.message?.role === 'hookMessage') {
+        e.message.role = 'custom';
+      }
+    }
+  }
   const cwd = header.cwd;
   const createdAt = toEpochMs(header.timestamp);
   const originSessionId = header.id;
 
   // ---- tree + leaf: the LAST ENTRY in file order is the leaf (sm.ts:964
   // _buildIndex walks every entry; append order ≠ tree order after branching).
+  // After v1 normalization every entry has an id; defensive fallback for
+  // hand-corrupted rows keeps them out of the index instead of throwing.
   const byId = new Map<string, PiEntry>();
-  for (const e of sessionEntries) byId.set(e.id, e);
-  const leafId = sessionEntries.length ? sessionEntries[sessionEntries.length - 1].id : null;
+  for (const e of sessionEntries) if (e.id) byId.set(e.id, e);
+  const leafId = sessionEntries.length ? sessionEntries[sessionEntries.length - 1].id ?? null : null;
   const leafPath = new Set<string>();
   {
     let cur: PiEntry | undefined = leafId ? byId.get(leafId) : undefined;
-    while (cur) {
+    while (cur?.id) {
       leafPath.add(cur.id);
       cur = cur.parentId ? byId.get(cur.parentId) : undefined;
     }
@@ -893,21 +960,24 @@ export async function parsePiFile(path: string): Promise<MigratedSession> {
 
   // Off-path entries: sibling branches → sidechains (pi.md §6). Non-message
   // off-path entries (labels/compactions on dead branches) also ride their
-  // branch group's meta so nothing is dropped.
-  const offPath = sessionEntries.filter((e) => !leafPath.has(e.id));
+  // branch group's meta so nothing is dropped. Orphans (dangling/self-pointing
+  // parentId — a legal second root after resetLeaf, pi.md §4 多 root) land
+  // here too: they form their own group, never crash, never drop.
+  const offPath = sessionEntries.filter((e) => !leafPath.has(e.id ?? ''));
   const sidechains: import('../../ir.js').MigratedSidechain[] = [];
   if (offPath.length) {
     // group by branch root: walk up from each entry until hitting the leaf
     // path (or a dangling parent); the highest off-path ancestor is the root.
     const groups = new Map<string, PiEntry[]>();
     for (const e of offPath) {
+      const eid = e.id ?? '';
       let anc: PiEntry | undefined = e;
-      let branchRoot = e.id;
+      let branchRoot = eid;
       while (anc?.parentId) {
         const p = byId.get(anc.parentId);
-        if (!p || leafPath.has(p.id)) break;
+        if (!p || leafPath.has(p.id ?? '')) break;
         anc = p;
-        branchRoot = anc.id;
+        branchRoot = anc.id ?? branchRoot;
       }
       const g = groups.get(branchRoot) ?? [];
       g.push(e);
@@ -916,14 +986,15 @@ export async function parsePiFile(path: string): Promise<MigratedSession> {
     for (const [rootId, group] of groups) {
       group.sort((a, b) => (toEpochMs(a.timestamp) ?? 0) - (toEpochMs(b.timestamp) ?? 0));
       // order the branch's own chain linearly: follow parentId within group
-      const groupById = new Map(group.map((e) => [e.id, e]));
+      const groupById = new Map(group.map((e) => [e.id ?? '', e]));
       const ordered: PiEntry[] = [];
       const visited = new Set<string>();
       const walk = (e: PiEntry): void => {
-        if (visited.has(e.id)) return;
-        visited.add(e.id);
+        const eid = e.id ?? '';
+        if (visited.has(eid)) return;
+        visited.add(eid);
         for (const child of group) {
-          if (child.parentId === e.id) walk(child);
+          if (child.parentId === eid) walk(child);
         }
         ordered.push(e);
       };

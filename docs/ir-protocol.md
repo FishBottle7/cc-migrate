@@ -57,7 +57,7 @@
 | 槽位 | 类型 | 语义 | 读写端 |
 |------|------|------|--------|
 | `branchSummaries[]` 条目扩形 | `{fromId, summary, anchorIndex?, time?, meta?}` | pi `branch_summary` entry 全保真：`anchorIndex` 指向 messages[] 里的投影 user 消息（anchor 契约，同 compaction 模式）；`meta` 承原生残件（details/usage/fromHook/entryId/timestamp）。旧形状 `{fromId, summary}` 仍合法 | pi 读写两端；其余忽略 |
-| `MigratedSession.meta.pi` | 会话级命名空间 | `header`（header 原文含 parentSession）、`settingsEvents`（model_change/thinking_level_change 全序列，写回按序重放）、`labels`（{targetId, label?, time}，含清除语义）、`customEntries`（{customType, data, time}）、`titleCleared`（session_info 显式清除） | pi 读写两端；其余忽略 |
+| `MigratedSession.meta.pi` | 会话级命名空间 | `header`（header 原文含 parentSession）、`settingsEvents`（model_change/thinking_level_change/session_info 全序列，写回按序重放——session_info 行含 title 历史与清除语义，重放后 title 步骤跳过重复行）、`labels`（{targetId, label?, time}，含清除语义）、`customEntries`（{customType, data, time}）、`titleCleared`（session_info 显式清除） | pi 读写两端；其余忽略 |
 | `MigratedMessage.meta.pi` 扩展 | 消息级命名空间 | `message`（assistant 无槽位字段：api/responseModel/responseId/deferred/errorMessage/rawStopReason/endTurn/diagnostics/usage 补全）、`bash`（bashExecution 全字段 + excludeFromContext）、`customMessage`（customType/display/details）、`anchor`（{kind:'compaction'\|'branch_summary', entryId}，标记桶投影消息）、`addedToolNames`/`usage`（toolResult 补全） | pi 读写两端；其余忽略 |
 | pi `compaction[]` 消费 | 既有桶补全 | pi 写端开始消费 `compaction[]`（此前只 dsh/zcode/claude 消费）：桶 → 原生 compaction entry（summary/firstKeptEntryId/tokensBefore + meta 残件）；**anchor 消息跳过防双写**；v3 计划丢弃策略表「Pi 保留 branchSummaries/compaction」至此兑现 | pi 写端 |
 
