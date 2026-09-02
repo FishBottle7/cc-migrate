@@ -408,51 +408,40 @@ test('v3.3 read: session_info empty name is an explicit title clear', async () =
   assert.equal((ir.meta as { pi: { titleCleared?: boolean } }).pi.titleCleared, true, 'clear semantics recorded');
 });
 
-test('v1 legacy file: entries without id/parentId chain in file order; firstKeptEntryIndex converts', async () => {
+test('v1/v2 legacy files are refused explicitly (development policy: current format only)', async () => {
   const root = await tempRoot();
   const dir = join(root, '--tmp-proj--');
   await fs.mkdir(dir, { recursive: true });
-  const path = join(dir, '2024-12-03T14-00-00-000Z_legacyv100.jsonl');
-  // v1: header has NO version field; entries carry no id/parentId; compaction
-  // still uses the array-index firstKeptEntryIndex (converted on read, never
-  // rewriting the source file — pi.md §2.2/§10)
-  const lines = [
+  // v1: header has NO version field; entries carry no id/parentId
+  const v1Path = join(dir, '2024-12-03T14-00-00-000Z_legacyv100.jsonl');
+  const v1Lines = [
     JSON.stringify({ type: 'session', id: 'legacyv100', timestamp: '2024-12-03T14:00:00.000Z', cwd: '/tmp/proj' }),
     JSON.stringify({ type: 'message', timestamp: '2024-12-03T14:00:01.000Z', message: { role: 'user', content: 'v1 question', timestamp: 1 } }),
     JSON.stringify({ type: 'message', timestamp: '2024-12-03T14:00:02.000Z', message: { role: 'assistant', content: [{ type: 'text', text: 'v1 answer' }], timestamp: 2 } }),
-    JSON.stringify({ type: 'compaction', timestamp: '2024-12-03T14:00:03.000Z', summary: 'v1 fold', firstKeptEntryIndex: 3, tokensBefore: 90 }),
-    JSON.stringify({ type: 'message', timestamp: '2024-12-03T14:00:04.000Z', message: { role: 'user', content: 'kept turn', timestamp: 3 } }),
   ].join('\n') + '\n';
-  await fs.writeFile(path, lines, 'utf8');
-  const ir = await parsePiFile(path);
-  assert.equal(ir.originTool, 'pi');
-  const texts = ir.messages.map((m) => (m.content[0] as { text?: string } | undefined)?.text ?? '');
-  assert.ok(texts.includes('v1 question') && texts.includes('v1 answer') && texts.includes('kept turn'),
-    'v1 chain (linear, file order) fully recovered — no silent empty session');
-  assert.equal(ir.compaction?.length, 1, 'v1 compaction read');
-  // firstKeptEntryIndex 3 (full-array index incl. header) → the compaction's
-  // own entry id, matching pi's migrateV1ToV2 positional lookup
-  assert.ok(ir.compaction![0]!.firstKeptId, 'firstKeptEntryIndex converted to an entry id');
-  const raw = await fs.readFile(path, 'utf8');
-  assert.ok(!raw.includes('firstKeptEntryId'), 'source file untouched (in-memory migration only)');
-});
-
-test('v2 legacy file: hookMessage role renames to custom (in memory)', async () => {
-  const root = await tempRoot();
-  const dir = join(root, '--tmp-proj--');
-  await fs.mkdir(dir, { recursive: true });
-  const path = join(dir, '2024-12-03T14-00-00-000Z_legacyv200.jsonl');
-  const lines = [
+  await fs.writeFile(v1Path, v1Lines, 'utf8');
+  await assert.rejects(
+    () => parsePiFile(v1Path),
+    /legacy v1 session file.*not supported.*migrate it in place/s,
+    'v1 (no version field) is refused with a migration hint, never half-parsed',
+  );
+  // v2: header version 2 (hookMessage era)
+  const v2Path = join(dir, '2024-12-03T14-00-00-000Z_legacyv200.jsonl');
+  const v2Lines = [
     JSON.stringify({ type: 'session', version: 2, id: 'legacyv200', timestamp: '2024-12-03T14:00:00.000Z', cwd: '/tmp/proj' }),
     JSON.stringify({ type: 'message', id: 'aaaaaaaa', parentId: null, timestamp: '2024-12-03T14:00:01.000Z', message: { role: 'hookMessage', customType: 'old-hook', content: 'hook payload', timestamp: 1 } }),
-    JSON.stringify({ type: 'message', id: 'bbbbbbbb', parentId: 'aaaaaaaa', timestamp: '2024-12-03T14:00:02.000Z', message: { role: 'assistant', content: [{ type: 'text', text: 'r' }], timestamp: 2 } }),
   ].join('\n') + '\n';
-  await fs.writeFile(path, lines, 'utf8');
-  const ir = await parsePiFile(path);
-  const hook = ir.messages.find((m) => (m.meta as { pi?: { customMessage?: { customType?: string } } } | undefined)?.pi?.customMessage?.customType === 'old-hook');
-  assert.ok(hook, 'hookMessage renamed to custom and projected as a user row');
-  assert.equal(hook!.role, 'user');
-  assert.equal(hook!.synthetic, true);
+  await fs.writeFile(v2Path, v2Lines, 'utf8');
+  await assert.rejects(
+    () => parsePiFile(v2Path),
+    /legacy v2 session file.*not supported/s,
+    'v2 is refused the same way',
+  );
+  // both source files stay untouched (no in-place migration by us, ever)
+  const v1Raw = await fs.readFile(v1Path, 'utf8');
+  assert.ok(v1Raw.includes('"type":"session"') && !v1Raw.includes('"version"'), 'v1 source untouched');
+  const v2Raw = await fs.readFile(v2Path, 'utf8');
+  assert.ok(v2Raw.includes('"version":2'), 'v2 source untouched');
 });
 
 test('stray summary-role message rows survive pi→pi round-trip (no bucket twin, no anchor skip)', async () => {

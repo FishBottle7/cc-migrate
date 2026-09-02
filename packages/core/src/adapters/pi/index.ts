@@ -25,7 +25,8 @@
  *    `ir.systemPrompt` empty; write side NEVER injects it (double-stack ban).
  *  - v4 harness files (`kind:'header'` first line) are detected and refused
  *    with an explicit "unsupported" error — never silently dropped or
- *    half-parsed (pi.md §7).
+ *    half-parsed (pi.md §7). Legacy v1/v2 files get the same explicit refusal
+ *    (open in pi once to migrate, then re-export).
  *  - Red lines: read-only on source files (never pi's own `open` chain — it
  *    rewrites old files in place); no unlink/rm/trash anywhere; writes go to a
  *    brand-new file created exclusively (`wx`).
@@ -70,8 +71,6 @@ interface PiEntry {
   message?: { role?: string } & Record<string, unknown>;
   summary?: string;
   firstKeptEntryId?: string;
-  /** v1 compaction used an array index; converted on read (sm.ts:246 migrateV1ToV2) */
-  firstKeptEntryIndex?: number;
   tokensBefore?: number;
   retainedTail?: unknown;
   fromId?: string;
@@ -737,42 +736,20 @@ export async function parsePiFile(path: string): Promise<MigratedSession> {
   }
   const header = first as PiHeader;
 
-  const sessionEntries = entries.slice(1).filter((e): e is PiEntry => (e as { type?: string }).type !== 'session') as PiEntry[];
-
-  // ---- v1/v2 normalization (IN MEMORY ONLY — we never rewrite the source
-  // file, unlike pi's own `open` which migrates in place; pi.md §2.2/§10).
-  // Mirrors migrateToCurrentVersion (sm.ts:281):
-  //  - v1→v2: entries carry no id/parentId — assign sequential ids chained in
-  //    file order; compaction `firstKeptEntryIndex` (array index) converts to
-  //    `firstKeptEntryId` via the same positional lookup;
-  //  - v2→v3: message role `hookMessage` renames to `custom`.
+  // v1/v2 files are refused explicitly (same discipline as the v4 gate below):
+  // cc-migrate is in development and only targets the CURRENT format — a
+  // half-tolerant read of legacy tree shapes (v1 has no id/parentId;
+  // firstKeptEntryIndex; v2 hookMessage) risks silently wrong parses, and
+  // silently-wrong is worse than refused. Pi's own open migrates old files in
+  // place — let it; we never touch the source (pi.md §2.2/§10).
   const version = typeof header.version === 'number' ? header.version : 1;
-  if (version < 2) {
-    const ids = new Set<string>();
-    let prevId: string | null = null;
-    for (const e of sessionEntries) {
-      e.id = typeof e.id === 'string' && e.id ? e.id : generateId(ids);
-      ids.add(e.id);
-      e.parentId = e.parentId === undefined ? prevId : e.parentId;
-      prevId = e.id;
-      if (e.type === 'compaction' && typeof e.firstKeptEntryIndex === 'number') {
-        // positional lookup includes the header offset: pi indexes into the
-        // FULL entries array (header is entries[0], sm.ts:246)
-        const target = entries[e.firstKeptEntryIndex];
-        if (target && (target as { type?: string }).type !== 'session') {
-          e.firstKeptEntryId = (target as PiEntry).id;
-        }
-        delete e.firstKeptEntryIndex;
-      }
-    }
+  if (version < PI_CURRENT_VERSION) {
+    throw new Error(
+      `Pi: "${path}" is a legacy v${version} session file (current is v${PI_CURRENT_VERSION}) — not supported; open it in pi once to let pi migrate it in place, then re-export`,
+    );
   }
-  if (version < 3) {
-    for (const e of sessionEntries) {
-      if (e.type === 'message' && e.message?.role === 'hookMessage') {
-        e.message.role = 'custom';
-      }
-    }
-  }
+
+  const sessionEntries = entries.slice(1).filter((e): e is PiEntry => (e as { type?: string }).type !== 'session') as PiEntry[];
   const cwd = header.cwd;
   const createdAt = toEpochMs(header.timestamp);
   const originSessionId = header.id;

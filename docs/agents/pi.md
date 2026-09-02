@@ -56,12 +56,13 @@ entry 基座 `{type, id, parentId, timestamp(ISO)}`；`id` 8-char hex（`randomU
 
 关键分界：`compaction`/`branch_summary`/`session_info` 不是「日志噪音」——它们分别是 pi 的上下文折叠锚、分支上下文恢复机制、显示名载体，全部参与 pi 的 resume 行为。**v3 读端只处理 `message`/`model_change`/`thinking_level_change` 三类是丢信息，不是合理简化**（8 类里 6 类静默丢弃，`unmappedEvents` 也没进——零丢弃原则双重违反）。
 
-### 2.2 版本迁移（读端要容忍）
+### 2.2 版本迁移（读端**显式拒绝**旧版本——2026-09-02 产品决策）
 
 - v1→v2：补 `id`/`parentId` 链 + `firstKeptEntryIndex` → `firstKeptEntryId`（按**数组下标**换算，`sm.ts:246`；⚠️ 下标基准是**含 header 的全 entries 数组**——`migrateV1ToV2` 直接 `entries[comp.firstKeptEntryIndex]`，header 是 entries[0]）
 - v2→v3：`hookMessage` role 改名 `custom`（`sm.ts:267`）
-- `migrateToCurrentVersion`（`sm.ts:281`）在 `open` 时**原地改写文件**（`_rewriteFile`）。适配器读旧文件时按同规则解析即可，但**绝不能触发 pi 自己的 open 迁移来代写**——我们只读不写源文件（见 §10 删除/改动红线）
-- `loadEntriesFromFile`（`sm.ts:514`）**跳过 malformed 行**（不报错）+ 末行无换行自动补 `\n`（`sm.ts:555`）+ 首行非 session header 则整体判非法返回空。适配器 parse 必须同样宽容逐行、但**不能像 pi 一样静默重写源文件**
+- `migrateToCurrentVersion`（`sm.ts:281`）在 `open` 时**原地改写文件**（`_rewriteFile`）
+- **适配器决策（2026-09-02，与 v4 防线同款纪律）**：开发阶段只支持现役 `version:3`——v1/v2 文件 parse 时**显式报错跳过**（错误信息提示「用 pi open 一次让其原地迁移后再导出」），不做容忍解析。理由：旧树形（v1 无 id/parentId、firstKeptEntryIndex、v2 hookMessage）的半吊子容忍解析风险是**静默解析错**，比显式拒绝更糟；且 pi 自己的 open 迁移是官方通道，无需我们代劳。我们仍然**绝不自己触发 pi 的 open 迁移、绝不写源文件**（见 §10）
+- `loadEntriesFromFile`（`sm.ts:514`）**跳过 malformed 行**（不报错）+ 末行无换行自动补 `\n`（`sm.ts:555`）+ 首行非 session header 则整体判非法返回空。适配器 parse 对**现役 v3 文件**同样宽容逐行、但**不能像 pi 一样静默重写源文件**
 
 ## 3. 消息词汇（`AgentMessage`，`docs/session-format.md` + `pi-ai/src/types.ts`）
 
