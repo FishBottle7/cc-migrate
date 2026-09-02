@@ -202,6 +202,6 @@ pi 的 compaction/branch_summary 在**原生 context 里是 user 消息**（`con
 7. **v4 检测**：`kind:'header'` → 显式报错跳过（§7）
 8. **测试**：round-trip（含 compaction/branch_summary/label/session_info/custom/bashExecution）+ 跨工具投影（pi→dsh verify 干净）+ 旧版 pi.test.ts 既有用例全绿；IR 槽位变更随实现落地时按闸门 bump `IR_VERSION` + 同步各端 `irVersion` + 登记 `ir-protocol.md`
 
-## 14. IR 变更登记摘要（同步进 ir-protocol.md §v3.3，落地时执行）
+## 14. IR 变更登记摘要（✅ 2026-09-02 已随 pi 适配器重写落地——`IR_VERSION`=3.3，各端 `irVersion` 闸门同步）
 
 v3.3（pi 适配器重写驱动，全部可选字段，旧端忽略）：`branchSummaries[]` 条目扩形 `{fromId, summary, anchorIndex?, time?, meta?}`；`MigratedSession.meta.pi` 命名空间（header/settingsEvents/labels/customEntries/titleCleared）；`MigratedMessage.meta.pi` 扩展（message/bash/customMessage/anchor/addedToolNames/usage）。**语义引用**：本表 §8；落地时 bump `IR_VERSION` 并同步全部适配器 `irVersion`（闸门强制）。dsh/claude/codex/zcode/opencode 的写端行为不受影响（可选字段 + 命名空间隔离）；读端忽略即可。

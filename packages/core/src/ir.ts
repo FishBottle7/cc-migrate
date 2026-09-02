@@ -53,6 +53,20 @@
  *    =2、originTool 闭集、会话级 goals/planModes/todos/unmappedEvents/branchSummaries
  *    逐项校验（docs/ir-protocol.md「IR 加固清单」第一层）。
  *  - readSource 出口 / writeTarget 入口引擎级 validateSession 卡点（第三层）。
+ *
+ * v3.3 additive changes (2026-09-01, pi 适配器重写驱动 — 全部为可选字段，旧适配器
+ * 忽略即可，见 docs/ir-protocol.md「v3.3 登记」与 docs/agents/pi.md §8/§14):
+ *  - branchSummaries[] 条目扩形：{fromId, summary, anchorIndex?, time?, meta?} —
+ *    pi branch_summary entry 全保真（anchorIndex 指向 messages[] 里的投影 user
+ *    消息，anchor 契约同 compaction；meta 承原生残件 details/usage/fromHook/
+ *    entryId/timestamp）。旧形状 {fromId, summary} 仍合法。
+ *  - MigratedSession.meta.pi / MigratedMessage.meta.pi 命名空间（pi 原生载荷，
+ *    其余适配器忽略）：会话级 header/settingsEvents/labels/customEntries/
+ *    titleCleared；消息级 message（assistant 无槽位字段）/bash/customMessage/
+ *    anchor/addedToolNames/usage。
+ *  - pi 写端开始消费 compaction[]/branchSummaries[]（桶 → 原生 entry，anchor
+ *    消息跳过防双写）；pi 读端 systemPrompt 恒空、写端恒不注入（pi 会话文件
+ *    不存提示词正文，v3.2 #8 在 pi 端的执行细则）。
  */
 
 export type ToolId = 'dsh' | 'claude' | 'codex' | 'opencode' | 'pi' | 'zcode' | 'unknown';
@@ -71,7 +85,7 @@ export type ToolId = 'dsh' | 'claude' | 'codex' | 'opencode' | 'pi' | 'zcode' | 
  * value), and register the change in docs/ir-protocol.md. The registry
  * refuses to register an adapter whose irVersion is older than this constant.
  */
-export const IR_VERSION = '3.2';
+export const IR_VERSION = '3.3';
 
 /** Compare two dotted IR versions ('3.2' < '3.10' < '4.0'). */
 export function compareIrVersions(a: string, b: string): number {
@@ -298,6 +312,22 @@ export interface MigratedPrLink {
 }
 
 /**
+ * One branch-summary record (pi `branch_summary` entry; v3.3). Same dual-carrier
+ * contract as MigratedCompaction: the summary text projects into messages[] as a
+ * synthetic user message (anchor contract) and `anchorIndex` points at it.
+ */
+export interface MigratedBranchSummary {
+  fromId: string;
+  summary: string;
+  /** index into messages[] of the projected branch-summary user message */
+  anchorIndex?: number;
+  /** epoch ms of the source entry (pi entry timestamp) */
+  time?: number;
+  /** adapter-namespaced native record, same contract as MigratedCompaction.meta */
+  meta?: Record<string, unknown>;
+}
+
+/**
  * One non-conversation session-level row from the source harness — claude
  * system records whose subtype has no conversational projection
  * (turn_duration, stop_hook_summary, microcompact_boundary, model_refusal_*,
@@ -339,7 +369,17 @@ export interface MigratedSession {
   compaction?: MigratedCompaction[];
   /** Typed lossless tool-invocation bucket (zcode fused call+result parts). */
   toolCalls?: MigratedToolCall[];
-  branchSummaries?: Array<{ fromId: string; summary: string }>;
+  /**
+   * Branch-summary records (pi `branch_summary` entries; v3.3 extended shape —
+   * the original `{fromId, summary}` stays valid). `summary` + `anchorIndex`
+   * travel cross-tool exactly like compaction[]: the summary text is ALSO
+   * projected as a role:'user' message in messages[] (anchor contract),
+   * `anchorIndex` points at that message, and native remnants (details/usage/
+   * fromHook/entryId/timestamp) ride `meta`. `fromId` is the source branch
+   * point id (pi: the leaf the branch was left from; provenance only — never
+   * tree-looked-up on load).
+   */
+  branchSummaries?: MigratedBranchSummary[];
   /** Typed lossless domain state from DSH (goal/change). */
   goals?: MigratedGoal[];
   /** Typed lossless domain state from DSH (plan/mode). */
@@ -612,9 +652,20 @@ export function validateSession(ir: MigratedSession): MigratedSession {
   if (ir.branchSummaries !== undefined) {
     if (!Array.isArray(ir.branchSummaries)) throw new Error('validateSession: branchSummaries must be an array');
     for (const [i, bs] of ir.branchSummaries.entries()) {
-      const b = bs as Record<string, unknown> | null;
+      const b = bs as unknown as Record<string, unknown> | null;
       if (typeof b !== 'object' || b === null || typeof b.fromId !== 'string' || typeof b.summary !== 'string') {
         throw new Error(`validateSession: branchSummaries[${i}] must be { fromId: string, summary: string }`);
+      }
+      // v3.3 extended shape (all optional): anchorIndex points at the projected
+      // messages[] user message; time is epoch ms; meta is the native-remnant bag.
+      if (b.anchorIndex !== undefined && typeof b.anchorIndex !== 'number') {
+        throw new Error(`validateSession: branchSummaries[${i}].anchorIndex must be a number`);
+      }
+      if (b.time !== undefined && typeof b.time !== 'number') {
+        throw new Error(`validateSession: branchSummaries[${i}].time must be a number`);
+      }
+      if (b.meta !== undefined && (typeof b.meta !== 'object' || b.meta === null || Array.isArray(b.meta))) {
+        throw new Error(`validateSession: branchSummaries[${i}].meta must be an object`);
       }
     }
   }

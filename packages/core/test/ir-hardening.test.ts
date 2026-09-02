@@ -267,3 +267,93 @@ test('builtin registry: all six adapters are at the current IR version', () => {
   // registry gate rejects any stale adapter at register time.
   builtinRegistry();
 });
+
+/* ---------------- v3.3 slots (pi rewrite, docs/ir-protocol.md「v3.3 登记」) ---------------- */
+
+test('validateSession: branchSummaries extended shape is guarded (v3.3)', () => {
+  const base = { fromId: 'aaaaaaaa', summary: 's' };
+  // legacy shape stays valid
+  validateSession({ ...irOf([]), branchSummaries: [base] });
+  // full extended shape
+  validateSession({
+    ...irOf([]),
+    branchSummaries: [{ ...base, anchorIndex: 0, time: 1733229600000, meta: { entryId: 'aaaaaaaa' } }],
+  });
+  // bad anchorIndex / time / meta
+  assert.throws(
+    () => validateSession({ ...irOf([]), branchSummaries: [{ ...base, anchorIndex: 'x' }] } as unknown as MigratedSession),
+    /branchSummaries\[0\]\.anchorIndex must be a number/,
+  );
+  assert.throws(
+    () => validateSession({ ...irOf([]), branchSummaries: [{ ...base, time: 'x' }] } as unknown as MigratedSession),
+    /branchSummaries\[0\]\.time must be a number/,
+  );
+  assert.throws(
+    () => validateSession({ ...irOf([]), branchSummaries: [{ ...base, meta: 'x' }] } as unknown as MigratedSession),
+    /branchSummaries\[0\]\.meta must be an object/,
+  );
+});
+
+test('pi read: leaf-path walk starts from the LAST ENTRY, not the last message (v3.3)', async () => {
+  // guarded by a dedicated scenario test in pi.test.ts (label entry as tail);
+  // here assert the pi round-trip contract: a pi-produced file re-reads with
+  // its full tail visible (leaf = last written entry by construction).
+  const adapter = new PiAdapter();
+  const root = await fs.mkdtemp(join(tmpdir(), 'sm-pi-leaf-'));
+  const ir: MigratedSession = {
+    schemaVersion: 2,
+    originTool: 'dsh',
+    cwd: '/tmp/proj',
+    messages: [
+      { role: 'user', content: [{ type: 'text', text: 'q' }], timestamp: 1 },
+      { role: 'assistant', content: [{ type: 'text', text: 'a' }], timestamp: 2 },
+    ],
+    title: 'leaf test',
+  };
+  const res = await adapter.write(ir, { root, targetCwd: '/tmp/proj' });
+  const back = await adapter.parse(res.sessionId, root);
+  const texts = back.messages.map((m) => (m.content[0] as { text?: string } | undefined)?.text ?? '');
+  assert.ok(texts.includes('a'), 'tail assistant message visible after round-trip (append order = tree order)');
+  assert.equal(back.title, 'leaf test', 'session_info entry restores the title');
+  await fs.rm(root, { recursive: true, force: true });
+});
+
+test('pi write: compaction/branchSummaries buckets project to native entries; anchor messages skipped (v3.3)', async () => {
+  const adapter = new PiAdapter();
+  const root = await fs.mkdtemp(join(tmpdir(), 'sm-pi-bucket-'));
+  const anchorText = 'The conversation history before this point was compacted into the following summary:\n\n<summary>\nold stuff\n</summary>';
+  const ir: MigratedSession = {
+    schemaVersion: 2,
+    originTool: 'dsh',
+    cwd: '/tmp/proj',
+    messages: [
+      { role: 'user', content: [{ type: 'text', text: 'before fold' }], timestamp: 1 },
+      { role: 'assistant', content: [{ type: 'text', text: 'folded answer' }], timestamp: 2 },
+      // anchor message (synthetic user projection of the compaction)
+      { role: 'user', content: [{ type: 'text', text: anchorText }], timestamp: 3, synthetic: true, meta: { pi: { anchor: { kind: 'compaction', entryId: 'src-comp-1' } } } },
+      { role: 'user', content: [{ type: 'text', text: 'after fold' }], timestamp: 4 },
+      { role: 'assistant', content: [{ type: 'text', text: 'post fold answer' }], timestamp: 5 },
+    ],
+    compaction: [{ summary: 'old stuff', tokensBefore: 42, anchorIndex: 2, meta: { entryId: 'src-comp-1', details: { z: 1 } } }],
+    branchSummaries: [{ fromId: 'root', summary: 'branch gone', anchorIndex: 4, time: 5, meta: { entryId: 'src-bs-1' } }],
+  };
+  const res = await adapter.write(ir, { root, targetCwd: '/tmp/proj' });
+  const raw = await fs.readFile(res.paths[0]!, 'utf8');
+  const rows = raw.split('\n').filter((l) => l.trim()).map((l) => JSON.parse(l) as Record<string, unknown>);
+  const compEntries = rows.filter((r) => r.type === 'compaction');
+  assert.equal(compEntries.length, 1, 'one native compaction entry from the bucket');
+  assert.equal((compEntries[0] as { summary?: string }).summary, 'old stuff', 'summary field is the PURE summary');
+  const ids = new Set(rows.map((r) => r.id).filter(Boolean) as string[]);
+  assert.ok(ids.has((compEntries[0] as { firstKeptEntryId?: string }).firstKeptEntryId!), 'firstKeptEntryId references a real entry id in the file');
+  // branchSummary anchored at the LAST message: after the loop the message
+  // chain ended — the entry follows as a tail entry (still on the leaf path)
+  const bsEntries = rows.filter((r) => r.type === 'branch_summary');
+  assert.equal(bsEntries.length, 1, 'one native branch_summary entry from the bucket');
+  // the rendered anchor text must NOT appear twice as message bodies
+  const anchorRows = rows.filter((r) => r.type === 'message' && JSON.stringify(r.message).includes('old stuff'));
+  assert.equal(anchorRows.length, 0, 'anchor message skipped on write-back (bucket twin provides the entry)');
+  // full archive (选 3): every IR message is in the file — nothing folded away
+  const msgRows = rows.filter((r) => r.type === 'message');
+  assert.ok(msgRows.length >= 4, 'all IR messages archived (full-archive choice)');
+  await fs.rm(root, { recursive: true, force: true });
+});
