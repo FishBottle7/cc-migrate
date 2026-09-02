@@ -4,8 +4,11 @@ packages:
   - 'packages/ui'
   - 'apps/*'
 
+# electron-winstaller：electron-builder 的 squirrel-windows target 传递依赖，
+# install 脚本只是把 vendor/7z-<arch>.exe 复制为 vendor/7z.exe（select-7z-arch.js）
 allowBuilds:
   electron: true
+  electron-winstaller: true
   esbuild: true
 
 # electron 的 postinstall 需要下载平台二进制；esbuild 校验其二进制

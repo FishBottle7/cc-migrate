@@ -1,0 +1,82 @@
+# electron-builder 配置 —— 打包形态下「system-Node worker」仍可用的关键是：
+# worker/worker.mjs 由【系统 Node】子进程加载（不是 Electron 内置 Node，见
+# worker.mjs 头注的 zstd 崩溃规避），因此：
+#   1. worker 及其依赖链（node_modules/@session-migrate/core）必须在【真实文件系统】
+#      上可 require —— 系统 Node 不认识 Electron 的 asar 虚拟文件系统，
+#      所以 worker + core 一律 asarUnpack 到 app.asar.unpacked；
+#   2. pnpm workspace 下 node_modules/@session-migrate/core 是指向
+#      ../../packages/core 的 symlink。electron-builder 的 files 匹配 node_modules
+#      时会把 symlink 解析后的真实文件收进来（构建实测验证），并保持包内相对布局。
+#
+# 渲染层产物在 dist/renderer 下，被 files 的 dist/** 自然覆盖，无需单列。
+
+appId: com.fishbottle.session-migrate # 个人工具命名，无域名冲突风险即可
+productName: session-migrate # 与 BrowserWindow title / package name 一致
+
+directories:
+  # 产物目录。默认会写到 SM_DIST_DIR 指定的路径（见 scripts 说明）：
+  # 本机 D: 盘常年 100% 满，release/ 落 C:（75G 可用）；用环境变量是为了
+  # 让其他磁盘宽裕的机器仍可默认输出到 apps/desktop-app/release。
+  # 用法：SM_DIST_DIR=D:/somewhere pnpm run dist:win
+  # 未设置时回退到 ./release。
+  output: ${env.SM_DIST_DIR}
+
+# 主进程入口沿用 package.json main=dist/index.js
+files:
+  - package.json # electron-builder 需要读 main 字段
+  - dist/** # 主进程产物（dist/*.js 平铺）+ 渲染层（dist/renderer/）
+  - preload/** # contextBridge 桥（.cjs 源文件直接加载）
+  - worker/** # system-Node worker（纯 JS 无构建）
+  # 渲染层的 vue/@session-migrate/ui 已被 vite 打进 dist/renderer（源码 alias 编译），
+  # asar 里不需要任何运行时 node_modules —— 先整目录排除，再【重新放行】worker
+  # 真正依赖的 @session-migrate/core（glob 顺序即优先级，后者覆盖前者）。
+  # core 是 pnpm workspace symlink，electron-builder 解析后按真实文件收进来。
+  - "!node_modules/**"
+  - node_modules/@session-migrate/core/dist/src/**
+  - node_modules/@session-migrate/core/package.json
+
+asar: true
+
+# 系统 Node 无法从 asar 内 require ESM —— worker + core 依赖链必须解包到
+# app.asar.unpacked/ 真实目录（worker-host.ts 的 resolveWorkerPaths 会把
+# asar 内路径重写到 .unpacked）。
+asarUnpack:
+  - worker/**
+  - node_modules/@session-migrate/core/**
+
+# 无签名（个人工具）：electron-builder 默认不签名，仅显式声明意图
+win:
+  target:
+    - target: nsis
+      arch: [x64]
+    - target: portable
+      arch: [x64]
+    - target: dir # 未打包目录树：冒烟测试用（scripts/smoke-packaged.mjs 指向它）
+      arch: [x64]
+  # signAndElevate 等默认关闭；无证书不配 certificateFile
+
+nsis:
+  oneClick: false # 非一键安装：允许自定义目录
+  allowToChangeInstallationDirectory: true
+  # 中文显示名（安装向导语言由 NSIS 按系统区域自动选择，这里只影响产物名）
+  artifactName: ${productName}-${version}-setup.${ext}
+  shortcutName: ${productName}
+  # perMachine=false（默认）→ per-user 安装，免 UAC，卸载干净
+
+# 以下平台配置就绪但本机（Windows）不构建：
+mac:
+  target:
+    - dmg
+  category: public.app-category.developer-tools
+
+linux:
+  target:
+    - AppImage
+  category: Development
+
+# 压缩：normal（默认）。worker + core 是纯 JS，体积小，不值得 maximum 的构建耗时
+compression: normal
+
+# electron 二进制下载慢时的备用镜像（留给需要的贡献者，注释掉即默认源）
+# electronDownload:
+#   mirror: https://npmmirror.com/mirrors/electron/

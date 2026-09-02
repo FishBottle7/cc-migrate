@@ -12,7 +12,11 @@
     "typecheck": "tsc -p tsconfig.main.json --noEmit && vue-tsc --noEmit -p tsconfig.renderer.json",
     "test": "pnpm run typecheck",
     "dev": "node scripts/dev.mjs",
-    "start": "pnpm run build && electron ."
+    "start": "pnpm run build && electron .",
+    "dist": "pnpm run build && node scripts/set-dist-dir.mjs",
+    "dist:win": "pnpm run build && node scripts/set-dist-dir.mjs --win",
+    "dist:win:dir": "pnpm run build && node scripts/set-dist-dir.mjs --win dir",
+    "smoke:packaged": "node scripts/smoke-packaged.mjs"
   },
   "dependencies": {
     "@session-migrate/core": "workspace:*",
@@ -23,6 +27,7 @@
     "@types/node": "^24.0.0",
     "@vitejs/plugin-vue": "^6.0.0",
     "electron": "^37.0.0",
+    "electron-builder": "^26.0.0",
     "typescript": "^5.9.0",
     "vite": "^7.0.0",
     "vue-tsc": "^3.0.0"

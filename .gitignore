@@ -1,6 +1,7 @@
 node_modules/
 .pnpm-store/
 dist/
+lib/
 *.tsbuildinfo
 .DS_Store
 
@@ -26,3 +27,6 @@ Thumbs.db
 # oversized build artifacts (git 无法按大小忽略，按产物类型兜底)
 *.min.js.map
 *.bundle
+
+# electron-builder 产物（apps/desktop-app/release）
+apps/desktop-app/release/

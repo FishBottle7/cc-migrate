@@ -291,14 +291,14 @@ DSH 插件 = `core` 的薄消费者。命令示例：
 12. CLI 支持全矩阵 `任意 <-> 任意`；`list`/`preview` 齐全（Codex/Claude/DSH 已齐）
 
 **Phase 3 —— DSH 插件打包 + GUI 集成**
-13. 把 core 打进 DSH 插件，注册 `/session-migrate` 命令 + `list-sources`
-14. 建 `packages/ui`（SessionPicker / SessionPreview / MigrateWizard，Vue 3）
-15. DSH GUI 向导：选会话 + 预览 + 转换并写入（三问交互：源目录 → 选 session+预览 → 转换 → 写目标存储）
+13. ✅ 把 core 打进 DSH 插件（`apps/dsh-plugin`，cordis 薄封装）：注册 `/session-migrate list-sources|preview|import` 三命令 + `cordis.patch.yml` bundle 行 + 冒烟测试（mock ctx 全绿、import 恒 mint 新 id 不覆盖）。命令层与宿主解耦（结构类型 PluginContext，零 cordis 依赖）；GUI 接入点已在 `apply(config)` 预留
+14. ✅ 建 `packages/ui`（SessionPicker / SessionPreview / MigrateWizard，Vue 3）
+15. 🔶 DSH GUI 向导：选会话 + 预览 + 转换并写入（三问交互：源目录 → 选 session+预览 → 转换 → 写目标存储）——命令层三函数可直接作 GUI 数据源，组件挂载待做
 
 **Phase 4 —— 独立 App（Electron）**
-16. 初始化 `apps/desktop-app`（Electron 主进程 import core + Vue 3 渲染进程复用 `packages/ui`）
-17. 完整 GUI 向导：选源/目录 → 浏览会话 + 离线预览 → 配置目标 + cwd 映射 → 一键写入
-18. 跨平台打包分发（Windows/macOS/Linux）
+16. ✅ 初始化 `apps/desktop-app`（Electron 主进程 import core + Vue 3 渲染进程复用 `packages/ui`）
+17. ✅ 完整 GUI 向导：选源/目录 → 浏览会话 + 离线预览 → 配置目标 + cwd 映射 → 一键写入
+18. 🔶 跨平台打包分发（2026-09-02 落地 Windows 本机构建）：electron-builder 就绪——nsis 安装包 + portable + dir 三 target（88MB/88MB/318MB 实测产出）；打包核心约束成立（worker + core asarUnpack 到真实文件系统，系统 Node 加载——Electron 内置 Node 的 zstd 崩溃规避架构在打包形态完整成立，打包 exe 真解析 2011 条消息大 DSH 会话通过）；冒烟 `smoke:packaged`（asar 布局 + worker JSON-RPC 一键验证）；mac(dmg)/linux(AppImage) 配置就绪未本机构建；代码签名/自动更新/应用图标待配
 
 **Phase 5 —— 健壮性**
 19. 工具调用 id 重映射、cwd 迁移、模型映射
@@ -317,4 +317,4 @@ DSH 插件 = `core` 的薄消费者。命令示例：
 A. `session-formats-audit.md` v2 已扩到 6 工具（含 DELTA vs 旧版）并拆出 `docs/agents/*.md` 一 agent 一档。
 B. 产品矩阵已定：CLI + DSH 插件 + **独立 App（Electron）**三端共用 core；技术栈 = TypeScript/Node(core) + Vue 3(渲染)。
 C. **验证**：`cd packages/core; pnpm run build && node --test --test-isolation=none dist/test/*.test.js`（必须 `--test-isolation=none`，否则 sandbox EPERM）；`pnpm -r --sort build` 会 EPERM，逐包 build；`cli` 用 `node dist/index.js list/preview/migrate --root <tmp>` 验证真实数据，不污染 `~/.dsh`/`~/.claude`/`~/.codex`。
-D. `Pi` 适配器（✅ v3.3 重写）与 `OpenCode` 真实写采样复核（✅ 2026-09-02）均已完成——进入 Phase 3 插件/GUI。
+D. `Pi` 适配器（✅ v3.3 重写）与 `OpenCode` 真实写采样复核（✅ 2026-09-02）均已完成。Phase 3 插件骨架（`apps/dsh-plugin`，三命令 + 冒烟）与 Phase 4 Windows 打包（electron-builder 实测出包）已落地——剩余：DSH GUI 向导组件挂载（Phase 3 第 15 项）、mac/linux 真机构建、签名/自动更新。

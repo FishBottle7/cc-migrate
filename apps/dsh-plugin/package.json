@@ -1,0 +1,46 @@
+{
+  "name": "@session-migrate/dsh-plugin",
+  "version": "0.1.0",
+  "description": "session-migrate DSH plugin: bring any AI coding tool's session into DSH as a resumable native session.",
+  "type": "module",
+  "main": "lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib",
+    "cordis.patch.yml",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "pnpm run build && node test/smoke.mjs"
+  },
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "session-migrate",
+    "cordis",
+    "cordis-plugin",
+    "deepseek-harness"
+  ],
+  "license": "MIT",
+  "dependencies": {
+    "@session-migrate/core": "workspace:*"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "typescript": "^5.6.0"
+  }
+}

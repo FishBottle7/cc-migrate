@@ -1,0 +1,9 @@
+# session-migrate DSH plugin — bundle patch: insert the plugin row (deployment-global).
+#
+# Registers the /session-migrate slash commands (list-sources / preview / import).
+# All commands are read-old-write-new: they never touch, rewrite or delete
+# existing sessions on either side. Override options via the config object.
+- insert:
+    - id: session-migrate
+      name: '@session-migrate/dsh-plugin'
+      config: {}
