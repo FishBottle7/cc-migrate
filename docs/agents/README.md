@@ -7,7 +7,7 @@
 | DSH | [dsh.md](./dsh.md) | `~/.dsh/sessions/.../session.jsonl.zstd`（zstd 拼接帧） | 单文件 + `foldSurface` | 低（已 round-trip） |
 | Claude Code | [claude.md](./claude.md) | `~/.claude/projects/<encoded-cwd>/<uuid>.jsonl` | 单文件 + `subagents/agent-*.jsonl` | 低 |
 | Codex | [codex.md](./codex.md) | `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl[.zst]` | 单文件（`session_index.jsonl` 仅索引） | 低 |
-| OpenCode | [opencode.md](./opencode.md) | `$XDG_DATA/opencode/opencode.db`（`message`+`part`） | DB 权威（`storage/*.json` 已遗留） | 中（实库读端 8/8 过 + 写端 INSERT 列已对实库 schema 核对；真实写回采样仍待做） |
+| OpenCode | [opencode.md](./opencode.md) | `$XDG_DATA/opencode/opencode.db`（`message`+`part`） | DB 权威（`storage/*.json` 已遗留） | 低（实库读写端 8/8 过；2026-09-02 真实写采样复核完成：`session.path` 语义修正落地，event 流不写登记为已知取舍） |
 | Pi | [pi.md](./pi.md) | `~/.pi/agent/sessions/--<path>--/<ts>_<uuid>.jsonl` | 单文件 JSONL 树 | 低 |
 | Cursor / Windsurf | [cursor-windsurf.md](./cursor-windsurf.md) | 未落盘到本机（占位） | unknown | — |
 

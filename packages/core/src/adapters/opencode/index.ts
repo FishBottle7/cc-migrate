@@ -44,7 +44,7 @@
  */
 
 import { promises as fs } from 'node:fs';
-import { join, dirname } from 'node:path';
+import { join, dirname, relative, isAbsolute } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { existsSync } from 'node:fs';
 import type { Adapter, WriteOptions, WriteResult } from '../../registry.js';
@@ -363,6 +363,50 @@ const OPENCODE_APP_VERSION = '1.18.21';
 
 function fwdSlash(p: string): string {
   return p.replace(/\\/g, '/');
+}
+
+/**
+ * `session.path` is the cwd RELATIVE to the project worktree — NEVER the
+ * absolute directory (that lives in `session.directory`). The app writes it
+ * via `sessionPath(worktree, cwd)` = path.relative(worktree, cwd) with
+ * backslashes normalized to '/' (session.ts:171). cwd == worktree (the
+ * common case: the repo root is the cwd) ⇒ ''. Relative paths only appear
+ * when the cwd is nested inside a larger worktree — real-store samples:
+ * 987/1055 rows are '' (cwd == git worktree), the rest like
+ * 'codes/dshPlugins/cc-migrate' (worktree '/'). Sessions listing by subpath
+ * (`like(path, '<sub>/%')`, session.ts:967) would never match an absolute
+ * path, so writing `directory` here breaks the app's path scoping.
+ */
+function sessionPathColumn(worktree: string, cwd: string): string {
+  if (!isAbsolute(cwd) || !isAbsolute(worktree)) return '';
+  // path.relative drops the drive/root when from is '/' (win32: '/' → the
+  // current drive root), which is exactly how the app's own sessionPath
+  // produces 'codes/dshPlugins/cc-migrate' for worktree '/' on Windows.
+  const rel = relative(worktree, cwd);
+  if (!rel || rel.startsWith('..') || isAbsolute(rel)) return '';
+  return fwdSlash(rel);
+}
+
+/**
+ * The worktree the app would resolve this cwd to (real-store 1.18 shape):
+ * 1. a git repo root found by walking up for `.git` (hash-id projects are
+ *    born from git discovery — their worktree IS the git root; 203/210
+ *    git-project rows have path '' because cwd == that root);
+ * 2. otherwise the 'global' project (worktree '/') — every non-git
+ *    directory attaches there, and sessionPath('/', cwd) drops the drive
+ *    root (win32 path.relative behavior), producing rows like
+ *    'codes/dshPlugins/cc-migrate' (24 real rows sampled).
+ * `session.directory` stays the absolute cwd either way.
+ */
+function resolveWorktree(cwd: string): string {
+  let cur = cwd;
+  for (let i = 0; i < 64 && cur; i++) {
+    if (existsSync(join(cur, '.git'))) return cur;
+    const parent = dirname(cur);
+    if (parent === cur) break;
+    cur = parent;
+  }
+  return '/';
 }
 
 /**
@@ -1098,6 +1142,10 @@ function writeToDb(db: DbHandle, ir: MigratedSession, newId: string, cwd: string
   // convention every production session row uses), else create one.
   ensureGlobalProject(db);
   const projectId = resolveProjectRow(db, dir);
+  // session.path mirrors the app's sessionPath(worktree, cwd) — worktree
+  // relative, '' at the worktree root (real-store sampled shape).
+  const worktree = resolveWorktree(cwd || '/');
+  const pathCol = sessionPathColumn(worktree, cwd || '/');
 
   const modelID = ir.model?.id ?? 'glm-5.3-flash';
   const providerID = ir.model?.provider ?? 'opencode';
@@ -1107,7 +1155,7 @@ function writeToDb(db: DbHandle, ir: MigratedSession, newId: string, cwd: string
     const slug = `migrated-${p.id.replace(/[^a-z0-9]/gi, '').slice(-10).toLowerCase()}`;
     db.prepare(
       'INSERT INTO session (id, project_id, workspace_id, parent_id, slug, directory, path, title, version, share_url, summary_additions, summary_deletions, summary_files, summary_diffs, metadata, cost, tokens_input, tokens_output, tokens_reasoning, tokens_cache_read, tokens_cache_write, revert, permission, agent, model, time_created, time_updated, time_compacting, time_archived) VALUES (?, ?, NULL, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, NULL, NULL, 0, 0, 0, 0, 0, 0, NULL, NULL, ?, NULL, ?, ?, NULL, NULL)',
-    ).run(p.id, projectId, p.parentId ?? null, slug, dir, dir, p.title, OPENCODE_APP_VERSION, p.agent ?? null, p.createdAt, now);
+    ).run(p.id, projectId, p.parentId ?? null, slug, dir, pathCol, p.title, OPENCODE_APP_VERSION, p.agent ?? null, p.createdAt, now);
   };
 
   const freshSessionId = (): string => {

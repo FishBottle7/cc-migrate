@@ -81,4 +81,14 @@ SessionHistory.load(db, sessionID)
 - `listSessions` 只列顶层（`parent_id IS NULL`，孤儿 parent 保留可见）——对齐 TUI 按 parentID 归组的行为
 - compaction：边界 = 唯一 part 为 `{type:'compaction',auto,tail_start_id?}` 的 user 行 + summary assistant（`summary:true,mode:'compaction',agent:'compaction',parentID=边界`）⇄ IR `compaction[]`（summary 文本投影为锚点 user 消息；`meta.opencode.auto` 往返；无 summary 配对的边界只留类型化记录、写端不落行）。`tail_start_id` 读端保留在 meta、写端不重建（msg id 会重生成，写回必成悬空）
 - `cwd` ↔ `session.directory`；`model` ↔ `session.model:{id,providerID,variant?}`；`file` part（mime/filename/url，data URL 图片）⇄ IR `FileBlock`
-- 未确定项（待一次真实写采样锁定）：`data` 列的精确 `Encoded` 去 `id`/`type` 形状、`event_sequence.seq` 与 `session_message.seq` 的一致性细节
+- ~~未确定项（待一次真实写采样锁定）~~ → 已由 2026-09-02 真实库写采样复核关闭，见下节「真实写采样复核（2026-09-02）」
+
+## 真实写采样复核（2026-09-02，只读核查 `~/.local/share/opencode/opencode.db` 实库）
+
+对实库（v1.18.21，1055 session / 44498 message / 185891 part / 282137 event 行）与 opencode 源码（`session.ts`/`project.ts`/`event.ts`）做只读核对，写端结论：
+
+1. **`session.path` 语义修正（唯一实装修复）**：`path` 列是 cwd 对 worktree 的**相对路径**（`session.ts:171 sessionPath(worktree, cwd) = path.relative + 前斜杠归一`），绝不能写成绝对目录（绝对目录在 `session.directory`）。实库形状双形态：git 项目的 cwd==repo 根 → `''`（1.18.21 git 项目 203/210 行）；非 git 目录挂 `global`（worktree `'/'`）→ 去盘符相对余段（如 `codes/dshPlugins/cc-migrate`，24 行）。App 的 `Session.list` 按 `like(path, '<sub>/%')` 做子路径过滤（`session.ts:967`）——写绝对路径会让该过滤永不命中。**适配器修复**：`resolveWorktree`（git 根探测：向上找 `.git`；无 → `'/'`）+ `sessionPathColumn`（`relative(worktree, cwd)`，win32 下 `'/'` 基准自动去盘符，与 app 同为 node path.relative 语义）。旧 v1.1 年代行大量 `path=''` 属「path 列尚不存在、迁移回填空串」的历史遗迹，勿模仿。
+2. **`session_message` / `session_input` / `session_context_epoch` / `todo` 全空**：本机 v1.18 实库正文权威确为 `message`+`part`（4.4 万/18.6 万行），适配器写 message/part 的选择与实库一致；`session_message.data` 的 `Encoded` 形状问题对 v1.18 年代**不存在**（表空，无人消费），新版经 SessionProjector 双写时写端仍走 message/part——读端两年代已覆盖，写端产 v1.18 形状即当前实库原生形状。
+3. **`event` / `event_sequence` 不是写端必需**：`event` 是投影流（`message.part.updated.1` 等 6 类，28 万行），`event_sequence` 每 aggregate 一行 seq 指针（`event/sql.ts`，写入在 `event.ts` append 时 `latest+1` 递增）。`SessionHistory.load` 不读 event 表；TUI 时间线走 `SessionProjector` 直写。适配器不写 event 行 = resume/正文无损；代价仅是 `history/events` API 与外部同步消费方看不到该会话的事件流——登记为已知取舍（原生事件流描述的是「app 自己正在运行」的实时状态，迁移会话没有这个状态可回放）。
+4. **其余写端形状逐列核对通过**（此前已按实库实现，本轮复核确认无漂移）：message/part 的 `time_created/time_updated` 毫秒整数；part 8 类型 `text/reasoning/tool/step-start/step-finish/patch/file/compaction` 的 data 形状；tool part 四态 `completed{status,input,output,metadata,title,time}/error{...,error}/pending{status,input,raw}/running`；`msg_`/`prt_`/`ses_` id 前缀；assistant `parentID` 回指轮首 user；user data `{role,time:{created},agent,model:{providerID,modelID},summary:{diffs:[]}}`。
+5. **`session.model` 形状补充采样**：非 NULL 的 274 行均为 `{"id","providerID","variant"?}` JSON 串（列是 TEXT）；适配器写 NULL 合法（实库 781 行也 NULL，多为 v1.1 年代），写端当前把 `ir.model` 投影进 assistant `modelID/providerID` 字段、`session.model` 写 NULL——维持现状（session.model 是冗余显示列，原生新会话才填）。

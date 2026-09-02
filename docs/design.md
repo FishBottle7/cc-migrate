@@ -210,7 +210,7 @@ D:\codes\dshPlugins\cc-migrate/
 │           ├── dsh/                # DSH（zstd 拼接帧 + surface + _no-cwd）
 │           ├── claude/             # Claude Code（jsonl 链 + sidechains）
 │           ├── codex/              # Codex（rollout + session_index）
-│           ├── opencode/           # OpenCode（db，Phase 2 末，待真实写采样）
+│           ├── opencode/           # OpenCode（db，读写端已按实库 v1.18 形状落地）
 │           └── pi/                 # Pi（JSONL 树，Phase 2）
 │
 ├── packages/cli/                   # CLI（任意 ⇄ 任意，脚本友好）
@@ -286,7 +286,7 @@ DSH 插件 = `core` 的薄消费者。命令示例：
 9. 验收：DSH → Claude 目录 → `claude --resume` 能续；反向同理 ✅
 
 **Phase 2 —— Codex + OpenCode + Pi**
-10. 依据审计把 Codex rollout / OpenCode db / Pi 树格式定死（Codex 已适配 `codex-main` 增量：`ResponseItem`/`FunctionCallOutput`/`SessionMeta`/`rollout_<id>.jsonl.zst`/`本地时间`；OpenCode 待一次真实写采样锁定 `data` 列序列化）— Codex 适配器 ✅，其余进行中
+10. 依据审计把 Codex rollout / OpenCode db / Pi 树格式定死（Codex 已适配 codex-main 增量：ResponseItem/FunctionCallOutput/SessionMeta/rollout zst/本地时间；OpenCode 2026-09-02 真实写采样复核完成——v1.18 实库正文权威 message/part、`session_message` 为空、写端形状逐列核对通过、`session.path` 语义修正；Pi v3.3 重写落地）— 全部 ✅
 11. Codex / OpenCode / Pi 适配器 parse/write（Codex ✅，OpenCode/Pi 待落盘）
 12. CLI 支持全矩阵 `任意 <-> 任意`；`list`/`preview` 齐全（Codex/Claude/DSH 已齐）
 
@@ -302,13 +302,13 @@ DSH 插件 = `core` 的薄消费者。命令示例：
 
 **Phase 5 —— 健壮性**
 19. 工具调用 id 重映射、cwd 迁移、模型映射
-20. 测试矩阵 + 损坏文件容错 + 幂等（不重复导入）+ OpenCode 真实写采样复核
+20. 测试矩阵 + 损坏文件容错 + 幂等（不重复导入）+ ~~OpenCode 真实写采样复核~~（✅ 2026-09-02 完成）
 
 ## 7. 诚实的边界与风险
 
 - **「原生 resume」≠「复现执行副作用」**：迁移后能接着对话往下聊、能重新调工具，但**不会**自动重跑之前的命令/文件改动（除非记录完整 shell trace 并重放，属执行沙箱范畴，超出对话迁移）。
 - **工具版本漂移**：每家格式会随版本变化（Codex 已从纯 JSONL 迁到 `rollout_<id>.jsonl.zst` + `ResponseItem` 增量；DSH 50 种事件类型新增不 bump `version`）。适配器按 `version`/格式特征探测并拒绝不认识的版本而非静默损坏。
-- **OpenCode 的 DB 单一权威**是最大落差（非旧版“双写文件镜像”）：需按 `database.ts:path()` 命中正确库、以 `BEGIN IMMEDIATE` 事务写 `project`+`session`+`session_message`（`seq` 连续、`msg_*` 校验、`FK=ON`），`storage/*.json` 不可作真理；仍需一次真实写采样锁定 `data` 形状。
+- **OpenCode 的 DB 单一权威**：按 `database.ts:path()` 命中正确库。v1.18 实库正文权威是 `message`+`part`（`session_message` 为空），写端按实库形状事务写 `project`+`session`+`message`+`part`；`session.path` 为 worktree 相对路径、git 根为空串（2026-09-02 采样修正）。`storage/*.json` 不可作真理。
 - **Pi 的首 assistant 守卫**：`_persist:1016` 在首个 `assistant` 前不落盘，迁移时需保证至少一条 assistant 否则文件不创建。
 - **不碰真实数据**：默认 dry-run + 输出到临时目录（`--dst-root`），用户确认后才写目标工具原地存储；DSH 写用新 session id，绝不覆盖已有会话。
 
@@ -317,4 +317,4 @@ DSH 插件 = `core` 的薄消费者。命令示例：
 A. `session-formats-audit.md` v2 已扩到 6 工具（含 DELTA vs 旧版）并拆出 `docs/agents/*.md` 一 agent 一档。
 B. 产品矩阵已定：CLI + DSH 插件 + **独立 App（Electron）**三端共用 core；技术栈 = TypeScript/Node(core) + Vue 3(渲染)。
 C. **验证**：`cd packages/core; pnpm run build && node --test --test-isolation=none dist/test/*.test.js`（必须 `--test-isolation=none`，否则 sandbox EPERM）；`pnpm -r --sort build` 会 EPERM，逐包 build；`cli` 用 `node dist/index.js list/preview/migrate --root <tmp>` 验证真实数据，不污染 `~/.dsh`/`~/.claude`/`~/.codex`。
-D. 补 `Pi` 适配器与 `OpenCode` 真实写采样后进入 Phase 3 插件/GUI。
+D. `Pi` 适配器（✅ v3.3 重写）与 `OpenCode` 真实写采样复核（✅ 2026-09-02）均已完成——进入 Phase 3 插件/GUI。

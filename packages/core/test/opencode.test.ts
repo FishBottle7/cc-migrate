@@ -12,6 +12,11 @@ async function tempRoot(): Promise<string> {
   return fs.mkdtemp(join(tmpdir(), 'sm-opencode-test-'));
 }
 
+/** Directory values are stored forward-slashed by the adapter. */
+function fwd(p: string): string {
+  return p.replace(/\\/g, '/');
+}
+
 /** Permissive v1.18-shaped store — only the columns the adapter touches. */
 function createTestDb(dbPath: string): DatabaseSync {
   const db = new DatabaseSync(dbPath);
@@ -297,4 +302,46 @@ test('OpenCode DB listSessions does not flatten subagent children into the top l
   const metas = await adapter.listSessions(root);
   assert.equal(metas.length, 1, 'only the top-level session is listable');
   assert.equal(metas[0].sessionId, res.sessionId);
+});
+
+test('OpenCode DB session.path is worktree-relative, never the absolute directory (real-store shape)', async () => {
+  const adapter = new OpenCodeAdapter();
+
+  // Case 1: cwd is a .git root itself — the app's own dominant shape
+  // (203/210 git-project rows in the sampled 1.18 store): path = ''.
+  const root1 = await tempRoot();
+  const dbPath1 = join(root1, 'opencode.db');
+  createTestDb(dbPath1);
+  await fs.mkdir(join(root1, 'proj', '.git'), { recursive: true });
+  const r1 = await adapter.write(subagentIr(), { root: dbPath1, targetCwd: join(root1, 'proj'), flatten: true });
+  const db1 = new DatabaseSync(dbPath1, { readOnly: true });
+  const row1 = db1.prepare('SELECT path, directory FROM session WHERE id=?').get(r1.sessionId) as { path: string; directory: string };
+  assert.equal(row1.path, '', 'cwd == git worktree root must write the empty string, not the absolute dir');
+  assert.equal(row1.directory, fwd(join(root1, 'proj')), 'directory stays the absolute cwd');
+  db1.close();
+
+  // Case 2: non-git cwd — the app attaches to the 'global' project
+  // (worktree '/'); sessionPath drops the drive root, so the relative
+  // remainder is written (24 real rows sampled: 'codes/dshPlugins/cc-migrate').
+  const root2 = await tempRoot();
+  const dbPath2 = join(root2, 'opencode.db');
+  createTestDb(dbPath2);
+  const r2 = await adapter.write(subagentIr(), { root: dbPath2, targetCwd: '/tmp/proj', flatten: true });
+  const db2 = new DatabaseSync(dbPath2, { readOnly: true });
+  const row2 = db2.prepare('SELECT path, directory FROM session WHERE id=?').get(r2.sessionId) as { path: string; directory: string };
+  assert.equal(row2.path, 'tmp/proj', 'non-git cwd writes the worktree-relative remainder (no absolute path ever)');
+  assert.equal(row2.directory, '/tmp/proj');
+  db2.close();
+
+  // Case 3: cwd nested UNDER a .git root — git discovery makes the repo root
+  // the worktree and path is the remainder below it.
+  const root3 = await tempRoot();
+  const dbPath3 = join(root3, 'opencode.db');
+  createTestDb(dbPath3);
+  await fs.mkdir(join(root3, 'repo', '.git'), { recursive: true });
+  const r3 = await adapter.write(subagentIr(), { root: dbPath3, targetCwd: join(root3, 'repo', 'sub'), flatten: true });
+  const db3 = new DatabaseSync(dbPath3, { readOnly: true });
+  const row3 = db3.prepare('SELECT path, directory FROM session WHERE id=?').get(r3.sessionId) as { path: string; directory: string };
+  assert.equal(row3.path, 'sub', 'cwd nested under a .git root writes the repo-relative subpath');
+  db3.close();
 });
