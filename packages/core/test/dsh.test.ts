@@ -1121,9 +1121,10 @@ test('zero-projection surface rows land in unmappedEvents and survive the round-
 });
 
 /* ------------------------------------------------------------------ */
-/* P1-C 回归：teammate 侧链显式丢弃——写不炸、警告可见、产物无残留        */
+/* teammate 侧链承载（方案 B，2026-09-03）：独立子会话承载内容、不发      */
+/* team/* 事件、kind 经 agentPreset 前缀往返保真                        */
 /* ------------------------------------------------------------------ */
-test('teammate sidechains: explicit drop with a visible warning, no teammate content in the artifacts', async () => {
+test('teammate sidechains: written as standalone child sessions (parentSession link, no team/* events, one-time info)', async () => {
   const adapter = new DshAdapter();
   const root = await tempRoot();
   const ir = {
@@ -1135,6 +1136,7 @@ test('teammate sidechains: explicit drop with a visible warning, no teammate con
       {
         agentId: 'tm-1',
         kind: 'teammate' as const,
+        agentType: 'D2-queue-head-fix',
         messages: [{ role: 'user' as const, timestamp: 1001, content: [{ type: 'text' as const, text: 'TEAMMATE SECRET PAYLOAD' }] }],
       },
       {
@@ -1144,33 +1146,105 @@ test('teammate sidechains: explicit drop with a visible warning, no teammate con
       },
     ],
   };
-  // 警告路径可触发：console.warn 必须为 teammate 丢弃发出一条可见警告
+  // 一次性说明（info 级 console.log，非警告——承载可见性契约）：数量 + 独立子
+  // 会话形态 + team/* 不发的理由必须出现；不得再出现任何「dropped」措辞。
+  const logs: string[] = [];
   const warnings: string[] = [];
+  const origLog = console.log;
   const origWarn = console.warn;
+  console.log = (...args: unknown[]) => { logs.push(args.map(String).join(' ')); };
   console.warn = (...args: unknown[]) => { warnings.push(args.map(String).join(' ')); };
   let res: { sessionId: string; paths: string[] };
   try {
-    res = await adapter.write(ir as never, { root, sessionId: 'tm-drop', targetCwd: 'D:\\proj' });
+    res = await adapter.write(ir as never, { root, sessionId: 'tm-carry', targetCwd: 'D:\\proj' });
   } finally {
+    console.log = origLog;
     console.warn = origWarn;
   }
-  const dropped = warnings.find((w) => w.includes('teammate sidechain'));
-  assert.ok(dropped, `a visible warning is emitted for dropped teammate sidechains: ${JSON.stringify(warnings)}`);
-  assert.ok(dropped!.includes('1 teammate sidechain'), 'warning carries the drop count');
-  assert.ok(dropped!.includes('docs/agents/dsh.md'), 'warning points at the documented rationale');
+  const info = logs.find((l) => l.includes('teammate sidechain'));
+  assert.ok(info, `a one-time info line announces the teammate carry-over: ${JSON.stringify(logs)}`);
+  assert.ok(info!.includes('1 teammate sidechain'), 'info carries the count');
+  assert.ok(info!.includes('standalone child sessions'), 'info names the carry-over shape');
+  assert.ok(info!.includes('docs/agents/dsh.md'), 'info points at the documented rationale');
+  assert.equal(logs.filter((l) => l.includes('teammate sidechain')).length, 1, 'exactly one announcement line');
+  assert.equal(warnings.length, 0, 'no warning anymore — carrying, not dropping');
 
-  // 不炸：写入成功；subagent 子会话照常写出，teammate 不落任何产物
-  assert.equal(res.paths.length, 2, 'main + subagent child only (teammate dropped)');
-  for (const p of res.paths) {
-    const plain = decompressSessionBuffer(await fs.readFile(p));
-    assert.ok(!plain.includes('TEAMMATE SECRET PAYLOAD'), `no teammate content leaks into artifact ${p}`);
-  }
+  // 主 + subagent 子会话 + teammate 子会话：三条产物，teammate 内容完整落盘
+  assert.equal(res.paths.length, 3, 'main + subagent child + teammate child');
   const projDir = join(root, '--D-proj--');
   const dirs = await fs.readdir(projDir);
-  assert.equal(dirs.length, 2, 'exactly main + subagent dirs (no teammate dir)');
-  // teammate 与 subagent 的语义边界锁死：subagent 内容存活
-  const back = await adapter.parse('tm-drop', root);
-  assert.equal(back.sidechains?.length, 1);
-  assert.equal(back.sidechains![0].kind, 'subagent');
-  assert.equal((back.sidechains![0].messages[0].content[0] as { text: string }).text, 'subagent content');
+  assert.equal(dirs.length, 3, 'exactly main + subagent + teammate dirs');
+  // teammate 内容绝不蒸发：独特文本必须命中其中一份产物
+  const teammateDir = dirs.find((d) => d !== 'tm-carry' && d !== 'sub-1');
+  assert.ok(teammateDir, 'teammate child dir exists');
+  const plain = decompressSessionBuffer(await fs.readFile(join(projDir, teammateDir, 'session.jsonl.zstd')));
+  assert.ok(plain.includes('TEAMMATE SECRET PAYLOAD'), 'teammate content fully carried in its child log');
+  const header = JSON.parse(plain.split('\n')[0]);
+  assert.equal(header.id, 'tm-1');
+  assert.equal(header.parentSession, 'tm-carry', 'teammate child links to the main session');
+  assert.equal(header.agentPreset, 'teammate/D2-queue-head-fix', 'teammate marker rides the native agentPreset slot');
+  assert.ok(plain.includes('(migrated teammate)'), 'title prefix visible in the child log');
+  // 不冒充纪律锁死：任何产物里不得出现 team/* 事件行（payload 契约不存在）
+  for (const p of res.paths) {
+    const rows = decompressSessionBuffer(await fs.readFile(p)).split('\n').filter((l) => l.trim()).slice(1).map((l) => JSON.parse(l)) as DshEventLike[];
+    const teamRows = rows.filter((r) => r.type.startsWith('team/'));
+    assert.equal(teamRows.length, 0, `no fabricated team/* events in ${p}`);
+  }
+  // teammate 子会话同样要过 DSH 物理契约（可加载性）
+  const verdict = verifySessionLog(plain, 'tm-1', join(projDir, teammateDir, 'session.jsonl.zstd'));
+  assert.ok(verdict.ok, `teammate child log passes verifySessionLog: ${JSON.stringify(verdict.issues ?? []).slice(0, 300)}`);
+
+  // 读回：sidechains 还原，两种 kind 各归各位（往返保真）
+  const back = await adapter.parse('tm-carry', root);
+  assert.equal(back.sidechains?.length, 2);
+  const backTm = back.sidechains!.find((s) => s.agentId === 'tm-1');
+  const backSub = back.sidechains!.find((s) => s.agentId === 'sub-1');
+  assert.ok(backTm, 'teammate sidechain restored');
+  assert.ok(backSub, 'subagent sidechain restored');
+  assert.equal(backTm!.kind, 'teammate', 'kind survives the write->parse round-trip');
+  assert.equal(backTm!.agentType, 'D2-queue-head-fix', 'agentType un-prefixed from the marker');
+  assert.equal((backTm!.messages[0].content[0] as { text: string }).text, 'TEAMMATE SECRET PAYLOAD');
+  assert.equal(backSub!.kind, 'subagent', 'subagent kind untouched (zero regression)');
+  assert.equal((backSub!.messages[0].content[0] as { text: string }).text, 'subagent content');
+});
+
+test('teammate sidechain round-trip: kind + agentType survive a second full write->parse cycle', async () => {
+  // 二次往返：解析产物再写出（dsh 写端消费 headerRaw 的路径），kind 与
+  // agentType 必须仍然保真——agentPreset 前缀标识在 headerRaw 透传与
+  // 前缀覆盖两道工序下都不能丢。
+  const adapter = new DshAdapter();
+  const root = await tempRoot();
+  const ir = {
+    schemaVersion: 2 as const,
+    originTool: 'claude' as const,
+    createdAt: 1000,
+    messages: [{ role: 'user' as const, timestamp: 1000, content: [{ type: 'text' as const, text: 'main thread' }] }],
+    sidechains: [
+      {
+        agentId: 'tm-round',
+        kind: 'teammate' as const,
+        messages: [{ role: 'user' as const, timestamp: 1001, content: [{ type: 'text' as const, text: 'teammate roundtrip body' }] }],
+      },
+    ],
+  };
+  const res1 = await adapter.write(ir as never, { root, sessionId: 'tm-rt-1', targetCwd: 'D:\\proj' });
+  const back1 = await adapter.parse('tm-rt-1', root);
+  assert.equal(back1.sidechains![0].kind, 'teammate');
+  assert.equal(back1.sidechains![0].agentType, 'teammate', 'no agentType -> marker falls back to the bare teammate identity');
+  // second write: the parse product carries meta.dsh.headerRaw (with the
+  // teammate/<…> agentPreset); the write side must force the marker again.
+  // 注意：第一轮写出的 tm-round 子会话占住了同名席位，第二轮按「绝不覆盖」
+  // 纪律给子会话换新 id（与 nested subagent tree 测试同款行为）——
+  // agentId 不承诺保真，kind/agentType/内容才是本轮断言对象。
+  const res2 = await adapter.write(back1, { root, sessionId: 'tm-rt-2', targetCwd: 'D:\\proj' });
+  const back2 = await adapter.parse('tm-rt-2', root);
+  assert.equal(back2.sidechains!.length, 1);
+  const sc2 = back2.sidechains![0];
+  assert.equal(sc2.kind, 'teammate', 'kind survives the second cycle');
+  assert.equal(sc2.agentType, 'teammate', 'agentType survives the second cycle (marker forced over headerRaw)');
+  assert.ok(res2.paths.length >= 2, 'main + teammate child rewritten');
+  assert.ok(
+    (sc2.messages[0].content[0] as { text: string }).text === 'teammate roundtrip body',
+    'content survives the second cycle',
+  );
 });

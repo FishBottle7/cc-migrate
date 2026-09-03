@@ -1061,6 +1061,21 @@ function stringOutput(v: unknown): string {
 /* Sidechains (subagent children)                                      */
 /* ------------------------------------------------------------------ */
 
+/**
+ * 读端下钻上限：真实代理树 2–3 层；损坏/手工数据里的 parent_id 深链或环
+ * 会让「每层一次 DB 查询」变成查询炸弹，16 层已远超任何真实嵌套深度。
+ */
+const SIDECHAIN_MAX_DEPTH = 16;
+
+/**
+ * Top entry: builds the sidechain tree one level per DB query. The accumulators
+ * (agentLinks / otherChildren / sidecarPrompts) are flat across the whole walk —
+ * callIds and sidecar keys are globally unique, so level attribution is not
+ * needed and the write side's link matcher can find nested entries verbatim.
+ * 往返对称性（上轮审查 P0-3 附带说明）：孙代 session 行（parent_id=子代 id）
+ * 以前读不回来——写端递归落库了孙代但读端只查顶层一层。现在每层 sidechain
+ * 递归下钻，子代的 sidechains[] 里挂孙代，主 IR 重新反映完整委托树。
+ */
 async function buildSidechains(
   db: DbHandle,
   parentSessionId: string,
@@ -1071,24 +1086,52 @@ async function buildSidechains(
   otherChildren: Array<{ id: string; taskType: string; title: string | null }>;
   sidecarPrompts: Record<string, unknown>;
 }> {
+  const acc = {
+    agentLinks: {} as Record<string, { childSessionId: string; agentId: string }>,
+    otherChildren: [] as Array<{ id: string; taskType: string; title: string | null }>,
+    sidecarPrompts: {} as Record<string, unknown>,
+  };
+  // 防环：parent_id 成环（A→B→A）时，环上节点只在其第一次出现的位置展开；
+  // visited 含顶层 sessionId 本身——孙代链绕回主会话属于损坏数据，重嵌一份
+  // 主 transcript 只会制造重复内容。
+  const visited = new Set<string>([parentSessionId]);
+  const sidechains = await buildSidechainLevel(db, parentSessionId, ctx, 0, visited, acc);
+  return { sidechains, agentLinks: acc.agentLinks, otherChildren: acc.otherChildren, sidecarPrompts: acc.sidecarPrompts };
+}
+
+/** One nesting level: children of parentSessionId → sidechains (+ their own levels). */
+async function buildSidechainLevel(
+  db: DbHandle,
+  parentSessionId: string,
+  ctx: ExpandCtx,
+  depth: number,
+  visited: Set<string>,
+  acc: {
+    agentLinks: Record<string, { childSessionId: string; agentId: string }>;
+    otherChildren: Array<{ id: string; taskType: string; title: string | null }>;
+    sidecarPrompts: Record<string, unknown>;
+  },
+): Promise<MigratedSidechain[]> {
+  if (depth >= SIDECHAIN_MAX_DEPTH) return [];
   const childRows = db.prepare(
     'SELECT id, task_type, title FROM session WHERE parent_id=? ORDER BY time_created',
   ).all(parentSessionId) as Row[];
 
   const sidechains: MigratedSidechain[] = [];
-  const agentLinks: Record<string, { childSessionId: string; agentId: string }> = {};
-  const otherChildren: Array<{ id: string; taskType: string; title: string | null }> = [];
-  const sidecars = await loadSidecars(ctx.agentsRoot, parentSessionId);
-  const sidecarPrompts: Record<string, unknown> = {};
   const usedCallIds = new Set<string>();
+  // sidecars 按父会话分目录（agents/<parentSessionId>/agent_*/），本层所有
+  // 子项共用一次目录读取；嵌套层递归时 parentSessionId 即子代 id，天然取
+  // 到该层自己的 sidecar，且目录读取不跨层复用（每层各有各的父目录）。
+  const sidecars = await loadSidecars(ctx.agentsRoot, parentSessionId);
 
   for (const row of childRows) {
     const childId = String(row.id ?? '');
     const taskType = String(row.task_type ?? '');
     if (taskType !== 'subagent_child') {
       // selection_side_chat / workflow_* are parent-linked too but out of the
-      // subagent sidechain contract — recorded for losslessness only.
-      otherChildren.push({ id: childId, taskType, title: row.title ? String(row.title) : null });
+      // subagent sidechain contract — recorded for losslessness only (flat
+      // bucket, entries carry their own id so attribution survives).
+      acc.otherChildren.push({ id: childId, taskType, title: row.title ? String(row.title) : null });
       continue;
     }
     const childMessages = loadMessagesOrdered(db, childId);
@@ -1120,12 +1163,11 @@ async function buildSidechains(
     }
     if (!irMessages.length && !childSynthetics.length) continue;
 
-    // sidecar supplement: agentId / parentToolUseId / systemPrompt / usage
     const scUuid = childId.startsWith('sess_subagent_agent_') ? childId.slice('sess_subagent_agent_'.length) : childId;
     const sidecar = sidecars.get(`agent_${scUuid}`);
     if (!agentType && sidecar?.profileSnapshot?.name) agentType = agentTypeOf(sidecar.profileSnapshot.name);
     if (sidecar) {
-      sidecarPrompts[`agent_${scUuid}`] = {
+      acc.sidecarPrompts[`agent_${scUuid}`] = {
         ...(sidecar.profileSnapshot?.systemPrompt ? { systemPrompt: sidecar.profileSnapshot.systemPrompt } : {}),
         ...(sidecar.profileId ? { profileId: sidecar.profileId } : {}),
         ...(sidecar.status ? { status: sidecar.status } : {}),
@@ -1135,6 +1177,8 @@ async function buildSidechains(
     }
 
     // parent Agent tool part match: sidecar parentToolUseId, else prompt equality
+    // （parentSessionId 已是该层的父会话——嵌套层的 prompt 匹配在子代会话内
+    // 进行，不会错配到顶层消息）
     let parentCallId = sidecar?.parentToolUseId ? String(sidecar.parentToolUseId) : undefined;
     if (parentCallId && !callIdExistsInSession(db, parentSessionId, parentCallId)) parentCallId = undefined;
     if (!parentCallId) {
@@ -1144,8 +1188,12 @@ async function buildSidechains(
     }
     if (parentCallId) {
       usedCallIds.add(parentCallId);
-      agentLinks[parentCallId] = { childSessionId: childId, agentId: sidecar?.agentId ? String(sidecar.agentId) : `agent_${scUuid}` };
+      acc.agentLinks[parentCallId] = { childSessionId: childId, agentId: sidecar?.agentId ? String(sidecar.agentId) : `agent_${scUuid}` };
     }
+
+    // 递归下钻：孙代挂在本 sidechain 的 sidechains[]（往返对称）。visited
+    // 挡环，深度上限挡查询炸弹；环上/超深的分支在此截断。
+    const nested = visited.has(childId) ? [] : (visited.add(childId), await buildSidechainLevel(db, childId, ctx, depth + 1, visited, acc));
 
     sidechains.push({
       agentId: childId,
@@ -1155,20 +1203,22 @@ async function buildSidechains(
       messages: irMessages,
       ...(childToolCalls.length ? { toolCalls: childToolCalls } : {}),
       ...(childSynthetics.length ? { meta: { 'zcode.syntheticMessages': childSynthetics } } : {}),
+      ...(nested.length ? { sidechains: nested } : {}),
     });
   }
 
   // sidecar entries whose child session row is gone — still record link info
+  // （per level：sidecar 目录按父会话隔离，本层 orphan 链接不会与他层混淆）
   for (const [key, meta] of sidecars) {
     if (meta.parentToolUseId && !usedCallIds.has(meta.parentToolUseId)) {
-      agentLinks[meta.parentToolUseId] = {
+      acc.agentLinks[meta.parentToolUseId] = {
         childSessionId: meta.childSessionId ?? `sess_subagent_${key}`,
         agentId: meta.agentId ?? key,
       };
     }
   }
 
-  return { sidechains, agentLinks, otherChildren, sidecarPrompts };
+  return sidechains;
 }
 
 /** Load sidecar metadata.json files for one parent session (best-effort). */
@@ -1347,19 +1397,27 @@ function writeToDb(db: DbHandle, ir: MigratedSession, newId: string, cwd: string
   // Agent calls always get a FRESH call id: the engine indexes subagent
   // sidecars/ledgers by parentToolUseId globally, so a preserved original
   // callID would re-link the migrated part to the SOURCE child session.
-  const queue = [...(ir.sidechains ?? [])];
+  // slot 机制按层递归：这里只扫根层（ir.messages × ir.sidechains）；
+  // writeSessionTree 写每个子会话前用同一函数再扫「该子会话自己的
+  // messages × 它自己的 sc.sidechains」，使嵌套层的 Agent tool part 也拿到
+  // metadata.agentId 回链——孙代不再是断链内容在。
   const slotBySidechain = new Map<MigratedSidechain, { toolUseId: string; childId: string; agentUuid: string }>();
-  for (const msg of ir.messages) {
-    for (const b of msg.content) {
-      if (b.type !== 'tool_use' || !isSubagentToolName(b.name)) continue;
-      const callId = remapCallId(ctx, b.id);
-      const slot = pickSidechainForCall(ctx, b, queue);
-      if (slot) {
-        ctx.subagentSlots.push({ toolUseId: callId, childId: slot.childId, agentUuid: slot.agentUuid, sidechain: slot.sidechain });
-        slotBySidechain.set(slot.sidechain, { toolUseId: callId, childId: slot.childId, agentUuid: slot.agentUuid });
+  const scanAgentSlots = (messages: MigratedMessage[], sidechains: MigratedSidechain[]): void => {
+    // 消费性队列只动副本（pickSidechainForCall 会 splice 认领项），不修改 IR 本体
+    const queue = [...sidechains];
+    for (const msg of messages) {
+      for (const b of msg.content) {
+        if (b.type !== 'tool_use' || !isSubagentToolName(b.name)) continue;
+        const callId = remapCallId(ctx, b.id);
+        const slot = pickSidechainForCall(ctx, b, queue);
+        if (slot) {
+          ctx.subagentSlots.push({ toolUseId: callId, childId: slot.childId, agentUuid: slot.agentUuid, sidechain: slot.sidechain });
+          slotBySidechain.set(slot.sidechain, { toolUseId: callId, childId: slot.childId, agentUuid: slot.agentUuid });
+        }
       }
     }
-  }
+  };
+  scanAgentSlots(ir.messages, ir.sidechains ?? []);
 
   const createdAt = ir.createdAt && ir.createdAt > 0 ? ir.createdAt : now;
   const paths: string[] = [];
@@ -1393,11 +1451,20 @@ function writeToDb(db: DbHandle, ir: MigratedSession, newId: string, cwd: string
   // claimed is STILL written as a child session (a transcript must never be
   // silently dropped); nested sc.sidechains recurse with the child's id as
   // their parent — each level drains its own leftovers (matcher.drain idea).
-  const writeSidechainTree = (sidechains: MigratedSidechain[], parentRowId: string): void => {
+  // 顺序（先身份后 slot）：每层先 derive 该层每个 sidechain 的子代身份 →
+  // 扫「该层 sidechain 自己的 messages × 它自己的 sc.sidechains 队列」登
+  // 记孙代 slot → 写该层消息（writeMessages 里 tool part 从
+  // ctx.subagentSlots 查 metadata.agentId 并改写 launch-ack footer）→ 递
+  // 归下一层。slot 的 childId/agentUuid 必须是本层递归将生成的孙代会话
+  // 行的 id（deriveChildIdentity/冲突重试的产物），而 slot 查表发生在
+  // writeMessages 落库时——所以顺序只能是「先 derive 身份、再登记 slot、
+  // 后写消息」，颠倒任一环都会让 tool part 指向不存在的会话或空指针。
+  const writeSessionTree = (sidechains: MigratedSidechain[], parentRowId: string): void => {
     for (const sc of sidechains) {
       // drain fallback: only sidechains whose parent level never received a
       // slot mapping get a synthetic child identity here — claimed ones reuse
-      // the identity bound in pass 2 (same agent uuid in tool part + session).
+      // the identity bound in pass 2 / the parent level's scan (same agent
+      // uuid in tool part + session).
       const claimed = slotBySidechain.get(sc);
       let childId: string;
       if (claimed) {
@@ -1411,6 +1478,12 @@ function writeToDb(db: DbHandle, ir: MigratedSession, newId: string, cwd: string
         childId = identity.childId;
       }
       ctx.usedChildIds.add(childId);
+      // 嵌套层 slot 回链：孙代由该层 messages 里的 Agent tool_use 产生——
+      // 身份此刻已定（上方 childId 刚 derive/认领完），扫这一层并登记
+      // slot。子层的 tool part 写库时（下方 writeMessages）从
+      // ctx.subagentSlots 查 metadata.agentId，孙代行 id 由下方递归的
+      // claimed 分支复用——同一 identity 贯穿三层，指针不断链。
+      scanAgentSlots(sc.messages, sc.sidechains ?? []);
       const childAgent = sc.agentType ? `zcode-${sc.agentType}` : 'zcode-agent';
       insertSessionRow(db, {
         id: childId,
@@ -1425,10 +1498,10 @@ function writeToDb(db: DbHandle, ir: MigratedSession, newId: string, cwd: string
       });
       paths.push(`session:${childId}`);
       writeMessages(db, sc.messages, childId, ctx, createdAt, childAgent, sc.toolCalls, keepSynthetic);
-      writeSidechainTree(sc.sidechains ?? [], childId);
+      writeSessionTree(sc.sidechains ?? [], childId);
     }
   };
-  writeSidechainTree(ir.sidechains ?? [], newId);
+  writeSessionTree(ir.sidechains ?? [], newId);
   return paths;
 }
 

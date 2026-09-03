@@ -571,3 +571,120 @@ test('P1-D: 越界 anchorIndex 显式警告，boundary 不静默落盘', () => {
     console.warn = origWarn;
   }
 });
+
+/* ------------------------------------------------------------------
+ * preserved 段有限 rekey（P0-B 升级）
+ * ------------------------------------------------------------------ */
+
+// 构造 claude 源投影形态的 IR：消息 meta.claude 携带源行 uuid（parse.ts
+// envelopeMeta 登记），compaction.preservedMessages.uuids 引用同一批源 uuid。
+function claudeSourcedIr(preservedUuids: string[]): MigratedSession {
+  const SUMMARY = 'This session is being continued from a previous conversation… 摘要';
+  const mk = (role: 'user' | 'assistant', text: string, srcUuid: string): {
+    role: 'user' | 'assistant';
+    content: ContentBlock[];
+    meta: { claude: { uuid: string } };
+  } => ({ role, content: [{ type: 'text', text }], meta: { claude: { uuid: srcUuid } } });
+  return {
+    schemaVersion: 2,
+    originTool: 'claude',
+    cwd: 'D:\\proj',
+    messages: [
+      mk('user', '旧问题1', 'src-u1'),
+      mk('assistant', '旧回复1', 'src-a1'),
+      mk('user', '旧问题2', 'src-u2'),
+      mk('assistant', '旧回复2', 'src-a2'),
+      { role: 'user', content: [{ type: 'text', text: SUMMARY }] },
+      mk('user', 'after compact', 'src-u3'),
+      mk('assistant', 'post-compact reply', 'src-a3'),
+    ],
+    compaction: [
+      {
+        summary: SUMMARY,
+        anchorIndex: 4,
+        meta: {
+          claude: {
+            compactMetadata: {
+              trigger: 'manual',
+              preTokens: 1000,
+              preservedMessages: { anchorUuid: 'src-boundary', uuids: preservedUuids },
+            },
+          },
+        },
+      },
+    ],
+  };
+}
+
+function findBoundary(records: Record<string, unknown>[]): Record<string, unknown> | undefined {
+  return records.find((r) => r.subtype === 'compact_boundary');
+}
+
+test('P0-B rekey 全命中: preserved 引用真实源 uuid → 换新后落盘，re-parse 折叠语义恢复', async () => {
+  const root = await tempRoot();
+  const ir = claudeSourcedIr(['src-u1', 'src-a1', 'src-u2', 'src-a2']);
+  const adapter = new ClaudeAdapter();
+  const res = await adapter.write(ir, { root, targetCwd: 'D:\\proj' });
+  const rows = await rowsOf(res.paths[0]);
+  const boundary = findBoundary(rows) as
+    | { uuid?: string; compactMetadata?: { preservedMessages?: { anchorUuid?: string; uuids?: string[] } } }
+    | undefined;
+  assert.ok(boundary, 'boundary 落盘');
+  const pm = boundary!.compactMetadata?.preservedMessages;
+  assert.ok(pm, '全命中：preservedMessages 字段存活（不再整删）');
+  assert.equal(pm!.uuids!.length, 4, '四个引用全部保留');
+  // 全部换新：文件里能找到每个新 uuid，且不再有 src- 旧引用
+  const uuidsInFile = new Set(rows.map((r) => String(r.uuid)).filter(Boolean));
+  for (const u of pm!.uuids!) {
+    assert.ok(uuidsInFile.has(u), `rekey 后的新 uuid 在文件中存在: ${u}`);
+    assert.ok(!u.startsWith('src-'), '旧 uuid 不落盘');
+  }
+  // anchorUuid 指向本 boundary 自身的新 uuid
+  assert.equal(pm!.anchorUuid, boundary!.uuid);
+
+  // re-parse：读端 applyPreservedSegmentRelinks 按 preservedMessages 收集保留段
+  // + 剪掉最后 boundary 前的其余行 → 折叠语义（保留 4 条 + 摘要 + 2 条新对话）
+  const back = await adapter.parse(res.sessionId, root);
+  assert.ok(back.messages.some((m) => m.content.some((b) => (b as { text?: string }).text === '旧问题1')), '保留段消息1 在 re-parse 后存活');
+  assert.ok(back.messages.some((m) => m.content.some((b) => (b as { text?: string }).text === '旧回复2')), '保留段消息4 在 re-parse 后存活');
+  assert.ok(back.messages.some((m) => m.content.some((b) => (b as { text?: string }).text === 'after compact')), 'boundary 后消息存活');
+  assert.ok(!back.messages.some((m) => m.content.some((b) => (b as { text?: string }).text === '不存在的消息')), 'sanity');
+  assert.equal(back.compaction?.length, 1, 'compaction 桶登记');
+});
+
+test('P0-B rekey 零命中: 引用不存在的旧 uuid → 字段删除（既有行为保持）', async () => {
+  const root = await tempRoot();
+  const ir = claudeSourcedIr(['ghost-1', 'ghost-2']);
+  const adapter = new ClaudeAdapter();
+  const res = await adapter.write(ir, { root, targetCwd: 'D:\\proj' });
+  const boundary = findBoundary(await rowsOf(res.paths[0])) as
+    | { compactMetadata?: { preservedMessages?: unknown; trigger?: string; preTokens?: number } }
+    | undefined;
+  assert.ok(boundary, 'boundary 落盘');
+  assert.equal(boundary!.compactMetadata?.preservedMessages, undefined, '零命中：字段删除');
+  assert.equal(boundary!.compactMetadata?.trigger, 'manual', '其余 compactMetadata 保留');
+  assert.equal(boundary!.compactMetadata?.preTokens, 1000);
+  // re-parse 不缩水（无 preserved → no-op + 全史加载）
+  const back = await adapter.parse(res.sessionId, root);
+  assert.ok(back.messages.length >= 3, 're-parse 消息不缩水');
+});
+
+test('P0-B rekey 部分命中: 只保留命中项（数组过滤），未命中项不悬挂', async () => {
+  const root = await tempRoot();
+  const ir = claudeSourcedIr(['src-u1', 'ghost-2', 'src-a2']);
+  const adapter = new ClaudeAdapter();
+  const res = await adapter.write(ir, { root, targetCwd: 'D:\\proj' });
+  const rows = await rowsOf(res.paths[0]);
+  const boundary = findBoundary(rows) as
+    | { uuid?: string; compactMetadata?: { preservedMessages?: { anchorUuid?: string; uuids?: string[] } } }
+    | undefined;
+  assert.ok(boundary, 'boundary 落盘');
+  const pm = boundary!.compactMetadata?.preservedMessages;
+  assert.ok(pm, '部分命中：字段存活');
+  assert.equal(pm!.uuids!.length, 2, '只保留两个命中项');
+  const uuidsInFile = new Set(rows.map((r) => String(r.uuid)).filter(Boolean));
+  for (const u of pm!.uuids!) {
+    assert.ok(uuidsInFile.has(u), `保留项的新 uuid 在文件中存在: ${u}`);
+  }
+  assert.equal(pm!.anchorUuid, boundary!.uuid);
+});

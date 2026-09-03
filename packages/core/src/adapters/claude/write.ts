@@ -57,6 +57,10 @@ interface ChainState {
   /** original source-row uuids materialized by the projection — their
    *  recordsRaw ride-through copies are skipped (represented, not lost) */
   emittedUuids: Set<string>;
+  /** 源行 uuid → 投影落盘的新行 uuid（有限 rekey 表）：compactMetadata 的
+   *  preserved 引用必须指向本文件实际存在的行，否则读端剪枝按悬挂 uuid 判
+   *  broken → no-op，折叠语义静默丢失 */
+  uuidRekey: Map<string, string>;
 }
 
 function iso(ms: number): string {
@@ -195,9 +199,13 @@ function emitMessage(ctx: EmitCtx, msg: MigratedMessage, opts: { compactSummary?
     ? iso(msg.timestamp)
     : iso(ctx.at());
   const meta = (msg.meta?.claude ?? {}) as Record<string, unknown>;
-  /** original source-row uuid — records its ride-through copy as represented */
-  const trackEmitted = (): void => {
-    if (typeof meta.uuid === 'string' && meta.uuid) state.emittedUuids.add(meta.uuid);
+  /** original source-row uuid — records its ride-through copy as represented;
+   *  同时登记 srcUuid → 新行 uuid 的 rekey 映射（boundary preserved 引用换新） */
+  const trackEmitted = (newUuid: string): void => {
+    if (typeof meta.uuid === 'string' && meta.uuid) {
+      state.emittedUuids.add(meta.uuid);
+      state.uuidRekey.set(meta.uuid, newUuid);
+    }
   };
   const native = (meta.message ?? undefined) as Record<string, unknown> | undefined;
   const env = envelopeFromMeta(meta);
@@ -270,7 +278,7 @@ function emitMessage(ctx: EmitCtx, msg: MigratedMessage, opts: { compactSummary?
     stripUndefined(record);
     state.records.push(record);
     state.parentUuid = uuid;
-    trackEmitted();
+    trackEmitted(uuid);
     for (const b of msg.content) {
       if (b.type === 'tool_use') state.toolUseOwner.set(b.id, uuid);
     }
@@ -307,7 +315,7 @@ function emitMessage(ctx: EmitCtx, msg: MigratedMessage, opts: { compactSummary?
     stripUndefined(record);
     state.records.push(record);
     state.parentUuid = uuid;
-    trackEmitted();
+    trackEmitted(uuid);
     return;
   }
   if (meta.systemSubtype === 'local_command') {
@@ -341,7 +349,7 @@ function emitMessage(ctx: EmitCtx, msg: MigratedMessage, opts: { compactSummary?
     stripUndefined(record);
     state.records.push(record);
     state.parentUuid = uuid;
-    trackEmitted();
+    trackEmitted(uuid);
     return;
   }
 
@@ -377,7 +385,7 @@ function emitMessage(ctx: EmitCtx, msg: MigratedMessage, opts: { compactSummary?
     stripUndefined(record);
     state.records.push(record);
     state.parentUuid = uuid;
-    trackEmitted();
+    trackEmitted(uuid);
     return;
   }
 
@@ -422,7 +430,7 @@ function emitMessage(ctx: EmitCtx, msg: MigratedMessage, opts: { compactSummary?
     stripUndefined(record);
     state.records.push(record);
     state.parentUuid = uuid;
-    trackEmitted();
+    trackEmitted(uuid);
   }
 
   // 2) each tool_result → its own user record, parentUuid overridden to the
@@ -462,7 +470,7 @@ function emitMessage(ctx: EmitCtx, msg: MigratedMessage, opts: { compactSummary?
     state.records.push(record);
     // tool_result 不改变后续消息的链挂点语义：下一条消息按文件序接到它之后
     state.parentUuid = uuid;
-    trackEmitted();
+    trackEmitted(uuid);
   }
   void trPos;
 }
@@ -508,7 +516,7 @@ export function buildMainRecords(
   };
   let clock = opts.nowMs ?? Date.now();
   const at = (): number => (clock += 1);
-  const ctx: EmitCtx = { stamp: st, state: { records: [], parentUuid: null, toolUseOwner: new Map(), emittedUuids: new Set() }, isSidechain: false, at };
+  const ctx: EmitCtx = { stamp: st, state: { records: [], parentUuid: null, toolUseOwner: new Map(), emittedUuids: new Set(), uuidRekey: new Map() }, isSidechain: false, at };
 
   // ---- header rows (materializeSessionFile 实测头序: ai-title/agent-name/mode/…) ----
   const header: Record<string, unknown>[] = [];
@@ -711,7 +719,7 @@ export function buildSidechainRecords(
   let clock = opts.nowMs ?? Date.now();
   const ctx: EmitCtx = {
     stamp: st,
-    state: { records: [], parentUuid: null, toolUseOwner: new Map(), emittedUuids: new Set() },
+    state: { records: [], parentUuid: null, toolUseOwner: new Map(), emittedUuids: new Set(), uuidRekey: new Map() },
     isSidechain: true,
     at: () => (clock += 1),
     agentId: sc.agentId,
@@ -765,30 +773,60 @@ function emitCompactionPair(ctx: EmitCtx, c: MigratedCompaction): void {
   if (typeof claudeMeta.summaryUuid === 'string' && claudeMeta.summaryUuid) {
     ctx.state.emittedUuids.add(claudeMeta.summaryUuid);
   }
-  // P0-B: 跨工具新 uuid 体系下，preservedSegment/preservedMessages 引用的
-  // 旧 uuid 不在本文件内——claude 读端剪枝算法按这些 uuid 收集保留段并删除
-  // "最后 boundary 之前"的其余行（实测 5 进 3 出）。因此引用未发射 uuid 时
-  // 直接删除这两个字段：原生读端对缺 preserved 元数据的 boundary 是 no-op +
-  // 全史加载，比悬挂引用更保真。不做全量 rekey（§8: rekey 需覆盖 7+ 类交叉
-  // 引用，漏一类即静默丢上下文，宁缺勿错）。anchorUuid 例外：它按 §3 指向
-  // boundary/摘要自身（本对刚登记），不参与存活判定；保留段若真被投影保留
-  // （claude 源经 recordsRaw 或活跃链），其消息 uuid 已在 emittedUuids 中。
+  // P0-B 升级为有限 rekey：跨工具新 uuid 体系下 preserved 引用指向源文件旧
+  // uuid，不换新则 claude 读端剪枝算法按 broken metadata 判 no-op（折叠
+  // 语义丢失）。rekey 表（emitMessage 逐条登记 源uuid→新行uuid）命中的
+  // 引用换新即可原样恢复折叠语义；做不到的宁缺勿错删字段——原生读端对缺
+  // preserved 元数据的 boundary 是 no-op + 全史加载，残缺段界标/半旧引用比
+  // 没有更糟（§8 有限版：只 rekey preserved 三类引用，sourceToolAssistantUUID
+  // 等其余指针维持现状）：
+  //  - preservedMessages.uuids：全命中→全换新；部分命中→只留命中项；零命中→删字段
+  //  - preservedSegment.head/tailUuid：两端同时命中才换新；任一未命中整字段删
+  //  - anchorUuid：按 §3 指向 boundary 自身 → 换成本 boundary 落盘 uuid（必命中）
   {
-    const emitted = ctx.state.emittedUuids;
-    const cmAll = (boundary.compactMetadata ?? {}) as {
-      preservedSegment?: { headUuid?: string; anchorUuid?: string; tailUuid?: string };
-      preservedMessages?: { anchorUuid?: string; uuids?: string[] };
+    const rekey = ctx.state.uuidRekey;
+    const cmAll = (boundary.compactMetadata ?? {}) as Record<string, unknown>;
+    const isObj = (v: unknown): v is Record<string, unknown> =>
+      typeof v === 'object' && v !== null && !Array.isArray(v);
+    const rekeyed = (u: unknown): string | undefined => {
+      if (typeof u !== 'string') return undefined;
+      const v = rekey.get(u);
+      return typeof v === 'string' ? v : undefined;
     };
-    const live = (refs: unknown[]): boolean =>
-      refs.every((u) => u === undefined || (typeof u === 'string' && emitted.has(u)));
-    const seg = cmAll.preservedSegment;
-    const pm = cmAll.preservedMessages;
-    const segDead = seg !== undefined && !live([seg.headUuid, seg.tailUuid]);
-    const pmDead = pm !== undefined && !live(Array.isArray(pm.uuids) ? pm.uuids : []);
-    if (segDead || pmDead) {
-      const cmClone = { ...(boundary.compactMetadata as Record<string, unknown>) };
-      if (segDead) delete cmClone.preservedSegment;
-      if (pmDead) delete cmClone.preservedMessages;
+    const segRaw = cmAll.preservedSegment;
+    const pmRaw = cmAll.preservedMessages;
+    const seg = isObj(segRaw) ? segRaw : undefined;
+    const pm = isObj(pmRaw) ? pmRaw : undefined;
+    const anchor = boundary.uuid as string;
+
+    // 段界标：head/tail 两端同时命中才存活（含 anchorUuid 换新）
+    let segOut: Record<string, unknown> | undefined;
+    if (seg) {
+      const h = rekeyed(seg.headUuid);
+      const t = rekeyed(seg.tailUuid);
+      if (h !== undefined && t !== undefined) {
+        segOut = { ...seg, headUuid: h, anchorUuid: anchor, tailUuid: t };
+      }
+    }
+    // 保留清单：命中项换新后存活，零命中整字段删；allUuids 是同类引用表，
+    // 跟随同一过滤换新——半新半旧的引用表比没有更糟
+    let pmOut: Record<string, unknown> | undefined;
+    if (pm) {
+      const srcList = Array.isArray(pm.uuids) ? (pm.uuids as unknown[]) : [];
+      const hits = srcList.map(rekeyed).filter((u): u is string => u !== undefined);
+      if (hits.length) {
+        pmOut = { ...pm, anchorUuid: anchor, uuids: hits };
+        if (Array.isArray(pm.allUuids)) {
+          pmOut.allUuids = (pm.allUuids as unknown[]).map(rekeyed).filter((u): u is string => u !== undefined);
+        }
+      }
+    }
+    if (seg !== undefined || pm !== undefined) {
+      const cmClone = { ...cmAll };
+      if (segOut !== undefined) cmClone.preservedSegment = segOut;
+      else delete cmClone.preservedSegment;
+      if (pmOut !== undefined) cmClone.preservedMessages = pmOut;
+      else delete cmClone.preservedMessages;
       boundary.compactMetadata = cmClone;
     }
   }

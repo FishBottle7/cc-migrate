@@ -1098,8 +1098,257 @@ test('zcode listSessions: absent file → [], a db that cannot be opened → thr
 });
 
 /* ------------------------------------------------------------------ */
-/* Real live store (skipped when ~/.zcode is absent)                   */
+/* Nested (grandchild) agent trees: slot backlinks + recursive reads   */
 /* ------------------------------------------------------------------ */
+
+test('zcode write: three-level tree — the child\'s Agent tool part carries metadata.agentId backlinking the grandchild', async () => {
+  await withoutRealZcodeHome(async () => {
+    const dstRoot = await fs.mkdtemp(join(tmpdir(), 'sm-zcode-nestslot-'));
+    try {
+      const grandUuid = '99999999-8888-7777-6666-555555555555';
+      const ir: MigratedSession = {
+        schemaVersion: 2,
+        originTool: 'zcode',
+        cwd: 'D:\\proj',
+        messages: [
+          { role: 'user', content: [{ type: 'text', text: 'delegate a research task' }] },
+          {
+            role: 'assistant',
+            content: [{ type: 'tool_use', id: 'call_rootagent', name: 'Agent', input: { description: 'research', prompt: 'research the tree' } }],
+            stopReason: 'tool-calls',
+          },
+        ],
+        sidechains: [{
+          agentId: 'sess_subagent_agent_11111111-2222-3333-4444-555555555555',
+          kind: 'subagent',
+          agentType: 'Explore',
+          parentMessageId: 'call_rootagent',
+          messages: [
+            { role: 'user', content: [{ type: 'text', text: 'research the tree' }] },
+            {
+              // 子代自己的 Agent 调用 → 孙代；tool_result 交给 pass 1 收集。
+              // prompt 与孙代首条 user 文本一致——matchByPrompt 双向可配
+              // （读端 findAgentCallByPrompt 的回链也靠它）
+              role: 'assistant',
+              content: [{ type: 'tool_use', id: 'call_inneragent', name: 'Agent', input: { description: 'deep probe', prompt: 'GRANDCHILD SLOT TEXT' } }],
+              stopReason: 'tool-calls',
+            },
+            {
+              // 子代视角收到的孙代结果——输出带 launch-ack footer（引擎追
+              // 加的回执），写端必须把它改写到新孙代 uuid 上
+              role: 'tool',
+              content: [{ type: 'tool_result', toolUseId: 'call_inneragent', content: 'probe done.\nagentId: agent_DEADBEEF-0000-0000-0000-000000000000 (use SendMessage to message this agent)' }],
+            },
+            { role: 'assistant', content: [{ type: 'text', text: 'child synthesis done' }] },
+          ],
+          sidechains: [{
+            agentId: `sess_subagent_agent_${grandUuid}`,
+            kind: 'subagent',
+            messages: [
+              { role: 'user', content: [{ type: 'text', text: 'GRANDCHILD SLOT TEXT' }] },
+              { role: 'assistant', content: [{ type: 'text', text: 'grandchild finished probing' }] },
+            ],
+          }],
+        }],
+      };
+      const res = await new ZcodeAdapter().write(ir, { root: dstRoot, targetCwd: 'D:\\proj' });
+      const db = new DatabaseSync(join(dstRoot, 'cli', 'db', 'db.sqlite'));
+      try {
+        const mainId = res.sessionId;
+        const child = db.prepare('SELECT id FROM session WHERE parent_id=?').get(mainId) as { id: string } | undefined;
+        assert.ok(child, 'child session row exists');
+        // 孙代 session 行挂在子代下（上轮已做——回归不丢）
+        const grand = db.prepare('SELECT id, task_type FROM session WHERE parent_id=?').get(child.id) as { id: string; task_type: string } | undefined;
+        assert.ok(grand, 'grandchild session row exists');
+        assert.equal(grand.task_type, 'subagent_child');
+        assert.equal(grand.id, `sess_subagent_agent_${grandUuid}`, 'grandchild keeps its derived identity');
+        // ---- 本任务核心断言：子代消息里的 Agent tool part 回链孙代 ----
+        const agentParts = (db.prepare("SELECT data FROM part WHERE session_id=? AND data LIKE '%\"tool\":\"Agent\"%'").all(child.id) as Array<{ data: string }>)
+          .map((r) => JSON.parse(r.data));
+        assert.equal(agentParts.length, 1, 'the child session carries exactly its own Agent call');
+        const part = agentParts[0];
+        assert.equal(part.state.metadata.agentId, `agent_${grandUuid}`, 'child Agent tool part must backlink the grandchild agentId');
+        // callID 换新（引擎全局 parentToolUseId 索引防回连源库）
+        assert.match(part.callID, /^call_[0-9a-f]{24}$/);
+        // launch-ack footer 改写对嵌套层生效：旧 uuid 必须被换成本轮孙代 uuid
+        assert.ok(!String(part.state.output).includes('DEADBEEF'), 'stale launch-ack uuid must be rewritten');
+        assert.match(String(part.state.output), new RegExp(`agentId: agent_${grandUuid}`));
+        // 孙代独特文本落库（transcript 不丢）
+        const hit = (db.prepare("SELECT COUNT(*) AS n FROM part WHERE data LIKE '%GRANDCHILD SLOT TEXT%'").get() as { n: number }).n;
+        assert.ok(hit >= 1, 'grandchild transcript text must survive');
+        // 根层的 Agent part 照旧回链子代（根级 slot 行为不回归）
+        const rootPart = JSON.parse((db.prepare("SELECT data FROM part WHERE session_id=? AND data LIKE '%\"tool\":\"Agent\"%'").get(mainId) as { data: string }).data);
+        assert.equal(rootPart.state.metadata.agentId, 'agent_11111111-2222-3333-4444-555555555555');
+      } finally {
+        db.close();
+      }
+      // ---- parse 读回：递归下钻，孙代挂在子代的 sidechains[] 里 ----
+      const back = await new ZcodeAdapter().parse(res.sessionId, dstRoot);
+      assert.equal(back.sidechains?.length, 1);
+      const childSc = back.sidechains![0];
+      assert.equal(childSc.agentId, 'sess_subagent_agent_11111111-2222-3333-4444-555555555555');
+      const grandSc = childSc.sidechains?.[0];
+      assert.ok(grandSc, 'grandchild must read back nested inside the child sidechain (recursive buildSidechains)');
+      assert.equal(grandSc.agentId, `sess_subagent_agent_${grandUuid}`);
+      assert.equal(grandSc.kind, 'subagent');
+      // 孙代与父链 tool part 的冷链接回来了：子代 IR 里的 Agent callId 配
+      // agentLinks（callID 是写端新生成的 call_<hex24>）
+      const agentLinkKeys = Object.keys((back.extensions as Record<string, unknown>)['zcode.agentLinks'] as Record<string, unknown>);
+      const childAgentCall = childSc.messages
+        .flatMap((m) => m.content)
+        .find((b) => b.type === 'tool_use' && (b as { name: string }).name === 'Agent') as { id: string };
+      assert.ok(childAgentCall, 'child IR carries its Agent tool_use');
+      assert.ok(agentLinkKeys.includes(childAgentCall.id), 'agentLinks must bind the child-level Agent call to the grandchild');
+      const link = (back.extensions as Record<string, unknown>)['zcode.agentLinks'] as Record<string, { childSessionId: string; agentId: string }>;
+      assert.equal(link[childAgentCall.id].childSessionId, `sess_subagent_agent_${grandUuid}`);
+      // 孙代独特文本在嵌套读回里
+      const grandText = grandSc.messages.some((m) => m.content.some((b) => b.type === 'text' && (b as { text: string }).text.includes('GRANDCHILD SLOT TEXT')));
+      assert.ok(grandText, 'grandchild unique text must read back through the nested tree');
+    } finally {
+      await fs.rm(dstRoot, { recursive: true, force: true });
+    }
+  });
+});
+
+test('zcode parse: native grandchild session rows read back recursively (parent_id depth 2)', async () => {
+  await withoutRealZcodeHome(async () => {
+    const fx = await makeFixture();
+    try {
+      const childId = 'sess_subagent_agent_11111111-2222-3333-4444-555555555555';
+      const grandId = 'sess_subagent_agent_99999999-8888-7777-6666-555555555555';
+      fx.insertSession({ id: 'sess_tree' });
+      const m0 = fx.insertMessage('sess_tree', 0, userData('root task'));
+      fx.insertPart(m0, 'sess_tree', 0, { type: 'text', text: 'root task' });
+      const m1 = fx.insertMessage('sess_tree', 1, assistantData({ finish: 'tool-calls' }));
+      fx.insertPart(m1, 'sess_tree', 0, {
+        type: 'tool', callID: 'call_out1', tool: 'Agent',
+        // prompt 必须 ≥16 字符——findAgentCallByPrompt 的最短匹配阈值
+        state: { status: 'completed', input: { prompt: 'child task long enough to match' }, output: 'child report' },
+      });
+      // 子代：自己的 Agent 调用 → 孙代
+      fx.insertSession({ id: childId, parent_id: 'sess_tree', task_type: 'subagent_child', title: 'child' });
+      // 子代自己的消息需要显式 id：fixture 默认 id 只按 (time,sequence) 生
+      // 成，跨 session 的 sequence=0 会与根会话撞 UNIQUE
+      const c0 = fx.insertMessage(childId, 0, {
+        role: 'user', time: { created: T0 }, agent: 'zcode-Explore',
+        semantics: { origin: 'agent_runtime', kind: 'user_prompt', ...VIS },
+      }, { id: 'msg_native_child0' });
+      fx.insertPart(c0, childId, 0, { type: 'text', text: 'child task long enough to match' });
+      const c1 = fx.insertMessage(childId, 1, { role: 'assistant', time: { created: T0 }, agent: 'zcode-Explore', finish: 'tool-calls' }, { id: 'msg_native_child1' });
+      fx.insertPart(c1, childId, 0, {
+        type: 'tool', callID: 'call_in1', tool: 'Agent',
+        state: { status: 'completed', input: { prompt: 'grand task with enough length' }, output: 'grand report', metadata: { schemaVersion: 1, agentId: `agent_${grandId.slice('sess_subagent_agent_'.length)}` } },
+      });
+      // 孙代：parent_id = 子代 id —— 旧读端（只查顶层一层）完全看不见它
+      fx.insertSession({ id: grandId, parent_id: childId, task_type: 'subagent_child', title: 'grandchild' });
+      const g0 = fx.insertMessage(grandId, 0, {
+        role: 'user', time: { created: T0 }, agent: 'zcode-agent',
+        semantics: { origin: 'agent_runtime', kind: 'user_prompt', ...VIS },
+      }, { id: 'msg_native_grand0' });
+      fx.insertPart(g0, grandId, 0, { type: 'text', text: 'grand task with enough length' });
+      const g1 = fx.insertMessage(grandId, 1, { role: 'assistant', time: { created: T0 }, agent: 'zcode-agent', finish: 'stop' }, { id: 'msg_native_grand1' });
+      fx.insertPart(g1, grandId, 0, { type: 'text', text: 'NATIVE GRANDCHILD TEXT' });
+
+      const ir = await new ZcodeAdapter().parse('sess_tree', fx.root);
+      assert.equal(ir.sidechains?.length, 1);
+      const childSc = ir.sidechains![0];
+      assert.equal(childSc.agentId, childId);
+      const grandSc = childSc.sidechains?.[0];
+      assert.ok(grandSc, 'grandchild sidechain must hang inside the child (previously invisible)');
+      assert.equal(grandSc.agentId, grandId);
+      assert.equal(grandSc.messages.length, 2);
+      const gText = grandSc.messages.some((m) => m.content.some((b) => b.type === 'text' && (b as { text: string }).text === 'NATIVE GRANDCHILD TEXT'));
+      assert.ok(gText, 'grandchild transcript read back through recursion');
+      // 嵌套层的 Agent tool part 链接：子代里 call_in1 → 孙代
+      const links = (ir.extensions as Record<string, unknown>)['zcode.agentLinks'] as Record<string, { childSessionId: string }>;
+      assert.equal(links['call_in1'].childSessionId, grandId, 'agentLinks binds the child-level call to the grandchild');
+      assert.equal(links['call_out1'].childSessionId, childId, 'root-level link unaffected');
+    } finally {
+      await fx.close();
+    }
+  });
+});
+
+test('zcode parse: parent_id cycles terminate — no duplicate transcripts, no infinite walk', async () => {
+  await withoutRealZcodeHome(async () => {
+    const fx = await makeFixture();
+    try {
+      const childId = 'sess_subagent_agent_CCCCCCCC-2222-3333-4444-555555555555';
+      // 单向 parent_id 模型里「交叉环」会让环上节点失去根链不可达；真实可
+      // 达的环形状是自引用：根自己 parent_id=自己且 subagent_child——第一
+      // 层查询会把根自己当子级返回，没有 visited 挡环就会自嵌套 16 份。
+      fx.insertSession({ id: childId, parent_id: 'sess_cyc', task_type: 'subagent_child', title: 'child' });
+      fx.insertSession({ id: 'sess_cyc', parent_id: 'sess_cyc', task_type: 'subagent_child', title: 'self-cycle root' });
+      const putPrompt = (sid: string, text: string, tag: string): void => {
+        const m = fx.insertMessage(sid, 0, {
+          role: 'user', time: { created: T0 }, agent: 'zcode-agent',
+          semantics: { origin: 'agent_runtime', kind: 'user_prompt', ...VIS },
+        // fixture 的默认 id 是 per-session 唯一的（msg_<ts>_<seq>-fixture），
+        // 两个 session 各自 sequence=0 会撞 id——显式给唯一 id
+        }, { id: `msg_cyc_${tag}` });
+        fx.insertPart(m, sid, 0, { type: 'text', text });
+      };
+      putPrompt('sess_cyc', 'CYCLE ROOT TEXT', 'root');
+      putPrompt(childId, 'CYCLE CHILD TEXT', 'child');
+
+      // 必须正常返回（自引用环不炸不自嵌套）。根的 transcript 会出现两
+      // 次——顶层 messages（它就是根）+ 作为「自己的子级」进 sidechains 一
+      // 次——这是合法的一次；visited 的职责是阻止第二次往下的自嵌套。
+      const ir = await new ZcodeAdapter().parse('sess_cyc', fx.root);
+      const dump = JSON.stringify(ir);
+      assert.equal(dump.split('CYCLE ROOT TEXT').length - 1, 2, 'root text: once as main messages, once as its own sidechain — no more');
+      assert.equal(dump.split('CYCLE CHILD TEXT').length - 1, 1, 'child transcript appears exactly once');
+      // 环上只展开一次：根作为「自己的子级」进 sidechains 后，递归被
+      // visited 截断，不会把同一份内容再嵌套一层
+      const selfSc = ir.sidechains?.find((s) => s.agentId === 'sess_cyc');
+      assert.ok(selfSc, 'the self-referencing root surfaces as its own sidechain once');
+      assert.equal(selfSc!.sidechains?.length ?? 0, 0, 'visited must cut the self-recursion — no nested copy of itself');
+      assert.ok(ir.sidechains?.some((s) => s.agentId === childId), 'normal child still read alongside the cycle');
+    } finally {
+      await fx.close();
+    }
+  });
+});
+
+test('zcode parse: depth beyond 16 nesting levels is cut off (query bomb guard)', async () => {
+  await withoutRealZcodeHome(async () => {
+    const fx = await makeFixture();
+    try {
+      const DEPTH = 20; // 超过上限 16：第 17 层起截断
+      fx.insertSession({ id: 'sess_chain' });
+      let parent = 'sess_chain';
+      for (let i = 0; i < DEPTH; i++) {
+        const sid = `sess_subagent_agent_${String(i).padStart(12, '0')}-2222-3333-4444-555555555555`;
+        fx.insertSession({ id: sid, parent_id: parent, task_type: 'subagent_child', title: `level ${i}` });
+        const m = fx.insertMessage(sid, 0, {
+          role: 'user', time: { created: T0 }, agent: 'zcode-agent',
+          semantics: { origin: 'agent_runtime', kind: 'user_prompt', ...VIS },
+        // 同上：跨 session 的默认 id 撞车，显式唯一 id（深度链 20 个 session）
+        }, { id: `msg_deep_${i}` });
+        fx.insertPart(m, sid, 0, { type: 'text', text: `LEVEL_${i}_TEXT` });
+        parent = sid;
+      }
+
+      const ir = await new ZcodeAdapter().parse('sess_chain', fx.root);
+      // 沿 sidechains[] 下钻数深度：读到第 15 个子级（共 16 层，含根）为止
+      let depth = 0;
+      let level: MigratedSession['sidechains'] | undefined = ir.sidechains;
+      while (level && level.length) {
+        depth += 1;
+        level = level[0].sidechains;
+      }
+      assert.equal(depth, 16, 'exactly 16 nesting levels read (guard cuts the rest)');
+      const dump = JSON.stringify(ir);
+      assert.ok(dump.includes('LEVEL_15_TEXT'), 'level 15 (16th) is the last readable one');
+      assert.ok(!dump.includes('LEVEL_16_TEXT'), 'level 16 is beyond the cap and must not appear');
+      assert.ok(!dump.includes(`LEVEL_${DEPTH - 1}_TEXT`), 'the deepest bomb level must not appear');
+    } finally {
+      await fx.close();
+    }
+  });
+});
+
+
 
 const REAL_DB = join(process.env.ZCODE_HOME ?? join(process.env.HOME ?? process.env.USERPROFILE ?? '', '.zcode'), 'cli', 'db', 'db.sqlite');
 

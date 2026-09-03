@@ -25,6 +25,11 @@
  *     buckets; write-back relinks parents and never clobbers an existing log.
  *  6. listSessions titles via session_projcache.json → last `session/title`
  *     log-scan fallback; archive state via workspace.json; `_no-cwd` layout.
+ *  7. claude teammate sidechains ride the SAME child-session path as
+ *     subagents (content preserved, no team/* events — see write()) and the
+ *     kind round-trips via the child header's `agentPreset` marker (2026-09-03
+ *     调查结论：team/* 在安装产物里只有 catalog 条目、无 payload 契约，伪造
+ *     team/message 行属瞎猜，故承载形态=独立子会话，见 docs/agents/dsh.md).
  */
 
 /**
@@ -149,6 +154,19 @@ interface DshEvent {
 
 const SURFACE_TYPES = new Set(['user/message', 'assistant/message', 'tool/result']);
 const PACKED_CHUNK_TYPES = new Set(['reasoning-chunks', 'text-chunks', 'tool-call-chunks']);
+
+/**
+ * teammate 子会话在 header.agentPreset 里的标识前缀（kind 往返保真，2026-09-03）。
+ * 为什么用 agentPreset：DSH header 是 strict 白名单字段（fromHeaderLine 只透传
+ * version/id/createdAt/cwd/parentSession/seedLength/origin/delegationDepth/
+ * agentPreset，origin 闭集仅 'subagent'，retired 字段出现即抛错）——在 header
+ * 里添加任何自定义 kind 字段都会被 DSH 加载器整份拒载，agentPreset 是唯一
+ * 自由字符串原生槽位。前缀命名空间 `teammate/` 由本引擎私有约定：dsh 原生
+ * preset 值（standard/explore/general-purpose 等）不携带 `/`，且读端用前缀
+ * 判定 kind 后会把 agentType 还原为去前缀部分，两种 kind 的往返互不污染
+ * （subagent 的 preset 撞上前缀的零概率由 dsh 原生词汇表保证）。
+ */
+const DSH_TEAMMATE_PRESET_PREFIX = 'teammate/';
 
 /**
  * The event types the DSH harness knows — mirrored 1:1 from
@@ -362,7 +380,12 @@ export class DshAdapter implements Adapter {
   /** Fully decode one child log into a mini-session sidechain: messages plus
    * every typed bucket (toolCalls/goals/planModes/todos/compaction/title/
    * unmappedEvents) and the original header under meta.dsh.headerRaw —
-   * write-back restores the child's delegationDepth/agentPreset/seedLength. */
+   * write-back restores the child's delegationDepth/agentPreset/seedLength.
+   * kind 往返保真：teammate 子会话的 header.agentPreset 带 `teammate/` 私有
+   * 前缀（DSH_TEAMMATE_PRESET_PREFIX），此处按前缀还原 kind==='teammate' 并
+   * 把 agentType 剥回去前缀的真值；无前缀的 preset 维持 kind==='subagent'
+   * 原判定（dsh 原生子代理会话零回归）。title 侧的 `(migrated teammate)`
+   * 前缀保留原样——读端不吞标识，title 是会话列表的可辨识位（有意保留）。 */
   private async decodeSidechain(ref: { id: string; header: Record<string, unknown>; createdAt: number; log: string }): Promise<MigratedSidechain> {
     const buf = await fs.readFile(ref.log);
     const plaintext = decompressSessionBuffer(buf);
@@ -371,10 +394,12 @@ export class DshAdapter implements Adapter {
     const events = lines.slice(1).map((l) => JSON.parse(l) as DshEvent);
     events.sort((a, b) => (a.seq ?? 0) - (b.seq ?? 0));
     const childIr = buildIrFromEvents(ref.header as unknown as { cwd?: string; createdAt?: number; id?: string }, events);
+    const rawPreset = typeof ref.header.agentPreset === 'string' ? ref.header.agentPreset : undefined;
+    const isTeammate = rawPreset !== undefined && rawPreset.startsWith(DSH_TEAMMATE_PRESET_PREFIX);
     const sc: MigratedSidechain = {
       agentId: ref.id,
-      kind: 'subagent',
-      agentType: typeof ref.header.agentPreset === 'string' ? ref.header.agentPreset : undefined,
+      kind: isTeammate ? 'teammate' : 'subagent',
+      ...(rawPreset !== undefined ? { agentType: isTeammate ? rawPreset.slice(DSH_TEAMMATE_PRESET_PREFIX.length) || undefined : rawPreset } : {}),
       messages: childIr.messages,
       ...(childIr.toolCalls?.length ? { toolCalls: childIr.toolCalls } : {}),
       ...(childIr.goals?.length ? { goals: childIr.goals } : {}),
@@ -520,23 +545,29 @@ export class DshAdapter implements Adapter {
       }
     }
 
-    // subagent sidechains -> independent child sessions, written depth-first.
-    // Each child keeps its source id unless that destination is already taken
+    // Sidechains -> independent child sessions, written depth-first. Each
+    // child keeps its source id unless that destination is already taken
     // (a dsh->dsh copy must never clobber the source log); nested sidechains
     // (grandchildren) link to the WRITTEN parent id. Child headerRaw rides
     // through verbatim (delegationDepth/seedLength/agentPreset/…); identity
     // and linkage fields are overridden per written lifecycle.
-    // teammate 侧链显式丢弃（不再静默）：claude 的 teammate 语义（并协作者
-    // 之间的消息流）与 dsh 的 team/member、team/message（任务分派/投递事件）
-    // 不同构，转译需要单独调查（见 docs/agents/dsh.md 的登记）；在落地前，
-    // 盲目把 teammate 消息写成 dsh 子代理会话会歪曲会话语义。丢弃必须可见：
-    // 警告里给出数量与调查指引，绝不无声吞掉整类数据。
-    const subagents = (ir.sidechains ?? []).filter((s) => s.kind === 'subagent');
-    const teammates = (ir.sidechains ?? []).filter((s) => s.kind !== 'subagent');
-    if (teammates.length > 0) {
-      // eslint-disable-next-line no-console -- migration-time visibility contract: silent drops are the bug class this guards
-      console.warn(
-        `[session-migrate/dsh] ${teammates.length} teammate sidechain(s) dropped (dsh has no native teammate channel — see docs/agents/dsh.md)`,
+    // teammate 侧链承载（2026-09-03 裁定，方案 B）：claude teammate 是「并协作者
+    // 的完整对话流」，与 subagent 同款落盘（独立子会话 + parentSession 链 +
+    // agentPreset 用 teammate 标识），内容零丢弃。**不发任何 team/* 事件**：
+    // 本机安装的 @deepseek-ai 全家桶里 team/member、team/message/queued、
+    // team/message/delivered、team/task 只出现在 known-event-types catalog，
+    // 没有任何生产者代码、没有 payload 类型声明（59 个真实会话实测 0 个 team
+    // 事件）——没有 payload 契约就没有转译，伪造 team/message 行的 data 字段
+    // 违反「不冒充」纪律。team/* 是运行时协作状态机（dsh-tool-cordis
+    // agentTeams 服务）的产物，迁移侧没有等价物；语义上最贴近 dsh 的原生
+    // 形态就是一份可独立 resume 的完整会话记录（语义登记见 docs/agents/dsh.md）。
+    const teammateCount = (ir.sidechains ?? []).filter((s) => s.kind === 'teammate').length;
+    if (teammateCount > 0) {
+      // 内容承载说明（非警告——丢弃已成历史）：一次性告知用户 teammate 侧链的
+      // 落盘形态与 team/* 不发的理由，语义边界保持可见，绝不无声改写。
+      // eslint-disable-next-line no-console -- migration-time visibility contract: teammate carry-over must be announced, not silent
+      console.log(
+        `[session-migrate/dsh] ${teammateCount} teammate sidechain(s) written as standalone child sessions (dsh team/* events are runtime-only state — content preserved, live-team semantics not translatable; see docs/agents/dsh.md)`,
       );
     }
     const now = Date.now();
@@ -556,10 +587,15 @@ export class DshAdapter implements Adapter {
       const childId = await this.claimFreeSessionId(sessionsRoot, this.childCwd(sc, scHeaderRaw, cwd), candidate);
       const childCreatedAt = now + ++childCounter;
       const rawDepth = scHeaderRaw?.delegationDepth;
+      // teammate 子会话的 agentPreset 一律带 teammate 标识（kind 往返保真的
+      // 载体，见下方 marker 说明）；subagent 走原有 agentType ?? 'standard' 路径。
+      const presetForChild = sc.kind === 'teammate'
+        ? DSH_TEAMMATE_PRESET_PREFIX + (sc.agentType ?? 'teammate')
+        : sc.agentType ?? 'standard';
       const childHeaderObj: Record<string, unknown> =
         scHeaderRaw && typeof scHeaderRaw === 'object' && !Array.isArray(scHeaderRaw)
           ? { ...scHeaderRaw }
-          : { version: 0, agentPreset: sc.agentType ?? 'standard' };
+          : { version: 0, agentPreset: presetForChild };
       childHeaderObj.type = 'session';
       childHeaderObj.id = childId;
       childHeaderObj.createdAt = childCreatedAt;
@@ -571,7 +607,11 @@ export class DshAdapter implements Adapter {
       // linkage is ours to own: the child always points at the WRITTEN parent
       childHeaderObj.parentSession = parentWrittenId;
       childHeaderObj.origin = 'subagent';
-      if (childHeaderObj.agentPreset === undefined) childHeaderObj.agentPreset = sc.agentType ?? 'standard';
+      // teammate 子会话的 agentPreset 强制覆盖为带标识值：即使 headerRaw 从源
+      // 会话带入了旧 agentPreset（dsh→dsh 不存在 teammate 源，但防御性保留
+      // 该覆盖——teammate 只可能来自 claude 等外部 IR），kind 标识绝不丢失。
+      if (sc.kind === 'teammate') childHeaderObj.agentPreset = presetForChild;
+      else if (childHeaderObj.agentPreset === undefined) childHeaderObj.agentPreset = sc.agentType ?? 'standard';
       delete childHeaderObj.sandboxMode;
       delete childHeaderObj.approvalPolicy;
       // 子会话 cwd 解析（此前被父 cwd 无条件覆盖）：优先 MigratedSidechain.cwd
@@ -585,6 +625,9 @@ export class DshAdapter implements Adapter {
       else delete childHeaderObj.cwd;
       const childHeader = JSON.stringify(childHeaderObj);
       // Full mini-session buckets — a child log round-trips like a main log.
+      // teammate 子会话的 title 加 `(migrated teammate)` 前缀：DSH 会话列表里
+      // 无 kind 维度，title 是唯一可辨识位（与主会话 `(migrated)` 后缀的
+      // disambiguate 风格同族——前缀而非后缀，避免与源 title 语义混淆）。
       const childIr: MigratedSession = {
         schemaVersion: 2 as const,
         originTool: 'dsh',
@@ -595,7 +638,14 @@ export class DshAdapter implements Adapter {
         ...(sc.todos?.length ? { todos: sc.todos } : {}),
         ...(sc.compaction?.length ? { compaction: sc.compaction } : {}),
         ...(sc.unmappedEvents?.length ? { unmappedEvents: sc.unmappedEvents } : {}),
-        ...(sc.title ? { title: sc.title } : {}),
+        // kind 保真的第二载体：title 前缀让往返后的 sidechain.title 也携带
+        // teammate 标识（irToEvents 会据此合成 session/title 事件）。原有
+        // title 有值则前缀附加，无值则用裸前缀兜底，保证标识必然可见。
+        ...(sc.kind === 'teammate'
+          ? { title: sc.title ? `(migrated teammate) ${sc.title}` : '(migrated teammate)' }
+          : sc.title
+            ? { title: sc.title }
+            : {}),
       };
       const childEvents = irToEvents(childIr, childCreatedAt);
       const cFrame1 = buildSessionFrame(childHeader);
@@ -636,7 +686,18 @@ export class DshAdapter implements Adapter {
         await writeSidechain(nested, childId, depth);
       }
     };
-    for (const sc of subagents) {
+    // 全部 sidechain 写出（subagent + teammate 同路径）：当前 IR 词汇表只有
+    // subagent/teammate 两 kind（ir.ts SidechainKind 闭集），teammate 已按
+    // 方案 B 承载；若未来 IR 扩出新 kind 且 dsh 未跟进，落到这里的兜底警告
+    // 保证该类数据绝不无声蒸发。
+    const unknownKinds = (ir.sidechains ?? []).filter((s) => s.kind !== 'subagent' && s.kind !== 'teammate');
+    if (unknownKinds.length > 0) {
+      // eslint-disable-next-line no-console -- migration-time visibility contract: silent drops are the bug class this guards
+      console.warn(
+        `[session-migrate/dsh] ${unknownKinds.length} sidechain(s) of unknown kind(s) ${[...new Set(unknownKinds.map((s) => s.kind))].join(', ')} dropped (no dsh carry-over defined — see docs/agents/dsh.md)`,
+      );
+    }
+    for (const sc of (ir.sidechains ?? []).filter((s) => s.kind === 'subagent' || s.kind === 'teammate')) {
       const baseDepth = typeof headerObj.delegationDepth === 'number' ? headerObj.delegationDepth : 0;
       await writeSidechain(sc, newId, baseDepth);
     }
