@@ -162,6 +162,31 @@ function envelopeFromMeta(meta: Record<string, unknown>): Partial<Record<string,
   return out;
 }
 
+/**
+ * P1-C: native.content 透传前置校验——其 tool_use id 集合必须与 IR 块一致
+ * （双向子集判定）。toolUseOwner 按 IR 块登记、tool_result 也按 IR id 配对，
+ * 透传携带 IR 之外的 tool_use id（或缺失 IR id）会写出文件中不存在的
+ * tool_use_id（配对断裂）。宁缺勿错：不一致则丢弃 native content 回退 IR 块重建。
+ */
+function nativeToolUseIdsConsistent(nativeContent: unknown[], blocks: ContentBlock[]): boolean {
+  const irIds = new Set(
+    blocks
+      .filter((b): b is Extract<ContentBlock, { type: 'tool_use' }> => b.type === 'tool_use')
+      .map((b) => b.id),
+  );
+  const nativeIds = new Set<string>();
+  for (const b of nativeContent) {
+    if (!b || typeof b !== 'object' || Array.isArray(b)) continue;
+    const blk = b as Record<string, unknown>;
+    if (blk.type !== 'tool_use') continue;
+    if (typeof blk.id !== 'string') return false; // 形状异常的 tool_use：宁缺勿错
+    nativeIds.add(blk.id);
+  }
+  if (nativeIds.size !== irIds.size) return false;
+  for (const id of nativeIds) if (!irIds.has(id)) return false;
+  return true;
+}
+
 function emitMessage(ctx: EmitCtx, msg: MigratedMessage, opts: { compactSummary?: boolean } = {}): void {
   const { stamp: st, state } = ctx;
   // 红线 #2: original row timestamps ride IR (msg.timestamp) — only fabricate
@@ -191,9 +216,16 @@ function emitMessage(ctx: EmitCtx, msg: MigratedMessage, opts: { compactSummary?
     const content = msg.content.filter((b) => b.type !== 'tool_result').map(claudeNativeBlock);
     if (!content.length) return;
     let message: Record<string, unknown>;
-    if (native && Array.isArray(native.content) && (native.content as unknown[]).length > 0) {
+    if (
+      native &&
+      Array.isArray(native.content) &&
+      (native.content as unknown[]).length > 0 &&
+      nativeToolUseIdsConsistent(native.content, msg.content)
+    ) {
       // claude→claude: keep the native message object verbatim (id/model/usage/
-      // stop_reason/context_management/redacted_thinking/caller/…)
+      // stop_reason/context_management/redacted_thinking/caller/…)。
+      // 前置一致性校验（P1-C）：透传的 tool_use id 必须与 IR 块一致——
+      // 否则 tool_result 配对断裂，回退 IR 块重建（宁缺勿错）。
       message = { ...native };
     } else {
       message = {
@@ -526,34 +558,76 @@ export function buildMainRecords(
   (ir.compaction ?? []).forEach((c) => {
     if (typeof c.anchorIndex === 'number' && c.anchorIndex >= 0 && c.anchorIndex < ir.messages.length) {
       compactByAnchor.set(c.anchorIndex, c);
+    } else if (typeof c.anchorIndex === 'number') {
+      // P1-D: 越界 anchorIndex 不再静默整条丢 —— boundary 失去锚定点就不能落盘
+      // （不能伪造位置），显式警告；entry 本身留在 IR 桶不丢。非 number（遗留
+      // summary 行缺 anchorIndex）保持静默跳过，那是合法的历史形状。
+      console.warn(
+        `[claude write] compaction anchorIndex ${c.anchorIndex} out of range (messages.length=${ir.messages.length}) — boundary skipped`,
+      );
     }
   });
   // anchorIndex 指向 messages[] 中的摘要消息；重放时在它之前插入 boundary，
-  // 摘要本身由 emitCompactionPair 的 isCompactSummary 行承载 —— 随后的投影
-  // 摘要消息必须跳过，否则同一份摘要落盘两遍（真机 9c958067 实测复现）
+  // 摘要文本由 emitCompactionPair 的 isCompactSummary 行承载 —— anchor 消息里
+  // 构成摘要的 text 块跳过（否则同一份摘要落盘两遍，真机 9c958067 实测复现），
+  // 其余块（额外 text/tool_use/file）照常 emit（P1-D：不再整条丢弃——额外块
+  // 属于对话内容，丢了即丢上下文）。
+  // keep-gate: isMeta user rows replay into model context (§2.2, 红线 #2) —
+  // keep them even when synthetic rows are otherwise dropped; local_command
+  // 同族（§2.3：转用户文本进 API 回放，非 presentation-only，P1-A）；其余
+  // synthetic family（attachment / runtime-injected rows）is presentation-only
+  // and skips unless keepSynthetic is set.
+  const keepGate = (m: MigratedMessage): boolean => {
+    const cm = (m.meta?.claude ?? {}) as Record<string, unknown>;
+    return (
+      m.synthetic !== true ||
+      opts.keepSynthetic === true ||
+      (m.synthetic === true && cm.isMeta === true) ||
+      cm.systemSubtype === 'local_command' ||
+      m.content.some((b) => b.type === 'tool_result')
+    );
+  };
   for (let i = 0; i < ir.messages.length; i++) {
     const msg = ir.messages[i];
     const comp = compactByAnchor.get(i);
     if (comp) {
       emitCompactionPair(ctx, comp);
+      const rest = stripSummaryBlocks(msg, comp.summary);
+      if (rest.length && keepGate({ ...msg, content: rest })) {
+        emitMessage(ctx, { ...msg, content: rest });
+      }
       continue;
     }
-    // keep-gate: isMeta user rows replay into model context (§2.2, 红线 #2) —
-    // keep them even when synthetic rows are otherwise dropped; the OTHER
-    // synthetic family (attachment / local_command / runtime-injected rows) is
-    // presentation-only and skips unless keepSynthetic is set.
-    const isMetaRow = msg.synthetic === true && (msg.meta?.claude as Record<string, unknown> | undefined)?.isMeta === true;
-    const keep = msg.synthetic !== true || opts.keepSynthetic === true || isMetaRow || msg.content.some((b) => b.type === 'tool_result');
-    if (!keep) continue;
+    if (!keepGate(msg)) continue;
     emitMessage(ctx, msg);
   }
 
-  // ---- sessionEvents: non-conversation system rows ride through verbatim ----
+  // ---- sessionEvents: 非对话行直通重放（v3.2 登记：其余全部入桶、写端直通） ----
   for (const ev of ir.sessionEvents ?? []) {
     const rec = (ev.data ?? {}) as Record<string, unknown>;
-    if (rec && typeof rec === 'object' && typeof rec.type === 'string' && TRANSCRIPT_ROW_TYPES.has(rec.type)) {
-      ctx.state.records.push({ ...rec, sessionId });
+    if (!rec || typeof rec !== 'object' || Array.isArray(rec)) continue;
+    const t = rec.type;
+    if (typeof t !== 'string') continue;
+    if (t === 'system') {
+      // P0-A: 原生 system 行（turn_duration / stop_hook_summary /
+      // microcompact_boundary / model_refusal_* / informational / …）原样重放
+      // data。compact_boundary 例外：读端把它路由进 compaction 桶（与
+      // isCompactSummary 摘要配对、parentUuid=null 截断链），正常 IR 的桶里不会
+      // 出现；外来 IR 硬塞时重放会造出第二份无配对 boundary（双写），跳过。
+      if (rec.subtype === 'compact_boundary') continue;
+      // 换新 uuid + 重锚 parentUuid：跨工具 IR 的源 uuid/parentUuid 在本文件中
+      // 不存在，悬挂行进不了 parentUuid 图，re-parse 时进不了链/尾随子树、回不
+      // 了桶。原始 uuid 登记 emittedUuids —— recordsRaw 兜底副本按「已被投影
+      // 代表」跳过，防双写。
+      const uuid = randomUUID();
+      const clone: Record<string, unknown> = { ...rec, parentUuid: ctx.state.parentUuid, uuid, sessionId };
+      if (st.snakeSessionId && rec.session_id !== undefined) clone.session_id = sessionId;
+      ctx.state.records.push(clone);
+      ctx.state.parentUuid = uuid;
+      if (typeof rec.uuid === 'string' && rec.uuid) ctx.state.emittedUuids.add(rec.uuid);
+      continue;
     }
+    if (TRANSCRIPT_ROW_TYPES.has(t)) ctx.state.records.push({ ...rec, sessionId });
   }
 
   // ---- terminal last-prompt (leafUuid = 末条 user/assistant; 不带 cwd) ----
@@ -596,6 +670,30 @@ export function buildMainRecords(
 
 const TRANSCRIPT_ROW_TYPES = new Set(['last-prompt', 'ai-title']);
 
+/**
+ * P1-D: anchor 消息摘除构成 compaction 摘要的 text 块（emitCompactionPair 的
+ * isCompactSummary 行已承载摘要全文，重放会落盘两遍），其余块原样保留。
+ * 摘要块识别 = 等价文本块的拼接（其余实现如按 subsequence 精确切分，在
+ * 摘要块与额外 text 交错/部分重叠时会把额外内容误判成摘要块整体丢弃）。
+ */
+function stripSummaryBlocks(msg: MigratedMessage, summary: string): ContentBlock[] {
+  const summaryText = summary.trim();
+  if (!summaryText) return [...msg.content];
+  const rest: ContentBlock[] = [];
+  let remaining = summaryText;
+  for (const b of msg.content) {
+    const text = b.type === 'text' ? b.text.trim() : '';
+    const isSummaryBlock = text !== '' && remaining.includes(text);
+    if (isSummaryBlock) {
+      const idx = remaining.indexOf(text);
+      remaining = (remaining.slice(0, idx) + remaining.slice(idx + text.length)).trim();
+      continue;
+    }
+    rest.push(b);
+  }
+  return rest;
+}
+
 /** sidechain file records (isSidechain:true + agentId stamps). */
 export function buildSidechainRecords(
   sc: MigratedSidechain,
@@ -620,8 +718,10 @@ export function buildSidechainRecords(
   };
   for (const msg of sc.messages) {
     const scMeta = (msg.meta?.claude ?? {}) as Record<string, unknown>;
-    const isMetaRow = msg.synthetic === true && scMeta.isMeta === true;
-    if (msg.synthetic === true && opts.keepSynthetic !== true && !isMetaRow && !msg.content.some((b) => b.type === 'tool_result')) continue;
+    // keep-gate 与主链同一规则（P1-A）：isMeta 与 local_command 参与 API 回放，
+    // 非 presentation-only，不随 keepSynthetic 默认丢弃。
+    const isReplayRow = scMeta.isMeta === true || scMeta.systemSubtype === 'local_command';
+    if (msg.synthetic === true && opts.keepSynthetic !== true && !isReplayRow && !msg.content.some((b) => b.type === 'tool_result')) continue;
     emitMessage(ctx, msg);
   }
   // 红线 #2: the original .meta.json sidecar (toolUseId/name/color/agentType…)
@@ -664,6 +764,33 @@ function emitCompactionPair(ctx: EmitCtx, c: MigratedCompaction): void {
   ctx.state.emittedUuids.add(boundary.uuid as string);
   if (typeof claudeMeta.summaryUuid === 'string' && claudeMeta.summaryUuid) {
     ctx.state.emittedUuids.add(claudeMeta.summaryUuid);
+  }
+  // P0-B: 跨工具新 uuid 体系下，preservedSegment/preservedMessages 引用的
+  // 旧 uuid 不在本文件内——claude 读端剪枝算法按这些 uuid 收集保留段并删除
+  // "最后 boundary 之前"的其余行（实测 5 进 3 出）。因此引用未发射 uuid 时
+  // 直接删除这两个字段：原生读端对缺 preserved 元数据的 boundary 是 no-op +
+  // 全史加载，比悬挂引用更保真。不做全量 rekey（§8: rekey 需覆盖 7+ 类交叉
+  // 引用，漏一类即静默丢上下文，宁缺勿错）。anchorUuid 例外：它按 §3 指向
+  // boundary/摘要自身（本对刚登记），不参与存活判定；保留段若真被投影保留
+  // （claude 源经 recordsRaw 或活跃链），其消息 uuid 已在 emittedUuids 中。
+  {
+    const emitted = ctx.state.emittedUuids;
+    const cmAll = (boundary.compactMetadata ?? {}) as {
+      preservedSegment?: { headUuid?: string; anchorUuid?: string; tailUuid?: string };
+      preservedMessages?: { anchorUuid?: string; uuids?: string[] };
+    };
+    const live = (refs: unknown[]): boolean =>
+      refs.every((u) => u === undefined || (typeof u === 'string' && emitted.has(u)));
+    const seg = cmAll.preservedSegment;
+    const pm = cmAll.preservedMessages;
+    const segDead = seg !== undefined && !live([seg.headUuid, seg.tailUuid]);
+    const pmDead = pm !== undefined && !live(Array.isArray(pm.uuids) ? pm.uuids : []);
+    if (segDead || pmDead) {
+      const cmClone = { ...(boundary.compactMetadata as Record<string, unknown>) };
+      if (segDead) delete cmClone.preservedSegment;
+      if (pmDead) delete cmClone.preservedMessages;
+      boundary.compactMetadata = cmClone;
+    }
   }
   if (typeof cm.logicalParentUuid === 'string') {
     boundary.logicalParentUuid = cm.logicalParentUuid;

@@ -418,9 +418,16 @@ export class ZcodeAdapter implements Adapter {
 
   async listSessions(root?: string): Promise<SessionMeta[]> {
     const dbPath = resolveDbPath(root);
+    // Only a genuinely ABSENT file means "no sessions to list". A store that
+    // exists but cannot be opened (WAL locked, copy fallback failed, corrupt
+    // file) or queries badly must surface as an error — an empty list from a
+    // readable-but-broken store would read as "nothing to migrate" and send
+    // the caller to the wrong next step.
     if (!dbPath || !existsSync(dbPath)) return [];
     const opened = await openLiveReadOnly(dbPath);
-    if (!opened) return [];
+    if (!opened) {
+      throw new Error(`Zcode: cannot open ${dbPath} read-only to list sessions (live WAL locked and copy failed) — aborting instead of returning an empty list`);
+    }
     try {
       // roots only (engine session/list roots:true): subagent_child /
       // selection_side_chat / workflow_* rows carry parent_id and are already
@@ -437,8 +444,6 @@ export class ZcodeAdapter implements Adapter {
         cwd: r.directory ? String(r.directory) : undefined,
         sourcePath: dbPath ?? undefined,
       }));
-    } catch {
-      return [];
     } finally {
       try { opened.db.close(); } catch { /* ignore */ }
     }
@@ -480,7 +485,7 @@ export class ZcodeAdapter implements Adapter {
       let paths: string[];
       try {
         db.exec('BEGIN IMMEDIATE');
-        paths = writeToDb(db, ir, newId, targetCwd);
+        paths = writeToDb(db, ir, newId, targetCwd, opts?.keepSynthetic ?? false);
         db.exec('COMMIT');
       } catch (e) {
         try { db.exec('ROLLBACK'); } catch { /* ignore */ }
@@ -1273,11 +1278,25 @@ interface WriteContext {
   agentLinks: Record<string, { childSessionId: string; agentId: string }>;
   callIdRemap: Map<string, string>;      // foreign tool_use id → call_<hex>
   results: Map<string, { content: string; isError: boolean }>;
+  /** true when the tool_result's call row is gone (empty id / unclaimed id) — such results degrade to user text lines. */
+  isOrphanResult?: (toolUseId: string) => boolean;
   subagentSlots: Array<{ toolUseId: string; childId: string; agentUuid: string; sidechain: MigratedSidechain }>;
   usedChildIds: Set<string>;
 }
 
-function writeToDb(db: DbHandle, ir: MigratedSession, newId: string, cwd: string): string[] {
+/** Session-row column values consumed from extensions['zcode.session'] (P1-B). */
+interface SessionRowDefaults {
+  /** engine version of the source store — restored instead of the built-in constant */
+  version?: string;
+  /** source permission JSON — restored instead of the built-in constant */
+  permission?: string;
+}
+
+function str(v: unknown): string | undefined {
+  return typeof v === 'string' && v ? v : undefined;
+}
+
+function writeToDb(db: DbHandle, ir: MigratedSession, newId: string, cwd: string, keepSynthetic = false): string[] {
   const now = Date.now();
   const extensions = (ir.extensions ?? {}) as Record<string, unknown>;
   const providers = (extensions['zcode.providers'] ?? {}) as Record<string, string>;
@@ -1292,16 +1311,35 @@ function writeToDb(db: DbHandle, ir: MigratedSession, newId: string, cwd: string
   const ctx: WriteContext = { db, cwd, providerIds, agentLinks, callIdRemap: new Map(), results: new Map(), subagentSlots: [], usedChildIds: new Set() };
 
   // pass 1: collect tool_result blocks (they always follow their call) — main
-  // messages and sidechain transcripts alike.
+  // messages and sidechain transcripts alike (nested levels included). Orphan
+  // results (empty toolUseId — the sanctioned no-pairing marker — or an id no
+  // tool_use claims) are deliberately NOT collected: they can never fuse back
+  // and writeMessages degrades them to a `[tool result]` user text line
+  // instead of silently dropping the content.
+  const pairedCallIds = new Set<string>();
   const collectResults = (messages: MigratedMessage[]): void => {
     for (const msg of messages) {
       for (const b of msg.content) {
-        if (b.type === 'tool_result') ctx.results.set(b.toolUseId, { content: b.content, isError: !!b.isError });
+        if (b.type === 'tool_use') pairedCallIds.add(b.id);
+      }
+    }
+    for (const msg of messages) {
+      for (const b of msg.content) {
+        if (b.type === 'tool_result' && b.toolUseId && pairedCallIds.has(b.toolUseId)) {
+          ctx.results.set(b.toolUseId, { content: b.content, isError: !!b.isError });
+        }
       }
     }
   };
+  const collectSidechainResults = (sidechains: MigratedSidechain[]): void => {
+    for (const sc of sidechains) {
+      collectResults(sc.messages);
+      collectSidechainResults(sc.sidechains ?? []);
+    }
+  };
   collectResults(ir.messages);
-  for (const sc of ir.sidechains ?? []) collectResults(sc.messages);
+  collectSidechainResults(ir.sidechains ?? []);
+  ctx.isOrphanResult = (toolUseId) => !toolUseId || !pairedCallIds.has(toolUseId);
 
   // pass 2: re-shape foreign call ids and bind sidechains to Agent tool_use
   // slots (extension link → prompt equality → order). Each bound sidechain is
@@ -1310,17 +1348,32 @@ function writeToDb(db: DbHandle, ir: MigratedSession, newId: string, cwd: string
   // sidecars/ledgers by parentToolUseId globally, so a preserved original
   // callID would re-link the migrated part to the SOURCE child session.
   const queue = [...(ir.sidechains ?? [])];
+  const slotBySidechain = new Map<MigratedSidechain, { toolUseId: string; childId: string; agentUuid: string }>();
   for (const msg of ir.messages) {
     for (const b of msg.content) {
       if (b.type !== 'tool_use' || !isSubagentToolName(b.name)) continue;
       const callId = remapCallId(ctx, b.id);
       const slot = pickSidechainForCall(ctx, b, queue);
-      if (slot) ctx.subagentSlots.push({ toolUseId: callId, childId: slot.childId, agentUuid: slot.agentUuid, sidechain: slot.sidechain });
+      if (slot) {
+        ctx.subagentSlots.push({ toolUseId: callId, childId: slot.childId, agentUuid: slot.agentUuid, sidechain: slot.sidechain });
+        slotBySidechain.set(slot.sidechain, { toolUseId: callId, childId: slot.childId, agentUuid: slot.agentUuid });
+      }
     }
   }
 
   const createdAt = ir.createdAt && ir.createdAt > 0 ? ir.createdAt : now;
   const paths: string[] = [];
+  // the extensions bucket read() just wrote carries the source store's own
+  // session-row columns. Only version/permission are consumed: they are
+  // store-level engine constants shared by every row of the source db. The
+  // per-row identity columns (slug/taskType) are NOT — an IR parsed from a
+  // CHILD session carries the child's extension, and grafting it onto the
+  // new ROOT row would mislabel it (subagent_child) or collide slugs.
+  const sessionExt = parseJsonObject(extensions['zcode.session']);
+  const sessionDefaults: SessionRowDefaults = {
+    version: str(sessionExt.version) ?? ENGINE_VERSION,
+    permission: str(sessionExt.permission) ?? DEFAULT_PERMISSION,
+  };
   insertSessionRow(db, {
     id: newId,
     parentId: null,
@@ -1330,28 +1383,52 @@ function writeToDb(db: DbHandle, ir: MigratedSession, newId: string, cwd: string
     updatedAt: now,
     taskType: 'interactive',
     titleSource: 'first_input',
+    defaults: sessionDefaults,
   });
   paths.push(`session:${newId}`);
-  writeMessages(db, ir.messages, newId, ctx, createdAt, 'zcode-agent', ir.toolCalls);
+  writeMessages(db, ir.messages, newId, ctx, createdAt, 'zcode-agent', ir.toolCalls, keepSynthetic);
 
   // pass 3: sidechains → subagent_child sessions (+ parent_id, engine's
-  // Cl('subagent_'+agentId) id convention).
-  for (const slot of ctx.subagentSlots) {
-    const sc = slot.sidechain;
-    const childAgent = sc.agentType ? `zcode-${sc.agentType}` : 'zcode-agent';
-    insertSessionRow(db, {
-      id: slot.childId,
-      parentId: newId,
-      directory: cwd,
-      title: firstUserText(sc.messages).split('\n')[0]?.slice(0, 120) || '(subagent)',
-      createdAt,
-      updatedAt: now,
-      taskType: 'subagent_child',
-      titleSource: 'first_input',
-    });
-    paths.push(`session:${slot.childId}`);
-    writeMessages(db, sc.messages, slot.childId, ctx, createdAt, childAgent, sc.toolCalls);
-  }
+  // Cl('subagent_'+agentId) id convention). Any sidechain no Agent call
+  // claimed is STILL written as a child session (a transcript must never be
+  // silently dropped); nested sc.sidechains recurse with the child's id as
+  // their parent — each level drains its own leftovers (matcher.drain idea).
+  const writeSidechainTree = (sidechains: MigratedSidechain[], parentRowId: string): void => {
+    for (const sc of sidechains) {
+      // drain fallback: only sidechains whose parent level never received a
+      // slot mapping get a synthetic child identity here — claimed ones reuse
+      // the identity bound in pass 2 (same agent uuid in tool part + session).
+      const claimed = slotBySidechain.get(sc);
+      let childId: string;
+      if (claimed) {
+        childId = claimed.childId;
+      } else {
+        let identity = deriveChildIdentity(sc);
+        for (let attempt = 0; attempt < 8 && (ctx.usedChildIds.has(identity.childId) || sessionIdExists(ctx.db, identity.childId)); attempt++) {
+          const freshUuid = randomUUID();
+          identity = { childId: `sess_subagent_agent_${freshUuid}`, agentUuid: freshUuid };
+        }
+        childId = identity.childId;
+      }
+      ctx.usedChildIds.add(childId);
+      const childAgent = sc.agentType ? `zcode-${sc.agentType}` : 'zcode-agent';
+      insertSessionRow(db, {
+        id: childId,
+        parentId: parentRowId,
+        directory: cwd,
+        title: sc.title ?? (firstUserText(sc.messages).split('\n')[0]?.slice(0, 120) || '(subagent)'),
+        createdAt: sc.createdAt ?? createdAt,
+        updatedAt: now,
+        taskType: 'subagent_child',
+        titleSource: 'first_input',
+        defaults: sessionDefaults,
+      });
+      paths.push(`session:${childId}`);
+      writeMessages(db, sc.messages, childId, ctx, createdAt, childAgent, sc.toolCalls, keepSynthetic);
+      writeSidechainTree(sc.sidechains ?? [], childId);
+    }
+  };
+  writeSidechainTree(ir.sidechains ?? [], newId);
   return paths;
 }
 
@@ -1419,8 +1496,9 @@ function deriveChildIdentity(sc: MigratedSidechain): { childId: string; agentUui
 
 function insertSessionRow(
   db: DbHandle,
-  s: { id: string; parentId: string | null; directory: string; title: string; createdAt: number; updatedAt: number; taskType: string; titleSource: string },
+  s: { id: string; parentId: string | null; directory: string; title: string; createdAt: number; updatedAt: number; taskType: string; titleSource: string; defaults?: SessionRowDefaults },
 ): void {
+  const d = s.defaults ?? {};
   try {
     db.prepare(
       'INSERT INTO session (id, parent_id, project_id, slug, directory, path, title, version, permission, time_created, time_updated, task_type, title_source) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)',
@@ -1428,12 +1506,12 @@ function insertSessionRow(
       s.id,
       s.parentId,
       zcodeProjectId(s.directory || '/'),
-      s.id,
+      s.id, // engine convention: slug == the row's own id
       s.directory || '/',
       s.directory || '/',
       s.title,
-      ENGINE_VERSION,
-      DEFAULT_PERMISSION,
+      d.version ?? ENGINE_VERSION,
+      d.permission ?? DEFAULT_PERMISSION,
       s.createdAt,
       s.updatedAt,
       s.taskType,
@@ -1452,7 +1530,11 @@ function insertSessionRow(
  * blocks are fused back into single 4-state tool parts — a matching
  * `toolCalls` record (typed lossless bucket) restores the exact native state
  * (status/title/metadata/time) and re-injects pending/running invocations
- * that have no replayable block; IR system messages become hidden
+ * that have no replayable block; ORPHAN tool_result blocks (call row gone)
+ * degrade to a `[tool result]` user text line instead of being dropped;
+ * IR `synthetic` messages are dropped by default (the engine owns its
+ * runtime context) and, with keepSynthetic, written as hidden
+ * system_reminder rows; IR system messages become hidden
  * system_reminder user rows; role:'tool' messages carry no row of their own
  * (results live in the tool parts).
  */
@@ -1464,6 +1546,7 @@ function writeMessages(
   baseTime: number,
   defaultAgent: string,
   toolCalls?: MigratedToolCall[],
+  keepSynthetic = false,
 ): void {
   let sequence = 0;
   let prevId: string | null = null;
@@ -1479,6 +1562,14 @@ function writeMessages(
 
     if (msg.role === 'tool') continue; // fused into the preceding assistant's tool parts
 
+    // harness-injected rows (IR `synthetic`): default drop — the target
+    // engine manages its own runtime context and replaying the source's
+    // would fight it (same discipline as the opencode write side).
+    // keepSynthetic (opt-in) keeps them as hidden system_reminder rows.
+    // Native zcode payload (meta.zcode.semantics) always wins: a row the
+    // SOURCE engine itself injected as a real prompt round-trips verbatim.
+    if (msg.synthetic === true && !zmeta?.semantics && !keepSynthetic) continue;
+
     if (msg.role === 'user' || msg.role === 'system' || msg.role === 'developer') {
       // developer (v3.1): project as an engine-injected user row —
       // system_reminder semantics stay provider-visible on replay; never fall
@@ -1491,11 +1582,25 @@ function writeMessages(
         !!(zmeta?.summary || (zmeta?.semantics as Row | undefined)?.kind === 'compact_summary');
       const textBlocks = msg.content.filter((b): b is { type: 'text'; text: string } => b.type === 'text');
       const fileBlocks = msg.content.filter((b): b is FileBlock => b.type === 'file');
-      if (!textBlocks.length && !fileBlocks.length && !isSummary) continue; // e.g. claude-style tool_result-only user rows
-      const parts: Array<{ data: Row; ts: number }> = textBlocks.map((b) => ({
+      // Orphan tool_result blocks (their call row is gone — empty toolUseId or
+      // an id no tool_use claims, e.g. a lost assistant row in the source):
+      // they can never fuse into a tool part, so degrade them to a visible
+      // user text line instead of silently dropping the content (the IR
+      // sanctions '' as the no-pairing marker; same idea as the opencode
+      // write side's orphan branch).
+      const orphanText = msg.content
+        .filter((b): b is Extract<ContentBlock, { type: 'tool_result' }> => b.type === 'tool_result' && !!ctx.isOrphanResult?.(b.toolUseId))
+        .map((b) => `[tool result] ${b.content}`)
+        .join('\n');
+      const textContent = textBlocks.length ? textBlocks : [];
+      if (!textContent.length && !fileBlocks.length && !isSummary && !orphanText) continue; // nothing replayable
+      const parts: Array<{ data: Row; ts: number }> = textContent.map((b) => ({
         data: { type: 'text', text: b.text, time: { start: ts, end: ts } },
         ts,
       }));
+      if (orphanText) {
+        parts.push({ data: { type: 'text', text: orphanText, time: { start: ts, end: ts } }, ts });
+      }
       for (const b of fileBlocks) {
         parts.push({
           data: {
@@ -1509,19 +1614,26 @@ function writeMessages(
         });
       }
       appendRawParts(parts, zmeta, ts);
+      const isSynthetic = msg.synthetic === true;
       const data: Row = {
         role: 'user',
         time: { created: ts },
         agent: zmeta?.agent ?? defaultAgent,
+        // semantics precedence: native zcode payload > harness-injection
+        // shape (synthetic/system/developer rows → system_reminder, hidden
+        // from the timeline but visible to the provider) > real_user prompt.
+        // `synthetic` rows that DID reach the engine as real prompts (native
+        // semantics on meta) keep their original semantics — only the plain
+        // IR flag without a native payload degrades to system_reminder.
         semantics: zmeta?.semantics
           ? zmeta.semantics
-          : isSystem
+          : isSystem || isSynthetic
             ? { origin: 'system', kind: 'system_reminder', uiVisibility: 'hidden', providerVisibility: 'visible', transcriptVisibility: 'hidden' }
             : { origin: 'real_user', kind: 'user_prompt', uiVisibility: 'visible', providerVisibility: 'visible', transcriptVisibility: 'visible' },
-        anchor: zmeta?.anchor ?? { turnId: `turn_${randomUUID()}`, origin: 'realUser' },
+        anchor: zmeta?.anchor ?? { turnId: `turn_${randomUUID()}`, origin: isSystem || isSynthetic ? 'system' : 'realUser' },
       };
       if (isSummary || zmeta?.summary) {
-        data.summary = zmeta?.summary ?? { body: textBlocks.map((b) => b.text).join('\n') };
+        data.summary = zmeta?.summary ?? { body: [...textContent, ...(orphanText ? [{ text: orphanText }] : [])].map((b) => b.text).join('\n') };
       }
       if (zmeta?.contextSnapshot) data.contextSnapshot = zmeta.contextSnapshot;
       if (zmeta?.tools) data.tools = zmeta.tools;
@@ -1529,6 +1641,7 @@ function writeMessages(
       if (zmeta?.synthetic) data.synthetic = true;
       if (zmeta?.source) data.source = zmeta.source;
       if (zmeta?.visibility) data.visibility = zmeta.visibility;
+      if (isSynthetic) data.synthetic = true;
       if (!isSystem) {
         const model = zmeta?.modelID
           ? { modelID: zmeta.modelID, ...(zmeta.providerID ? { providerID: zmeta.providerID } : {}), ...(zmeta.variant ? { variant: zmeta.variant } : {}) }
@@ -1572,14 +1685,25 @@ function writeMessages(
           : (looksLikeCallId(b.id) ? b.id : remapCallId(ctx, b.id));
         const record = recordByCallId.get(b.id) ?? recordByCallId.get(callId);
         const result = ctx.results.get(b.id) ?? ctx.results.get(callId);
+        // Native 4-state discipline: a call with NO record and NO result is a
+        // REAL pending invocation (the source was interrupted mid-flight) —
+        // fabricating completed+'' would violate the tool-part contract and
+        // drift on every re-parse. Write the native pending shape instead
+        // (status/input/raw), the same shape the engine itself persists.
+        const hasResult = result !== undefined || (record && record.status !== 'pending' && record.status !== 'running');
         const state: Row = {
-          status: record?.status ?? (result?.isError ? 'error' : 'completed'),
+          status: hasResult ? record?.status ?? (result?.isError ? 'error' : 'completed') : 'pending',
           input: record?.input !== undefined ? record.input : ((b.input && typeof b.input === 'object') ? b.input : tryParse(b.input)),
-          title: record?.title ?? b.name,
+          ...(hasResult ? { title: record?.title ?? b.name } : {}),
           time: record?.time ?? { start: ts, end: ts + 1 },
         };
-        if (state.status === 'error') state.error = record?.error ?? result?.content ?? 'tool call failed';
-        else state.output = record?.output ?? result?.content ?? '';
+        if (!hasResult) {
+          state.raw = '';
+        } else if (state.status === 'error') {
+          state.error = record?.error ?? result?.content ?? 'tool call failed';
+        } else {
+          state.output = record?.output ?? result?.content ?? '';
+        }
         const metadata: Row = { schemaVersion: 1, ...(record?.metadata ?? {}) };
         if (isSubagentToolName(b.name)) {
           const slot = ctx.subagentSlots.find((s) => s.toolUseId === callId);

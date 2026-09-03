@@ -526,7 +526,19 @@ export class DshAdapter implements Adapter {
     // (grandchildren) link to the WRITTEN parent id. Child headerRaw rides
     // through verbatim (delegationDepth/seedLength/agentPreset/…); identity
     // and linkage fields are overridden per written lifecycle.
+    // teammate 侧链显式丢弃（不再静默）：claude 的 teammate 语义（并协作者
+    // 之间的消息流）与 dsh 的 team/member、team/message（任务分派/投递事件）
+    // 不同构，转译需要单独调查（见 docs/agents/dsh.md 的登记）；在落地前，
+    // 盲目把 teammate 消息写成 dsh 子代理会话会歪曲会话语义。丢弃必须可见：
+    // 警告里给出数量与调查指引，绝不无声吞掉整类数据。
     const subagents = (ir.sidechains ?? []).filter((s) => s.kind === 'subagent');
+    const teammates = (ir.sidechains ?? []).filter((s) => s.kind !== 'subagent');
+    if (teammates.length > 0) {
+      // eslint-disable-next-line no-console -- migration-time visibility contract: silent drops are the bug class this guards
+      console.warn(
+        `[session-migrate/dsh] ${teammates.length} teammate sidechain(s) dropped (dsh has no native teammate channel — see docs/agents/dsh.md)`,
+      );
+    }
     const now = Date.now();
     let childCounter = 0;
     const writeSidechain = async (sc: MigratedSidechain, parentWrittenId: string, parentDepth: number): Promise<void> => {
@@ -541,7 +553,7 @@ export class DshAdapter implements Adapter {
         !sc.agentId.includes(':')
           ? sc.agentId
           : `session-${randomUUID()}`;
-      const childId = await this.claimFreeSessionId(sessionsRoot, cwd, candidate);
+      const childId = await this.claimFreeSessionId(sessionsRoot, this.childCwd(sc, scHeaderRaw, cwd), candidate);
       const childCreatedAt = now + ++childCounter;
       const rawDepth = scHeaderRaw?.delegationDepth;
       const childHeaderObj: Record<string, unknown> =
@@ -562,7 +574,14 @@ export class DshAdapter implements Adapter {
       if (childHeaderObj.agentPreset === undefined) childHeaderObj.agentPreset = sc.agentType ?? 'standard';
       delete childHeaderObj.sandboxMode;
       delete childHeaderObj.approvalPolicy;
-      if (cwd) childHeaderObj.cwd = cwd;
+      // 子会话 cwd 解析（此前被父 cwd 无条件覆盖）：优先 MigratedSidechain.cwd
+      // （ir.ts:187 的槽位——dsh 读端在 decodeSidechain 里按 header.cwd 填充），
+      // 其次子 headerRaw.cwd（独立迁移子代理会话时 header 保真携带），都非绝对
+      // 时回退父 cwd。与主会话同一条 isAbsolute 校验纪律：DSH 的 header 验证
+      // （path.isAbsolute）会拒绝相对 cwd——列表投影的编码骨架（"D-codes-foo"）
+      // 绝不能进 header。
+      const childCwd = this.childCwd(sc, scHeaderRaw, cwd);
+      if (childCwd) childHeaderObj.cwd = childCwd;
       else delete childHeaderObj.cwd;
       const childHeader = JSON.stringify(childHeaderObj);
       // Full mini-session buckets — a child log round-trips like a main log.
@@ -581,7 +600,10 @@ export class DshAdapter implements Adapter {
       const childEvents = irToEvents(childIr, childCreatedAt);
       const cFrame1 = buildSessionFrame(childHeader);
       const cFrame2 = buildEventsFrame(childEvents);
-      const cDir = join(sessionsRoot, dshProjectDirName(cwd), encodeSegment(childId));
+      // 子会话目录布局按「子自己的 cwd」落 project dir（与 header.cwd 同源，
+      // 上一行刚解析出的 childCwd）——此前用父 cwd 会让子会话在 DSH 的
+      // 工作区视图里挂到错误的 project 下。
+      const cDir = join(sessionsRoot, dshProjectDirName(childCwd), encodeSegment(childId));
       await fs.mkdir(cDir, { recursive: true });
       const cPayload = Buffer.concat([cFrame1, cFrame2]);
       const cPath = join(cDir, 'session.jsonl.zstd');
@@ -601,10 +623,10 @@ export class DshAdapter implements Adapter {
         throw e;
       }
       paths.push(cPath);
-      if (isDefaultRoot && cwd) {
+      if (isDefaultRoot && childCwd) {
         try {
           const { ensureWorkspaceRegistration } = await import('./workspace.js');
-          await ensureWorkspaceRegistration(sessionsRoot, cwd, childId, { isDefaultRoot });
+          await ensureWorkspaceRegistration(sessionsRoot, childCwd, childId, { isDefaultRoot });
         } catch {
           // best-effort
         }
@@ -734,6 +756,17 @@ export class DshAdapter implements Adapter {
     } catch {
       return false;
     }
+  }
+
+  /** 子会话 cwd 解析：sc.cwd（IR 槽位，优先）> 子 headerRaw.cwd > 父 cwd。
+   * 候选值必须通过 isAbsolute 校验（DSH header 契约），非绝对一律跳过取
+   * 下一级——与主会话 cwd 的降级纪律同款。返回 '' 表示 cwd-less（落 _no-cwd）。 */
+  private childCwd(sc: MigratedSidechain, scHeaderRaw: Record<string, unknown> | undefined, parentCwd: string): string {
+    const candidates = [sc.cwd, typeof scHeaderRaw?.cwd === 'string' ? scHeaderRaw.cwd : undefined];
+    for (const c of candidates) {
+      if (typeof c === 'string' && isAbsolute(c)) return c;
+    }
+    return parentCwd;
   }
 
   /** Return `preferred` when its artifact path is free; otherwise mint a fresh
@@ -914,6 +947,19 @@ export function buildIrFromEvents(header: { cwd?: string; createdAt?: number; id
           nodes.push(ev.seq);
           if (ev.type === 'tool/result') backfillToolCall(toolCallByCallId, cleanData, ev.time);
         }
+      } else {
+        // 零投影 surface 行（content.length === 0 的 assistant/message 是 DSH
+        // deriveEventMessage 的合法 null 形态；空投影 user 行同理）：不进
+        // messages[]，但绝不能整行蒸发——它是已知事件类型，原样落
+        // unmappedEvents 保住 dsh→dsh 往返（写端照常重发该行，零丢弃）。
+        unmappedEvents.push({
+          seq: ev.seq,
+          time: ev.time ?? 0,
+          type: ev.type,
+          data: cleanData,
+          ...(ev.surfaceOp !== undefined ? { surfaceOp: ev.surfaceOp as string } : {}),
+          ...((ev as { sourceEventSeqs?: number[] }).sourceEventSeqs ? { sourceEventSeqs: (ev as { sourceEventSeqs?: number[] }).sourceEventSeqs } : {}),
+        } as NonNullable<MigratedSession['unmappedEvents']>[number]);
       }
       continue;
     }
@@ -1468,7 +1514,11 @@ export function irToEvents(ir: MigratedSession, baseTime: number): DshEvent[] {
     // KNOWN_SESSION_EVENT_TYPES, and the envelope allowlist leaves no room for
     // a skip marker. Drop them here; the IR bucket keeps them for transfers to
     // harnesses that do understand the source's event vocabulary.
-    if (!DSH_KNOWN_EVENT_TYPES.has(ev.type)) continue;
+    // 例外：packed 3 种存储行（text-chunks 等）不属 catalog
+    // （docs/session-formats-audit.md 事件类型全表——catalog 51 种 vs packed 3
+    // 种是两套词汇表），读端 :790 早就在区分这两个集合。闸门必须两边都放行：
+    // 只查 catalog 会把含 packed 行的会话整份拒之门外（写出即拒载）。
+    if (!DSH_KNOWN_EVENT_TYPES.has(ev.type) && !PACKED_CHUNK_TYPES.has(ev.type)) continue;
     raw.push({
       time,
       type: ev.type,
@@ -1503,6 +1553,55 @@ export function irToEvents(ir: MigratedSession, baseTime: number): DshEvent[] {
     if (a.time !== b.time) return a.time - b.time;
     return (a._seq ?? 0) - (b._seq ?? 0);
   });
+
+  // 乱序 IR 修正 pass：DSH 的 tool-pairing 契约要求每个 tool/result 引用的
+  // callId 必须由更早的 tool/call 引入（孤儿 result 渲染为 ghost 兜底卡片，
+  // verifySessionLog 也按此判违规）。上面的 (time, _seq) 总排序只还原源流
+  // 顺序，不含「call 必须先于其 result」约束——跨工具合并或乱序 IR（result
+  // 载体消息时间戳早于配对 assistant）会把 result 排到 call 之前。修正：对
+  // 每个 tool/result，若其配对 call 行排在它之后，把该 call 行移到 result
+  // 紧前（其余相对顺序不动；此处 callId 都是写端席位 id 且一对一，同一
+  // result 不会配对多条 call）。seq 此刻尚未赋终值（连续重排在后），移动的
+  // 只是数组位置——最终 seq 由下面的 contiguous 赋值统一决定。
+  {
+    const callIdxByWrittenId = new Map<string, number[]>();
+    raw.forEach((r, i) => {
+      if (r.type !== 'tool/call') return;
+      const cid = (r.data as Record<string, unknown> | undefined)?.callId;
+      if (typeof cid === 'string' && cid) {
+        const list = callIdxByWrittenId.get(cid) ?? [];
+        list.push(i);
+        callIdxByWrittenId.set(cid, list);
+      }
+    });
+    for (let i = 0; i < raw.length; i++) {
+      const r = raw[i];
+      if (r.type !== 'tool/result') continue;
+      const src = ((r.data as { message?: { source?: { callId?: unknown } } } | undefined)?.message)?.source;
+      const cid = typeof src?.callId === 'string' ? src.callId : undefined;
+      if (!cid) continue;
+      const candidates = (callIdxByWrittenId.get(cid) ?? []).filter((j) => j !== undefined);
+      const callAfter = candidates.find((j) => j > i);
+      if (callAfter === undefined) continue;
+      // 配对 call 在 result 之后：把它（连同它占的席位）前移到 result 紧前。
+      // 多条候选时取最早的（它是 seq 序上应紧跟该 result 的那条）。
+      const [moved] = raw.splice(callAfter, 1);
+      raw.splice(i, 0, moved);
+      // 席位索引整体偏移 1（splice 掉一个再插回一个，之后的行索引不变，
+      // 之前的行 +1）——刷新索引表，防止同 id 的后续配对错位。
+      callIdxByWrittenId.clear();
+      raw.forEach((rr, k) => {
+        if (rr.type !== 'tool/call') return;
+        const c = (rr.data as Record<string, unknown> | undefined)?.callId;
+        if (typeof c === 'string' && c) {
+          const l = callIdxByWrittenId.get(c) ?? [];
+          l.push(k);
+          callIdxByWrittenId.set(c, l);
+        }
+      });
+      // moved 行现在恰好占据位置 i（result 紧前），继续扫描下一个 result。
+    }
+  }
 
   // Separate packed storage rows (seq0/time0) from seq-assigned events.
   // Packed rows must keep exactly {type, seq0, time0, data} — the decoder

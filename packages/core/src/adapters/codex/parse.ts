@@ -369,7 +369,8 @@ export async function scanRolloutMeta(path: string): Promise<RolloutMetaScan> {
 
 /* ------------------------------------------------------------------ */
 /* Records → IR                                                        */
-/* ------------------------------------------------------------------ */export interface IrBuildContext {
+/* ------------------------------------------------------------------ */
+export interface IrBuildContext {
   /** Newest-wins thread titles (session_index.jsonl). */
   titles?: Map<string, string>;
   /** Absolute path of the source rollout file — recorded into meta.codex. */
@@ -393,6 +394,11 @@ export function rolloutRecordsToIr(records: RolloutLineRaw[], ctx: IrBuildContex
   const unmapped: MigratedUnmappedEvent[] = [];
   const metaLines: CodexNativeRow[] = [];
   const pendingTurnBits: Array<{ kind: 'turnContext' | 'worldState'; row: CodexNativeRow; seq: number; time?: number }> = [];
+  // Stitched chains merge several files' lineSeq spaces: ids synthesized from
+  // a line position (`local_shell_<seq>` and friends) get a per-parse scope so
+  // two segments cannot mint the same id for different items. Single-file
+  // parses keep the legacy unscoped format byte-identically.
+  const scope = ctx.stitchedChain?.length ? `s${ctx.stitchedChain.length}` : undefined;
 
   for (let i = 0; i < records.length; i++) {
     const rec = records[i];
@@ -409,7 +415,7 @@ export function rolloutRecordsToIr(records: RolloutLineRaw[], ctx: IrBuildContex
       }
       case 'response_item': {
         const payload = (rec.payload ?? {}) as Record<string, unknown>;
-        const item = responseItemToMessage(payload, { ts, ordinal, clientAuthored, lineSeq: i });
+        const item = responseItemToMessage(payload, { ts, ordinal, clientAuthored, lineSeq: i, ...(scope ? { scope } : {}) });
         if (item) {
           flushTurnBits(item, pendingTurnBits);
           messages.push(item);
@@ -449,7 +455,7 @@ export function rolloutRecordsToIr(records: RolloutLineRaw[], ctx: IrBuildContex
       }
       case 'compacted': {
         const payload = (rec.payload ?? {}) as Record<string, unknown>;
-        const entry = compactedToEntry(payload, { ts, ordinal, lineSeq: i }, messages);
+        const entry = compactedToEntry(payload, { ts, ordinal, lineSeq: i, ...(scope ? { scope } : {}) }, messages);
         flushTurnBits(entry.summaryMessage, pendingTurnBits);
         // Anchor = the summary projection's index in messages[]; write-back
         // replaces that message with the native `compacted` record.
@@ -577,6 +583,15 @@ interface ItemCtx {
   ordinal?: number;
   clientAuthored: boolean;
   lineSeq: number;
+  /**
+   * Per-file disambiguator for synthesized ids (`local_shell_<scope>_<seq>` …):
+   * a stitched history_base chain concatenates several files' lineSeq spaces,
+   * so two segments can mint the same synthetic id for DIFFERENT items — which
+   * would falsely pair a tool_use with a foreign tool_result on write-back.
+   * Absent (empty) = single unscoped file (ids stay byte-identical to the
+   * legacy format for untouched sessions).
+   */
+  scope?: string;
 }
 
 function baseMeta(ctx: ItemCtx, itemType: string): CodexMessageMeta {
@@ -744,7 +759,7 @@ function responseItemToMessage(payload: Record<string, unknown>, ctx: ItemCtx): 
       if (payload.internal_chat_message_metadata_passthrough !== undefined) {
         meta.passthrough = payload.internal_chat_message_metadata_passthrough;
       }
-      const callId = hasCallId ? (payload.call_id as string) : `local_shell_${ctx.lineSeq}`;
+      const callId = hasCallId ? (payload.call_id as string) : `local_shell_${ctx.scope ? `${ctx.scope}_${ctx.lineSeq}` : ctx.lineSeq}`;
       return {
         role: 'assistant',
         content: [{ type: 'tool_use', id: callId, name: 'local_shell', input: payload.action ?? {} }],
@@ -764,7 +779,7 @@ function responseItemToMessage(payload: Record<string, unknown>, ctx: ItemCtx): 
       if (payload.internal_chat_message_metadata_passthrough !== undefined) {
         meta.passthrough = payload.internal_chat_message_metadata_passthrough;
       }
-      const callId = hasCallId ? (payload.call_id as string) : `tool_search_${ctx.lineSeq}`;
+      const callId = hasCallId ? (payload.call_id as string) : `tool_search_${ctx.scope ? `${ctx.scope}_${ctx.lineSeq}` : ctx.lineSeq}`;
       return {
         role: 'assistant',
         content: [{ type: 'tool_use', id: callId, name: 'tool_search', input: payload.arguments ?? {} }],
@@ -784,7 +799,7 @@ function responseItemToMessage(payload: Record<string, unknown>, ctx: ItemCtx): 
       if (payload.internal_chat_message_metadata_passthrough !== undefined) {
         meta.passthrough = payload.internal_chat_message_metadata_passthrough;
       }
-      const callId = hasCallId ? (payload.call_id as string) : `tool_search_out_${ctx.lineSeq}`;
+      const callId = hasCallId ? (payload.call_id as string) : `tool_search_out_${ctx.scope ? `${ctx.scope}_${ctx.lineSeq}` : ctx.lineSeq}`;
       return {
         role: 'tool',
         content: [{ type: 'tool_result', toolUseId: callId, content: JSON.stringify(payload.tools ?? []) }],
@@ -802,7 +817,7 @@ function responseItemToMessage(payload: Record<string, unknown>, ctx: ItemCtx): 
       }
       return {
         role: 'assistant',
-        content: [{ type: 'tool_use', id: itemId ?? `web_search_${ctx.lineSeq}`, name: 'web_search', input: payload.action ?? {} }],
+        content: [{ type: 'tool_use', id: itemId ?? `web_search_${ctx.scope ? `${ctx.scope}_${ctx.lineSeq}` : ctx.lineSeq}`, name: 'web_search', input: payload.action ?? {} }],
         timestamp,
         seq: ctx.ordinal ?? ctx.lineSeq,
         meta: { codex: meta },
@@ -816,7 +831,7 @@ function responseItemToMessage(payload: Record<string, unknown>, ctx: ItemCtx): 
       if (payload.internal_chat_message_metadata_passthrough !== undefined) {
         meta.passthrough = payload.internal_chat_message_metadata_passthrough;
       }
-      const callId = itemId ?? `image_gen_${ctx.lineSeq}`;
+      const callId = itemId ?? `image_gen_${ctx.scope ? `${ctx.scope}_${ctx.lineSeq}` : ctx.lineSeq}`;
       const useBlock: ContentBlock = {
         type: 'tool_use',
         id: callId,
@@ -1131,7 +1146,7 @@ interface CompactedBuild {
 
 function compactedToEntry(
   payload: Record<string, unknown>,
-  ctx: { ts: string; ordinal?: number | undefined; lineSeq: number },
+  ctx: { ts: string; ordinal?: number | undefined; lineSeq: number; scope?: string },
   _messages: MigratedMessage[],
 ): CompactedBuild {
   const summary = String(payload.message ?? '');
@@ -1155,7 +1170,7 @@ function compactedToEntry(
     const rhMessages: MigratedMessage[] = [];
     for (let i = 0; i < rh.length; i++) {
       const envelope = rh[i] as Record<string, unknown>;
-      const itemCtx: ItemCtx = { ts: ctx.ts, ordinal: ctx.ordinal, clientAuthored: false, lineSeq: i };
+      const itemCtx: ItemCtx = { ts: ctx.ts, ordinal: ctx.ordinal, clientAuthored: false, lineSeq: i, ...(ctx.scope ? { scope: ctx.scope } : {}) };
       const msg = responseItemToMessage(envelope, itemCtx) ?? placeholderMessage(envelope, i);
       rhMessages.push(msg);
     }

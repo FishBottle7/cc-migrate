@@ -1002,3 +1002,175 @@ test('verifySessionLog flags an orphan tool/result as a tool-pairing issue', () 
   const ok = verifySessionLog(paired, 'v-pair', 'mem');
   assert.ok(ok.ok, `paired log passes: ${JSON.stringify(ok.issues)}`);
 });
+
+/* ------------------------------------------------------------------ */
+/* P1-A 回归：子 sidechain cwd 解析（sc.cwd > headerRaw.cwd > 父 cwd）    */
+/* ------------------------------------------------------------------ */
+test('child sidechain cwd: sc.cwd wins over parent cwd (own project dir + header)', async () => {
+  const adapter = new DshAdapter();
+  const root = await tempRoot();
+  const ir = {
+    schemaVersion: 2 as const,
+    originTool: 'dsh' as const,
+    createdAt: 1000,
+    messages: [{ role: 'user' as const, timestamp: 1000, content: [{ type: 'text' as const, text: 'parent' }] }],
+    sidechains: [{
+      agentId: 'child-own-cwd',
+      kind: 'subagent' as const,
+      // IR 槽位（ir.ts MigratedSidechain.cwd）携带子会话自己的 cwd
+      cwd: 'D:\\child-wt',
+      messages: [{ role: 'user' as const, timestamp: 1001, content: [{ type: 'text' as const, text: 'child' }] }],
+      meta: { dsh: { headerRaw: { version: 0, id: 'child-own-cwd', createdAt: 10, origin: 'subagent', delegationDepth: 1 } } },
+    }],
+  };
+  const res = await adapter.write(ir as never, { root, sessionId: 'cwd-sc', targetCwd: 'D:\\proj' });
+  // 子会话落在「子 cwd」自己的 project dir 下，不是父的
+  const childPath = res.paths.find((p) => p.includes('child-own-cwd'))!;
+  assert.ok(childPath.includes('--D-child-wt--'), 'child session lands under its OWN cwd project dir');
+  const header = JSON.parse(decompressSessionBuffer(await fs.readFile(childPath)).split('\n')[0]);
+  assert.equal(header.cwd, 'D:\\child-wt', 'child header.cwd is the sidechain cwd, not the parent override');
+  // 父会话不受影响（仍在父 project dir）
+  assert.ok(res.paths[0]!.includes('--D-proj--'), 'parent stays in its own project dir');
+});
+
+test('child sidechain cwd: headerRaw.cwd is the fallback when sc.cwd is absent', async () => {
+  const adapter = new DshAdapter();
+  const root = await tempRoot();
+  const ir = {
+    schemaVersion: 2 as const,
+    originTool: 'dsh' as const,
+    createdAt: 1000,
+    messages: [{ role: 'user' as const, timestamp: 1000, content: [{ type: 'text' as const, text: 'parent' }] }],
+    sidechains: [{
+      agentId: 'child-hdr-cwd',
+      kind: 'subagent' as const,
+      messages: [{ role: 'user' as const, timestamp: 1001, content: [{ type: 'text' as const, text: 'child' }] }],
+      // 无 sc.cwd——独立迁移子会话时 headerRaw 里保真的 cwd 兜底
+      meta: { dsh: { headerRaw: { version: 0, id: 'child-hdr-cwd', createdAt: 10, origin: 'subagent', delegationDepth: 1, cwd: 'D:\\hdr-wt' } } },
+    }],
+  };
+  const res = await adapter.write(ir as never, { root, sessionId: 'cwd-hdr', targetCwd: 'D:\\proj' });
+  const childPath = res.paths.find((p) => p.includes('child-hdr-cwd'))!;
+  const header = JSON.parse(decompressSessionBuffer(await fs.readFile(childPath)).split('\n')[0]);
+  assert.equal(header.cwd, 'D:\\hdr-wt', 'headerRaw.cwd used when sc.cwd is absent');
+  assert.ok(childPath.includes('--D-hdr-wt--'), 'child lands under the headerRaw cwd project dir');
+});
+
+test('child sidechain cwd: non-absolute candidates fall back to the parent cwd', async () => {
+  const adapter = new DshAdapter();
+  const root = await tempRoot();
+  const ir = {
+    schemaVersion: 2 as const,
+    originTool: 'dsh' as const,
+    createdAt: 1000,
+    messages: [{ role: 'user' as const, timestamp: 1000, content: [{ type: 'text' as const, text: 'parent' }] }],
+    sidechains: [{
+      agentId: 'child-skel',
+      kind: 'subagent' as const,
+      // 列表投影的编码骨架（非绝对）——绝不能进 header（DSH isAbsolute 拒载）
+      cwd: 'D-codes-someproj',
+      messages: [{ role: 'user' as const, timestamp: 1001, content: [{ type: 'text' as const, text: 'child' }] }],
+      meta: { dsh: { headerRaw: { version: 0, id: 'child-skel', createdAt: 10, origin: 'subagent', delegationDepth: 1, cwd: 'also-not-absolute' } } },
+    }],
+  };
+  const res = await adapter.write(ir as never, { root, sessionId: 'cwd-skel', targetCwd: 'D:\\proj' });
+  const childPath = res.paths.find((p) => p.includes('child-skel'))!;
+  const header = JSON.parse(decompressSessionBuffer(await fs.readFile(childPath)).split('\n')[0]);
+  assert.equal(header.cwd, 'D:\\proj', 'non-absolute candidates rejected; parent cwd used');
+  assert.ok(childPath.includes('--D-proj--'), 'child lands under the parent cwd project dir');
+});
+
+/* ------------------------------------------------------------------ */
+/* P1-B 回归：零投影 surface 行（空 content assistant）不蒸发，          */
+/* 落 unmappedEvents 且往返存活                                         */
+/* ------------------------------------------------------------------ */
+test('zero-projection surface rows land in unmappedEvents and survive the round-trip', async () => {
+  const adapter = new DshAdapter();
+  const root = await tempRoot();
+  // 空 content 的 assistant/message 是 DSH deriveEventMessage 的合法 null
+  // 形态（docs/agents/dsh.md「事件与 Surface」）——此前 buildIrFromEvents
+  // 对它整行蒸发（既不进 messages 也不进 unmapped）。
+  const raw: DshEventLike[] = [
+    { seq: 0, type: 'turn/start', time: 1, data: { turn: 1 } },
+    { seq: 1, type: 'step/start', time: 1, data: { turn: 1, step: 1 } },
+    { seq: 2, type: 'user/message', surfaceOp: 'append', time: 2, data: { id: 'u1', role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: 'q' }] } },
+    { seq: 3, type: 'assistant/message', surfaceOp: 'append', time: 3, data: { turn: 1, step: 1, message: { id: 'a-empty', role: 'assistant', source: { kind: 'model', provider: 'p', model: 'm' }, content: [] } } },
+    { seq: 4, type: 'assistant/message', surfaceOp: 'append', time: 4, data: { turn: 1, step: 1, message: { id: 'a-full', role: 'assistant', source: { kind: 'model', provider: 'p', model: 'm' }, content: [{ type: 'text', text: 'answer' }] } } },
+  ];
+  const ir = buildIrFromEvents({ id: 's1', createdAt: 1 }, raw as never);
+  // 空投影行不进 messages，但必须在 unmappedEvents 里（零丢弃）
+  assert.equal(ir.messages.length, 2, 'only the projected rows surface');
+  const unmappedEmpty = (ir.unmappedEvents ?? []).find((e) => e.type === 'assistant/message');
+  assert.ok(unmappedEmpty, 'empty assistant row archived to unmappedEvents (not vaporized)');
+  assert.equal(unmappedEmpty!.seq, 3);
+  const rawRow = unmappedEmpty!.data as { message?: { id?: string } };
+  assert.equal(rawRow.message?.id, 'a-empty', 'payload preserved verbatim');
+
+  // 写回：行存在（已知类型，写端照常重发）
+  const res = await adapter.write(ir, { root, sessionId: 'empty-surface', targetCwd: 'D:\\proj' });
+  const rows = decompressSessionBuffer(await fs.readFile(res.paths[0]!)).split('\n').filter((l) => l.trim()).slice(1).map((l) => JSON.parse(l)) as DshEventLike[];
+  const emptyRow = rows.find((r) => r.type === 'assistant/message' && ((r.data as { message?: { id?: string } }).message?.id === 'a-empty'));
+  assert.ok(emptyRow, 'empty assistant row re-emitted on write-back');
+  // 双程回读：unmappedEvents 里还在
+  const back = await adapter.parse('empty-surface', root);
+  const backEmpty = (back.unmappedEvents ?? []).find((e) => e.type === 'assistant/message');
+  assert.ok(backEmpty, 'empty assistant row survives the full round-trip');
+  assert.equal(((backEmpty!.data as { message?: { id?: string } }).message?.id), 'a-empty');
+  const verdict = verifySessionLog(decompressSessionBuffer(await fs.readFile(res.paths[0]!)), 'empty-surface', res.paths[0]!);
+  assert.ok(verdict.ok, `verifySessionLog passes: ${JSON.stringify(verdict.issues ?? []).slice(0, 300)}`);
+});
+
+/* ------------------------------------------------------------------ */
+/* P1-C 回归：teammate 侧链显式丢弃——写不炸、警告可见、产物无残留        */
+/* ------------------------------------------------------------------ */
+test('teammate sidechains: explicit drop with a visible warning, no teammate content in the artifacts', async () => {
+  const adapter = new DshAdapter();
+  const root = await tempRoot();
+  const ir = {
+    schemaVersion: 2 as const,
+    originTool: 'claude' as const,
+    createdAt: 1000,
+    messages: [{ role: 'user' as const, timestamp: 1000, content: [{ type: 'text' as const, text: 'main thread' }] }],
+    sidechains: [
+      {
+        agentId: 'tm-1',
+        kind: 'teammate' as const,
+        messages: [{ role: 'user' as const, timestamp: 1001, content: [{ type: 'text' as const, text: 'TEAMMATE SECRET PAYLOAD' }] }],
+      },
+      {
+        agentId: 'sub-1',
+        kind: 'subagent' as const,
+        messages: [{ role: 'user' as const, timestamp: 1002, content: [{ type: 'text' as const, text: 'subagent content' }] }],
+      },
+    ],
+  };
+  // 警告路径可触发：console.warn 必须为 teammate 丢弃发出一条可见警告
+  const warnings: string[] = [];
+  const origWarn = console.warn;
+  console.warn = (...args: unknown[]) => { warnings.push(args.map(String).join(' ')); };
+  let res: { sessionId: string; paths: string[] };
+  try {
+    res = await adapter.write(ir as never, { root, sessionId: 'tm-drop', targetCwd: 'D:\\proj' });
+  } finally {
+    console.warn = origWarn;
+  }
+  const dropped = warnings.find((w) => w.includes('teammate sidechain'));
+  assert.ok(dropped, `a visible warning is emitted for dropped teammate sidechains: ${JSON.stringify(warnings)}`);
+  assert.ok(dropped!.includes('1 teammate sidechain'), 'warning carries the drop count');
+  assert.ok(dropped!.includes('docs/agents/dsh.md'), 'warning points at the documented rationale');
+
+  // 不炸：写入成功；subagent 子会话照常写出，teammate 不落任何产物
+  assert.equal(res.paths.length, 2, 'main + subagent child only (teammate dropped)');
+  for (const p of res.paths) {
+    const plain = decompressSessionBuffer(await fs.readFile(p));
+    assert.ok(!plain.includes('TEAMMATE SECRET PAYLOAD'), `no teammate content leaks into artifact ${p}`);
+  }
+  const projDir = join(root, '--D-proj--');
+  const dirs = await fs.readdir(projDir);
+  assert.equal(dirs.length, 2, 'exactly main + subagent dirs (no teammate dir)');
+  // teammate 与 subagent 的语义边界锁死：subagent 内容存活
+  const back = await adapter.parse('tm-drop', root);
+  assert.equal(back.sidechains?.length, 1);
+  assert.equal(back.sidechains![0].kind, 'subagent');
+  assert.equal((back.sidechains![0].messages[0].content[0] as { text: string }).text, 'subagent content');
+});

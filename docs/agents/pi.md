@@ -129,7 +129,7 @@ pi-mono 内部正在长一套**新的 harness 会话层**（`packages/agent/src/
 | 2 | `branch_summary` entry（fromId/summary/details?/usage?/fromHook?） | `branchSummaries[]` 扩展为 `{fromId, summary, anchorIndex?, time?, meta?}` + anchor 消息 | v3 计划承诺的「Pi 保留 branchSummaries」兑现 |
 | 3 | `session_info`（name，含显式清除语义） | `title`（最新非空即用；清除语义进 `meta.pi.titleCleared`） | |
 | 4 | `model_change`/`thinking_level_change` 序列（历史变更，含位置） | 推导态（最后值）入既有 `model`/`thinkingLevel`；**全序列**进 `meta.pi.settingsEvents`（写回按序重放） | 现适配器只取 last，序列丢弃 |
-| 5 | `label`（targetId/label/清除） | `meta.pi.labels: {targetId, label?, time}[]` | 书签是用户手工标记，丢=丢用户数据 |
+| 5 | `label`（targetId/label/清除） | `meta.pi.labels: {targetId, label?, time, anchorIndex?}[]`（2026-09-03 审查修复加 `anchorIndex`——写端经它把 targetId 重映射到本次生成的新 entry id；无此映射的 label 写回必被 `byId.has` guard 拒，见 ir-protocol.md 审查登记节） | 书签是用户手工标记，丢=丢用户数据 |
 | 6 | `custom` entry（customType/data） | `meta.pi.customEntries: {customType, data, time}[]` | 扩展状态持久化 |
 | 7 | `custom_message` entry（customType/content/display/details） | `messages[]` user 行（content 按 §3 投影）+ `synthetic:true` + `meta.pi.customMessage`（customType/display/details） | 进 context 的扩展注入，必须随消息走 |
 | 8 | `assistant` 消息 9 个无槽位字段 | `meta.pi.message`（api/responseModel/responseId/deferred/errorMessage/rawStopReason/endTurn/diagnostics/usage 中除已映射 stopReason 之外者） | 挂消息实体（勿 id 旁表）；IR 已有 `usage` 概念先例（`meta.dsh.usage`） |

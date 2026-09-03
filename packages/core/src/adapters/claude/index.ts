@@ -81,13 +81,16 @@ export class ClaudeAdapter implements Adapter {
 
     let newId = opts?.sessionId ?? randomUUID();
     const dir = join(projectsRoot, claudeProjectDirName(targetCwd));
-    const finalPath = join(dir, `${newId}.jsonl`);
+    let finalPath = join(dir, `${newId}.jsonl`);
     if (await exists(finalPath)) {
-      // 目标位置已有同 id 文件：换号重写，绝不覆盖（§6#2）
+      // 目标位置已有同 id 文件：换号重写，绝不覆盖（§6#2）。
+      // 换号后 finalPath 必须同步重算（P1-B），否则新内容仍指向旧路径 ——
+      // 'wx' 因文件已存在而失败，newId 也与落盘文件名不一致。
       if (opts?.sessionId) {
         throw new Error(`Claude: refusing to overwrite existing session file ${finalPath}`);
       }
       newId = randomUUID();
+      finalPath = join(dir, `${newId}.jsonl`);
     }
 
     const keepSynthetic = opts?.keepSynthetic === true;

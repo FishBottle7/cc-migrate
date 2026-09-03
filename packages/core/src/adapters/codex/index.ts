@@ -31,9 +31,6 @@ import {
   findRolloutById,
   loadSessionIndexTitles,
   parseRolloutFile,
-  rolloutRecordsToIr,
-  parseRolloutLines,
-  readRolloutText,
   scanRolloutHead,
   scanRolloutMeta,
 } from './parse.js';
@@ -49,14 +46,16 @@ export class CodexAdapter implements Adapter {
     if (!codexHome) throw new Error('Codex: cannot resolve CODEX_HOME/.codex');
     const path = await findRolloutById(codexHome, sessionId);
     if (!path) throw new Error(`Codex: session "${sessionId}" not found under ${codexHome}`);
-    const titles = await loadSessionIndexTitles(codexHome);
-    const text = await readRolloutText(path);
-    const ir = rolloutRecordsToIr(parseRolloutLines(text), { titles, sourcePath: path });
+    // parseRolloutFile (not parseRolloutLines + rolloutRecordsToIr): only the
+    // file-level entry resolves `session_meta.history_base` prefix chains —
+    // going straight at the records would silently lose everything before the
+    // paginated cut (P0 review finding). It also covers titles + sourcePath.
+    const ir = await parseRolloutFile(path, codexHome);
     // Read side of the write-side subagent expansion: native codex subagent
     // threads are separate rollout files linked via session_meta thread_spawn
     // — stitch them into ir.sidechains (recursively for grandchildren).
     const byParent = await subagentChildIndex(codexHome);
-    const stitched = await loadSubagentTree(sessionId, ir, byParent, titles, new Set([sessionId]));
+    const stitched = await loadSubagentTree(sessionId, ir, byParent, new Set([sessionId]));
     if (stitched.length) ir.sidechains = stitched;
     return validateSession(ir);
   }
@@ -137,7 +136,12 @@ export class CodexAdapter implements Adapter {
   }
 }
 
-async function appendSessionIndex(codexHome: string, threadId: string, threadName: string): Promise<void> {
+async function appendSessionIndex(codexHome: string, threadId: string, threadName: string | undefined): Promise<void> {
+  // An untitled session gets NO index row at all: codex only appends one when
+  // it actually learned a name, and a migrated '(untitled)' placeholder would
+  // fabricate a record codex itself never writes (listSessions falls back to
+  // the head-scan title for index-less threads).
+  if (!threadName) return;
   const entry = {
     id: threadId,
     thread_name: threadName,
@@ -288,18 +292,16 @@ async function loadSubagentTree(
   parentId: string,
   parentIr: MigratedSession,
   byParent: Map<string, SubagentChildInfo[]>,
-  titles: Map<string, string>,
   visited: Set<string>,
 ): Promise<MigratedSidechain[]> {
   const out: MigratedSidechain[] = [];
   for (const info of byParent.get(parentId) ?? []) {
     if (visited.has(info.threadId)) continue;
     visited.add(info.threadId);
-    const text = await readRolloutText(info.path);
-    const child = rolloutRecordsToIr(parseRolloutLines(text), { titles, sourcePath: info.path });
+    const child = await parseRolloutFile(info.path);
     const label =
       info.agentNickname ?? info.agentRole ?? info.agentPath?.split('/').filter(Boolean).pop();
-    const nested = await loadSubagentTree(info.threadId, child, byParent, titles, visited);
+    const nested = await loadSubagentTree(info.threadId, child, byParent, visited);
     out.push({
       agentId: info.threadId,
       kind: 'subagent',

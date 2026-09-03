@@ -137,8 +137,11 @@ export function verifySessionLog(plain: string, sessionId: string, path: string)
     const fail = (check: VerifyIssue['check'], message: string) => issues.push({ line: lineNo, seq: isSafeInt(ev.seq) ? (ev.seq as number) : isSafeInt(ev.seq0) ? (ev.seq0 as number) : undefined, check, message });
 
     // DSH refuses a whole log containing any event type outside its known set
-    // (assertEventsSupported — no per-row skip mechanism exists).
-    if (!DSH_KNOWN_EVENT_TYPES.has(type)) {
+    // (assertEventsSupported — no per-row skip mechanism exists). Packed
+    // storage rows (text-chunks 等 3 种) sit OUTSIDE the catalog by design
+    // (docs/session-formats-audit.md 事件类型全表) but are perfectly loadable
+    // — their contract is the {seq0,time0,data} envelope checked below.
+    if (!DSH_KNOWN_EVENT_TYPES.has(type) && !PACKED_ROW_TYPES.has(type)) {
       fail('event-type', `event type ${JSON.stringify(type)} is unknown to DSH — the loader refuses the whole log`);
     }
 

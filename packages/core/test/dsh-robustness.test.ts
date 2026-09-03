@@ -12,7 +12,7 @@ import assert from 'node:assert/strict';
 import { promises as fs } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { DshAdapter } from '../src/adapters/dsh/index.js';
+import { DshAdapter, irToEvents } from '../src/adapters/dsh/index.js';
 import { decompressSessionBuffer } from '../src/adapters/dsh/format.js';
 import { verifySessionLog } from '../src/adapters/dsh/verify.js';
 import { fallbackIr } from '../src/demo.js';
@@ -236,4 +236,129 @@ test('sidechain write path (claimFree) is unaffected by the main-session collisi
   assert.equal(back1.sidechains![0].agentId, 'sc-child-1');
   assert.notEqual(back2.sidechains![0].agentId, 'sc-child-1');
   assert.equal((back2.sidechains![0].messages[0].content[0] as { text: string }).text, 'child of p2', '内容不串树');
+});
+
+/* ------------------------------------------------------------------ */
+/* 6. P0-A 回归：packed 存储行（text-chunks 等 3 种）写出后必须可载      */
+/*    —— 写端 unknown-type 闸门曾只查 catalog，把含 packed 行的会话      */
+/*      整份拒载（写出即拒载）；packed 与 catalog 是两套词汇表            */
+/* ------------------------------------------------------------------ */
+test('packed storage rows survive the unknown-type write gate (written log passes verifySessionLog)', async () => {
+  const adapter = new DshAdapter();
+  const root = await tempRoot();
+  // dsh→dsh 典型形状：unmappedEvents 里带 packed 行（读端 buildIrFromEvents
+  // 把 seq0/time0 行原样归档进 unmapped）+ 一条普通已知类型行对照
+  const ir = {
+    schemaVersion: 2 as const,
+    originTool: 'dsh' as const,
+    createdAt: 1000,
+    messages: [{ role: 'user' as const, timestamp: 1000, content: [{ type: 'text' as const, text: 'q' }] }],
+    unmappedEvents: [
+      { seq: 2, time: 1002, type: 'text-chunks', data: { turn: 1, step: 1, index: 0, texts: ['hello', ' world'] } },
+      { seq: 4, time: 1004, type: 'reasoning-chunks', data: { turn: 1, step: 1, index: 0, texts: ['think'] } },
+      { seq: 6, time: 1006, type: 'tool-call-chunks', data: { turn: 1, step: 1, index: 0, args: ['{"p":"x"}'] } },
+      { seq: 7, time: 1007, type: 'approval/asked', data: { kind: 'bash' } },
+    ],
+  };
+  const res = await adapter.write(ir as never, { root, sessionId: 'packed-gate', targetCwd: 'D:\\proj' });
+  const rows = (await readLog(res.paths[0])).slice(1) as Array<Record<string, unknown>>;
+
+  // 三种 packed 行都以 {type,seq0,time0,data} 存储行形态落盘（不是被闸门吞掉）
+  const packed = rows.filter((r) => ['text-chunks', 'reasoning-chunks', 'tool-call-chunks'].includes(String(r.type)));
+  assert.equal(packed.length, 3, 'packed 3 行全部写出（闸门放行）');
+  for (const p of packed) {
+    assert.ok(typeof p.seq0 === 'number', 'packed 行用 seq0 而非 seq');
+    assert.ok(typeof p.time0 === 'number', 'packed 行用 time0 而非 time');
+    assert.equal(p.seq, undefined, 'packed 行绝不携带 seq 键（envelope 精确键契约）');
+    assert.equal(p.time, undefined, 'packed 行绝不携带 time 键');
+  }
+  // 已知非 surface 类型照常重发
+  assert.ok(rows.some((r) => r.type === 'approval/asked'), 'known non-surface type replayed');
+  // 物理契约全过：event-type 检查不再把 packed 行误判为 unknown-to-DSH
+  const verdict = verifySessionLog(decompressSessionBuffer(await fs.readFile(res.paths[0])), 'packed-gate', res.paths[0]);
+  assert.ok(verdict.ok, `verifySessionLog passes: ${JSON.stringify(verdict.issues ?? []).slice(0, 300)}`);
+
+  // 往返：parse 回来 packed 行仍在 unmapped（seq0/time0 保真）
+  const back = await adapter.parse('packed-gate', root);
+  const backPacked = (back.unmappedEvents ?? []).filter((e) => e.type === 'text-chunks');
+  assert.equal(backPacked.length, 1, 'text-chunks 行往返存活');
+  assert.deepEqual(backPacked[0].data, { turn: 1, step: 1, index: 0, texts: ['hello', ' world'] }, 'payload 原样');
+});
+
+/* ------------------------------------------------------------------ */
+/* 7. P0-B 回归：乱序 IR（result 载体消息时间戳早于配对 assistant）写出  */
+/*    后 call 必须先于 result——总排序只有 (time,_seq)，不含配对约束      */
+/* ------------------------------------------------------------------ */
+test('out-of-order IR: the pairing correction pass moves tool/call ahead of its tool/result', async () => {
+  const adapter = new DshAdapter();
+  const root = await tempRoot();
+  // 复现审查坐实的形状：tool/result 载体消息（t=1001, seq=3）排在带
+  // tool_use 的 assistant（t=1002, seq=5）之前——(time,_seq) 总排序会把
+  // result 排到 call 前，DSH 判 tool-pairing 违规（ghost 兜底卡片）。
+  const ir = {
+    schemaVersion: 2 as const,
+    originTool: 'zcode' as const,
+    createdAt: 1000,
+    messages: [
+      { role: 'user' as const, timestamp: 1000, seq: 0, content: [{ type: 'text' as const, text: 'run it' }] },
+      { role: 'tool' as const, timestamp: 1001, seq: 3, content: [{ type: 'tool_result' as const, toolUseId: 'call_x', content: 'done', isError: false }] },
+      { role: 'assistant' as const, timestamp: 1002, seq: 5, content: [{ type: 'tool_use' as const, id: 'call_x', name: 'read', input: { path: 'a.txt' } }] },
+    ],
+  };
+  const res = await adapter.write(ir as never, { root, sessionId: 'pair-order', targetCwd: 'D:\\proj' });
+  const rows = (await readLog(res.paths[0])).slice(1) as Array<{ seq: number; type: string; data: Record<string, unknown> }>;
+
+  // call 排在 result 紧前（或更早），配对 id 一致
+  const callIdx = rows.findIndex((r) => r.type === 'tool/call');
+  const resultIdx = rows.findIndex((r) => r.type === 'tool/result');
+  assert.ok(callIdx >= 0, 'tool/call emitted');
+  assert.ok(resultIdx >= 0, 'tool/result emitted');
+  assert.ok(callIdx < resultIdx, `tool/call (idx ${callIdx}) must precede its tool/result (idx ${resultIdx})`);
+  const callId = rows[callIdx].data.callId as string;
+  const resultPair = ((rows[resultIdx].data.message as Record<string, unknown>).source as Record<string, unknown>).callId;
+  assert.equal(resultPair, callId, 'pairing reference intact');
+  // 物理契约：tool-pairing 检查过（不再产生引用早前不存在的 call 的孤儿）
+  const verdict = verifySessionLog(decompressSessionBuffer(await fs.readFile(res.paths[0])), 'pair-order', res.paths[0]);
+  assert.ok(verdict.ok, `verifySessionLog passes: ${JSON.stringify(verdict.issues ?? []).slice(0, 300)}`);
+  // 写出→parse 往返：消息守恒
+  const back = await adapter.parse('pair-order', root);
+  assert.equal(back.messages.length, ir.messages.length, 'message count conserved');
+  assert.equal(back.messages.filter((m) => m.role === 'tool').length, 1, 'tool result row survives');
+});
+
+/* ------------------------------------------------------------------ */
+/* 8. P0-B 纯翻译器：irToEvents 的输出顺序契约（不落盘直接断言）        */
+/* ------------------------------------------------------------------ */
+test('irToEvents: call-before-result ordering holds for out-of-order IR at the pure translator level', () => {
+  const ir = {
+    schemaVersion: 2 as const,
+    originTool: 'zcode' as const,
+    createdAt: 1000,
+    messages: [
+      { role: 'user' as const, timestamp: 1000, seq: 0, content: [{ type: 'text' as const, text: 'q' }] },
+      { role: 'tool' as const, timestamp: 1001, seq: 3, content: [{ type: 'tool_result' as const, toolUseId: 'call_a', content: 'r-a' }] },
+      { role: 'tool' as const, timestamp: 1001, seq: 4, content: [{ type: 'tool_result' as const, toolUseId: 'call_b', content: 'r-b' }] },
+      { role: 'assistant' as const, timestamp: 1002, seq: 5, content: [
+        { type: 'tool_use' as const, id: 'call_a', name: 'read', input: {} },
+        { type: 'tool_use' as const, id: 'call_b', name: 'read', input: {} },
+      ] },
+    ],
+  };
+  const events = irToEvents(ir as never, 1000) as Array<{ seq: number; type: string; data: Record<string, unknown> }>;
+  // 每个 call 的首次出现位置先于配对 result 的位置
+  const firstCallAt = new Map<string, number>();
+  events.forEach((e, i) => {
+    if (e.type !== 'tool/call') return;
+    const cid = String(e.data.callId);
+    if (!firstCallAt.has(cid)) firstCallAt.set(cid, i);
+  });
+  events.forEach((e, i) => {
+    if (e.type !== 'tool/result') return;
+    const cid = String(((e.data.message as Record<string, unknown>).source as Record<string, unknown>).callId);
+    const at = firstCallAt.get(cid);
+    assert.ok(at !== undefined, `result ${cid} has a call row`);
+    assert.ok(at! < i, `call ${cid} (pos ${at}) precedes its result (pos ${i})`);
+  });
+  // seq 连续性不受移动影响
+  events.forEach((e, i) => assert.equal(e.seq, i, `seq[${i}] contiguous`));
 });

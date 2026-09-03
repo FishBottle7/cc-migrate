@@ -448,9 +448,11 @@ test('zcode parse+write: subagent sidechain round-trips with engine id conventio
         assert.equal(res.sessionId.startsWith('sess_'), true);
         const dstDb = new DatabaseSync(join(dstRoot, 'cli', 'db', 'db.sqlite'));
         try {
-          // session row shape
+          // session row shape. P1-B: extensions['zcode.session'] (read from
+          // the source store) is now consumed on write-back, so the fixture's
+          // own version/permission survive instead of the synthesized constants.
           const sess = dstDb.prepare('SELECT * FROM session WHERE id=?').get(res.sessionId) as Record<string, unknown>;
-          assert.equal(sess.version, '0.16.3');
+          assert.equal(sess.version, '0.16.5');
           assert.equal(sess.permission, '{"mode":"build"}');
           assert.equal(sess.slug, res.sessionId);
           assert.equal(sess.project_id, 'proj_d-proj');
@@ -780,6 +782,318 @@ test('zcode write: refuses to fabricate the default store without an explicit ro
       () => adapter.write(ir, { targetCwd: 'D:\\proj' }),
       /Refusing to fabricate/,
     );
+  });
+});
+
+/* ------------------------------------------------------------------ */
+/* Review fixes: orphan results, sidechain drain/nesting, pending     */
+/* states, synthetic flag, session extensions, listSessions errors    */
+/* ------------------------------------------------------------------ */
+
+test('zcode write: orphan tool_result (empty toolUseId) degrades to a [tool result] user line, never silently dropped', async () => {
+  await withoutRealZcodeHome(async () => {
+    const dstRoot = await fs.mkdtemp(join(tmpdir(), 'sm-zcode-orph-'));
+    try {
+      const ir: MigratedSession = {
+        schemaVersion: 2,
+        originTool: 'claude',
+        title: 'orphan result',
+        cwd: 'D:\\proj',
+        messages: [
+          { role: 'user', content: [{ type: 'text', text: 'do things' }] },
+          // user row carrying ONLY an orphan tool_result (call row lost in the source)
+          { role: 'user', content: [{ type: 'tool_result', toolUseId: '', content: 'ORPHAN RESULT TEXT' }] },
+        ],
+      };
+      const res = await new ZcodeAdapter().write(ir, { root: dstRoot, targetCwd: 'D:\\proj' });
+      // whole-store search: the orphan content text must survive somewhere
+      const db = new DatabaseSync(join(dstRoot, 'cli', 'db', 'db.sqlite'));
+      try {
+        const hit = (db.prepare("SELECT COUNT(*) AS n FROM part WHERE data LIKE '%ORPHAN RESULT TEXT%'").get() as { n: number }).n;
+        assert.ok(hit >= 1, `orphan tool_result content must land in ≥1 part row, got ${hit}`);
+        const carrier = JSON.parse((db.prepare("SELECT p.data FROM part p JOIN message m ON m.id = p.message_id WHERE p.data LIKE '%ORPHAN RESULT TEXT%'").get() as { data: string }).data);
+        assert.equal(carrier.type, 'text');
+        assert.match(carrier.text, /^\[tool result\] ORPHAN RESULT TEXT$/);
+        // and the message row carrying it is a user row, not a phantom tool part
+        const msgData = JSON.parse((db.prepare("SELECT m.data FROM part p JOIN message m ON m.id = p.message_id WHERE p.data LIKE '%ORPHAN RESULT TEXT%'").get() as { data: string }).data);
+        assert.equal(msgData.role, 'user');
+        const toolParts = (db.prepare("SELECT COUNT(*) AS n FROM part WHERE data LIKE '%\"type\":\"tool\"%'").get() as { n: number }).n;
+        assert.equal(toolParts, 0, 'an orphan result must not fabricate a tool part');
+      } finally {
+        db.close();
+      }
+    } finally {
+      await fs.rm(dstRoot, { recursive: true, force: true });
+    }
+  });
+});
+
+test('zcode write: unclaimed sidechain drains into a subagent_child session (transcript never dropped)', async () => {
+  await withoutRealZcodeHome(async () => {
+    const dstRoot = await fs.mkdtemp(join(tmpdir(), 'sm-zcode-drain-'));
+    try {
+      const ir: MigratedSession = {
+        schemaVersion: 2,
+        originTool: 'zcode',
+        cwd: 'D:\\proj',
+        messages: [
+          { role: 'user', content: [{ type: 'text', text: 'just chatting, no agent call' }] },
+          { role: 'assistant', content: [{ type: 'text', text: 'ok' }] },
+        ],
+        sidechains: [{
+          agentId: 'sess_subagent_agent_aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee',
+          kind: 'subagent',
+          agentType: 'Explore',
+          messages: [
+            { role: 'user', content: [{ type: 'text', text: 'UNCLAIMED SIDECHAIN TEXT' }] },
+            { role: 'assistant', content: [{ type: 'text', text: 'did the exploring anyway' }] },
+          ],
+        }],
+      };
+      const res = await new ZcodeAdapter().write(ir, { root: dstRoot, targetCwd: 'D:\\proj' });
+      const db = new DatabaseSync(join(dstRoot, 'cli', 'db', 'db.sqlite'));
+      try {
+        // the sidechain became a child session row parented at the main session
+        const kids = db.prepare('SELECT id, parent_id, task_type FROM session WHERE parent_id=?').all(res.sessionId) as Array<Record<string, unknown>>;
+        assert.equal(kids.length, 1, 'unclaimed sidechain must still write its child session');
+        assert.equal(kids[0].task_type, 'subagent_child');
+        assert.ok(String(kids[0].id).startsWith('sess_subagent_agent_'), 'child id follows the engine id convention');
+        // and its unique text survives
+        const hit = (db.prepare("SELECT COUNT(*) AS n FROM part WHERE data LIKE '%UNCLAIMED SIDECHAIN TEXT%'").get() as { n: number }).n;
+        assert.ok(hit >= 1, 'drained sidechain transcript text must survive');
+      } finally {
+        db.close();
+      }
+    } finally {
+      await fs.rm(dstRoot, { recursive: true, force: true });
+    }
+  });
+});
+
+test('zcode write: nested (grandchild) sidechains write sessions parented at their child level', async () => {
+  await withoutRealZcodeHome(async () => {
+    const dstRoot = await fs.mkdtemp(join(tmpdir(), 'sm-zcode-nest-'));
+    try {
+      const ir: MigratedSession = {
+        schemaVersion: 2,
+        originTool: 'zcode',
+        cwd: 'D:\\proj',
+        messages: [
+          { role: 'user', content: [{ type: 'text', text: 'spawn' }] },
+          {
+            role: 'assistant',
+            content: [{ type: 'tool_use', id: 'call_agentX', name: 'Agent', input: { description: 'probe', prompt: 'delegate further' } }],
+            stopReason: 'tool-calls',
+          },
+        ],
+        sidechains: [{
+          agentId: 'sess_subagent_agent_11111111-2222-3333-4444-555555555555',
+          kind: 'subagent',
+          agentType: 'Explore',
+          parentMessageId: 'call_agentX',
+          messages: [
+            { role: 'user', content: [{ type: 'text', text: 'delegate further' }] },
+            {
+              role: 'assistant',
+              content: [{ type: 'tool_use', id: 'call_agentInner', name: 'Agent', input: { description: 'inner', prompt: 'inner work' } }],
+              stopReason: 'tool-calls',
+            },
+          ],
+          sidechains: [{
+            agentId: 'sess_subagent_agent_99999999-8888-7777-6666-555555555555',
+            kind: 'subagent',
+            messages: [
+              { role: 'user', content: [{ type: 'text', text: 'GRANDCHILD UNIQUE TEXT' }] },
+              { role: 'assistant', content: [{ type: 'text', text: 'grandchild done' }] },
+            ],
+          }],
+        }],
+      };
+      const res = await new ZcodeAdapter().write(ir, { root: dstRoot, targetCwd: 'D:\\proj' });
+      const db = new DatabaseSync(join(dstRoot, 'cli', 'db', 'db.sqlite'));
+      try {
+        const mainId = res.sessionId;
+        const child = db.prepare('SELECT id FROM session WHERE parent_id=?').get(mainId) as { id: string } | undefined;
+        assert.ok(child, 'child session row exists');
+        // grandchild session is parented at the CHILD (subagent delegation tree)
+        const grand = db.prepare('SELECT id, task_type FROM session WHERE parent_id=?').get(child.id) as { id: string; task_type: string } | undefined;
+        assert.ok(grand, 'grandchild session row must exist (previously dropped entirely)');
+        assert.equal(grand.task_type, 'subagent_child');
+        const hit = (db.prepare("SELECT COUNT(*) AS n FROM part WHERE data LIKE '%GRANDCHILD UNIQUE TEXT%'").get() as { n: number }).n;
+        assert.ok(hit >= 1, 'grandchild transcript text must survive');
+        // nesting depth is exactly main → child → grandchild (no accidental flat attach)
+        const depthCheck = db.prepare('SELECT COUNT(*) AS n FROM session WHERE parent_id=? AND id=?').get(mainId, grand.id) as { n: number };
+        assert.equal(depthCheck.n, 0, 'grandchild must not attach to the main session');
+      } finally {
+        db.close();
+      }
+    } finally {
+      await fs.rm(dstRoot, { recursive: true, force: true });
+    }
+  });
+});
+
+test('zcode write: tool_use without record or result stays pending, never fabricated completed+\'\'', async () => {
+  await withoutRealZcodeHome(async () => {
+    const dstRoot = await fs.mkdtemp(join(tmpdir(), 'sm-zcode-pend-'));
+    try {
+      const ir: MigratedSession = {
+        schemaVersion: 2,
+        originTool: 'claude',
+        cwd: 'D:\\proj',
+        messages: [
+          { role: 'user', content: [{ type: 'text', text: 'go' }] },
+          // Bash call whose result never arrived (source interrupted)
+          { role: 'assistant', content: [{ type: 'tool_use', id: 'call_pendingXYZ', name: 'Bash', input: { command: 'sleep 1000' } }], stopReason: 'tool-calls' },
+          { role: 'assistant', content: [{ type: 'text', text: '(interrupted)' }] },
+        ],
+      };
+      const res = await new ZcodeAdapter().write(ir, { root: dstRoot, targetCwd: 'D:\\proj' });
+      const db = new DatabaseSync(join(dstRoot, 'cli', 'db', 'db.sqlite'));
+      try {
+        const part = JSON.parse((db.prepare("SELECT data FROM part WHERE session_id=? AND data LIKE '%call_pendingXYZ%'").get(res.sessionId) as { data: string }).data);
+        assert.equal(part.type, 'tool');
+        assert.equal(part.state.status, 'pending', 'a call with no record and no result must write the native pending state');
+        assert.equal(part.state.input.command, 'sleep 1000');
+        assert.ok(!('output' in part.state), 'no fabricated output');
+        assert.ok(!('title' in part.state), 'pending parts carry no title in the native shape');
+      } finally {
+        db.close();
+      }
+    } finally {
+      await fs.rm(dstRoot, { recursive: true, force: true });
+    }
+  });
+});
+
+test('zcode write: synthetic messages drop by default; keepSynthetic writes hidden system_reminder semantics', async () => {
+  await withoutRealZcodeHome(async () => {
+    const mkIr = (): MigratedSession => ({
+      schemaVersion: 2,
+      originTool: 'dsh',
+      cwd: 'D:\\proj',
+      messages: [
+        { role: 'user', content: [{ type: 'text', text: 'real question' }] },
+        { role: 'user', content: [{ type: 'text', text: '<system-reminder>harness injection</system-reminder>' }], synthetic: true },
+        { role: 'assistant', content: [{ type: 'text', text: 'answer' }] },
+      ],
+    });
+    const adapter = new ZcodeAdapter();
+
+    // default: the synthetic row is dropped entirely
+    const dropRoot = await fs.mkdtemp(join(tmpdir(), 'sm-zcode-synd-'));
+    try {
+      const res = await adapter.write(mkIr(), { root: dropRoot, targetCwd: 'D:\\proj' });
+      const db = new DatabaseSync(join(dropRoot, 'cli', 'db', 'db.sqlite'));
+      try {
+        const hit = (db.prepare("SELECT COUNT(*) AS n FROM part WHERE session_id=? AND data LIKE '%harness injection%'").get(res.sessionId) as { n: number }).n;
+        assert.equal(hit, 0, 'synthetic message must be dropped by default');
+      } finally {
+        db.close();
+      }
+    } finally {
+      await fs.rm(dropRoot, { recursive: true, force: true });
+    }
+
+    // opt-in keepSynthetic: written with hidden system_reminder semantics
+    const keepRoot = await fs.mkdtemp(join(tmpdir(), 'sm-zcode-synk-'));
+    try {
+      const res = await adapter.write(mkIr(), { root: keepRoot, targetCwd: 'D:\\proj', keepSynthetic: true });
+      const db = new DatabaseSync(join(keepRoot, 'cli', 'db', 'db.sqlite'));
+      try {
+        const row = db.prepare("SELECT m.data FROM part p JOIN message m ON m.id = p.message_id WHERE p.data LIKE '%harness injection%'").get() as { data: string } | undefined;
+        assert.ok(row, 'synthetic message kept with keepSynthetic');
+        const d = JSON.parse(row.data);
+        assert.equal(d.role, 'user');
+        assert.equal(d.semantics.origin, 'system');
+        assert.equal(d.semantics.kind, 'system_reminder');
+        assert.equal(d.semantics.uiVisibility, 'hidden');
+        assert.equal(d.semantics.providerVisibility, 'visible');
+        assert.equal(d.synthetic, true);
+        // the real prompt keeps its real_user semantics
+        const realRow = JSON.parse((db.prepare("SELECT m.data FROM part p JOIN message m ON m.id = p.message_id WHERE p.data LIKE '%real question%'").get() as { data: string }).data);
+        assert.equal(realRow.semantics.origin, 'real_user');
+      } finally {
+        db.close();
+      }
+    } finally {
+      await fs.rm(keepRoot, { recursive: true, force: true });
+    }
+  });
+});
+
+test('zcode write: extensions["zcode.session"] store-level columns (version/permission) are honoured', async () => {
+  await withoutRealZcodeHome(async () => {
+    const dstRoot = await fs.mkdtemp(join(tmpdir(), 'sm-zcode-ext-'));
+    try {
+      const ir: MigratedSession = {
+        schemaVersion: 2,
+        originTool: 'zcode',
+        title: 'ext session',
+        cwd: 'D:\\proj',
+        createdAt: T0,
+        messages: [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }],
+        extensions: {
+          'zcode.session': {
+            // per-row identity fields (slug/taskType of the SOURCE row) are
+            // deliberately NOT re-applied: the IR was parsed from one row but
+            // written as a fresh root — re-grafting the child's taskType would
+            // mislabel the new root as subagent_child.
+            version: '0.21.7',
+            permission: '{"mode":"plan"}',
+            slug: 'stale-source-slug',
+            taskType: 'subagent_child',
+          },
+        },
+      };
+      const res = await new ZcodeAdapter().write(ir, { root: dstRoot, targetCwd: 'D:\\proj' });
+      const db = new DatabaseSync(join(dstRoot, 'cli', 'db', 'db.sqlite'));
+      try {
+        const row = db.prepare('SELECT version, permission, task_type, slug FROM session WHERE id=?').get(res.sessionId) as Record<string, unknown>;
+        assert.equal(row.version, '0.21.7', 'engine version from the source extension');
+        assert.equal(row.permission, '{"mode":"plan"}', 'permission JSON from the source extension');
+        assert.equal(row.task_type, 'interactive', 'per-row task_type is NOT re-grafted from the source row');
+        assert.equal(row.slug, res.sessionId, 'per-row slug is NOT re-grafted from the source row');
+      } finally {
+        db.close();
+      }
+    } finally {
+      await fs.rm(dstRoot, { recursive: true, force: true });
+    }
+  });
+});
+
+test('zcode listSessions: absent file → [], a db that cannot be opened → throws', async () => {
+  await withoutRealZcodeHome(async () => {
+    // 1. no db at all → empty list, no error
+    const emptyRoot = await fs.mkdtemp(join(tmpdir(), 'sm-zcode-ls1-'));
+    try {
+      assert.deepEqual(await new ZcodeAdapter().listSessions(emptyRoot), []);
+    } finally {
+      await fs.rm(emptyRoot, { recursive: true, force: true });
+    }
+
+    // 2. a CORRUPT store at the resolved path: read-only open succeeds but
+    // the query fails ("file is not a database"). The old code swallowed that
+    // into []; now the failure must surface — a broken store silently listed
+    // as empty would read as "nothing to migrate".
+    const badRoot = await fs.mkdtemp(join(tmpdir(), 'sm-zcode-ls2-'));
+    const badDir = join(badRoot, 'cli', 'db');
+    try {
+      await fs.mkdir(badDir, { recursive: true });
+      await fs.writeFile(join(badDir, 'db.sqlite'), 'this is definitely not a sqlite database'.repeat(50));
+      await assert.rejects(
+        () => new ZcodeAdapter().listSessions(badRoot),
+        (e: unknown) => {
+          assert.ok(e instanceof Error);
+          assert.match(e.message, /not a database|cannot open/i);
+          return true;
+        },
+        'a corrupt store must surface as an error, never as []',
+      );
+    } finally {
+      await fs.rm(badRoot, { recursive: true, force: true });
+    }
   });
 });
 

@@ -304,6 +304,179 @@ test('OpenCode DB listSessions does not flatten subagent children into the top l
   assert.equal(metas[0].sessionId, res.sessionId);
 });
 
+/* ------------------------------------------------------------------ */
+/* Review fixes: anchor exemption, transaction atomicity, boundary    */
+/* parts surviving parse, listSessions error surfacing                */
+/* ------------------------------------------------------------------ */
+
+test('OpenCode DB write: compaction anchor on a synthetic message is exempt from the synthetic gate (pi v3.3 shape)', async () => {
+  const adapter = new OpenCodeAdapter();
+  const root = await tempRoot();
+  const dbPath = join(root, 'opencode.db');
+  createTestDb(dbPath);
+
+  // pi v3.3 official anchor shape: the projected compaction summary is a
+  // synthetic:true user message the anchorIndex points at.
+  const ir: MigratedSession = {
+    schemaVersion: 2,
+    originTool: 'pi',
+    title: 'pi compacted',
+    messages: [
+      { role: 'user', content: [{ type: 'text', text: 'before compaction' }], timestamp: T0 },
+      { role: 'assistant', content: [{ type: 'text', text: 'early reply' }], timestamp: T0 + 1 },
+      { role: 'user', content: [{ type: 'text', text: 'PI SUMMARY PAYLOAD' }], timestamp: T0 + 2, synthetic: true },
+      { role: 'user', content: [{ type: 'text', text: 'after compaction' }], timestamp: T0 + 3 },
+    ],
+    compaction: [{ summary: 'PI SUMMARY PAYLOAD', anchorIndex: 2, meta: { pi: { anchor: { kind: 'compaction', entryId: 'src-comp-1' } } } }],
+  };
+  const res = await adapter.write(ir, { root: dbPath, targetCwd: '/tmp/proj' });
+
+  const db = new DatabaseSync(dbPath, { readOnly: true });
+  // the boundary part + the summary:true assistant both exist
+  const boundaryPart = JSON.parse((db.prepare("SELECT data FROM part WHERE session_id=? AND data LIKE '%\"type\":\"compaction\"%'").get(res.sessionId) as { data: string }).data);
+  assert.ok(boundaryPart, 'compaction boundary part written despite the synthetic anchor');
+  const summaryRow = db.prepare("SELECT data FROM message WHERE session_id=? AND data LIKE '%\"summary\":true%'").get(res.sessionId) as { data: string };
+  assert.ok(summaryRow, 'summary assistant row written');
+  const sd = JSON.parse(summaryRow.data);
+  assert.equal(sd.mode, 'compaction');
+  assert.ok(sd.parentID, 'summary assistant parents to the boundary user row');
+  db.close();
+
+  // parse back: both the compaction record and its summary survive
+  const back = await adapter.parse(res.sessionId, root);
+  assert.equal(back.compaction?.length, 1);
+  assert.equal(back.compaction![0].summary, 'PI SUMMARY PAYLOAD');
+  const carrier = back.messages[back.compaction![0].anchorIndex!];
+  assert.equal((carrier.content[0] as { text: string }).text, 'PI SUMMARY PAYLOAD');
+});
+
+test('OpenCode DB write: system-role compaction anchor is exempt from the system drop too', async () => {
+  const adapter = new OpenCodeAdapter();
+  const root = await tempRoot();
+  const dbPath = join(root, 'opencode.db');
+  createTestDb(dbPath);
+
+  const ir: MigratedSession = {
+    schemaVersion: 2,
+    originTool: 'dsh',
+    title: 'system anchor',
+    messages: [
+      { role: 'user', content: [{ type: 'text', text: 'q' }], timestamp: T0 },
+      // system-role anchor (some sources project the checkpoint as system)
+      { role: 'system', content: [{ type: 'text', text: 'SYS ANCHOR SUMMARY' }], timestamp: T0 + 1 },
+    ],
+    compaction: [{ summary: 'SYS ANCHOR SUMMARY', anchorIndex: 1 }],
+  };
+  const res = await adapter.write(ir, { root: dbPath, targetCwd: '/tmp/proj' });
+  const db = new DatabaseSync(dbPath, { readOnly: true });
+  const hit = (db.prepare("SELECT COUNT(*) AS n FROM part WHERE session_id=? AND data LIKE '%SYS ANCHOR SUMMARY%'").get(res.sessionId) as { n: number }).n;
+  db.close();
+  assert.ok(hit >= 1, 'a system-role anchor must still write its summary (anchor priority > role gate)');
+});
+
+test('OpenCode DB write: mid-write failure rolls the whole transaction back (zero residue)', async () => {
+  const adapter = new OpenCodeAdapter();
+  const root = await tempRoot();
+  const dbPath = join(root, 'opencode.db');
+  const setup = createTestDb(dbPath);
+  // occupy the exact session id the write will target — the INSERT fails
+  // mid-transaction, after the global project row was already ensured.
+  setup.prepare("INSERT INTO session (id, project_id) VALUES ('ses_doomed', 'global')").run();
+  setup.close();
+
+  const ir: MigratedSession = {
+    schemaVersion: 2,
+    originTool: 'claude',
+    title: 'will fail',
+    messages: [
+      { role: 'user', content: [{ type: 'text', text: 'hello' }], timestamp: T0 },
+      { role: 'assistant', content: [{ type: 'text', text: 'world' }], timestamp: T0 + 1 },
+    ],
+  };
+  await assert.rejects(
+    () => adapter.write(ir, { root: dbPath, targetCwd: '/tmp/proj', sessionId: 'ses_doomed' }),
+    /UNIQUE constraint failed/,
+  );
+
+  const db = new DatabaseSync(dbPath, { readOnly: true });
+  const count = (t: string): number => (db.prepare(`SELECT COUNT(*) c FROM ${t}`).get() as { c: number }).c;
+  // only the pre-inserted placeholder row remains — the transaction rolled
+  // back everything else (project row, messages, parts)
+  assert.equal(count('project'), 0, 'no residue: project table untouched');
+  assert.equal(count('session'), 1, 'no residue: only the pre-existing placeholder session');
+  assert.equal(count('message'), 0, 'no residue: message table untouched');
+  assert.equal(count('part'), 0, 'no residue: part table untouched');
+  db.close();
+});
+
+test('OpenCode DB parse: boundary user row keeps its own text parts (they no longer evaporate)', async () => {
+  const adapter = new OpenCodeAdapter();
+  const root = await tempRoot();
+  const dbPath = join(root, 'opencode.db');
+  const db = createTestDb(dbPath);
+  try {
+    // build the native shape directly: boundary user row carrying BOTH a
+    // compaction part and its own [user interrupted] text part, plus the
+    // summary assistant parented to it (real-store shape, 23/44 boundary rows)
+    const insMsg = (id: string, time: number, data: Record<string, unknown>): void => {
+      db.prepare('INSERT INTO message (id, session_id, time_created, time_updated, data) VALUES (?, ?, ?, ?, ?)').run(id, 'ses_b1', time, time, JSON.stringify(data));
+    };
+    const insPart = (mid: string, seq: number, data: Record<string, unknown>): void => {
+      db.prepare('INSERT INTO part (id, message_id, session_id, time_created, time_updated, data) VALUES (?, ?, ?, ?, ?, ?)').run(`prt_${mid}_${seq}`, mid, 'ses_b1', T0 + seq, T0 + seq, JSON.stringify(data));
+    };
+    db.prepare('INSERT OR IGNORE INTO project (id, worktree) VALUES (\'global\', \'/\')').run();
+    db.prepare('INSERT INTO session (id, project_id, title, time_created, time_updated) VALUES (?, ?, ?, ?, ?)').run('ses_b1', 'global', 'boundary text', T0, T0);
+    insMsg('msg_b1', T0, { role: 'user', time: { created: T0 }, agent: 'build' });
+    insPart('msg_b1', 0, { type: 'compaction', auto: false });
+    insPart('msg_b1', 1, { type: 'text', text: '[user interrupted]' });
+    insMsg('msg_b2', T0 + 1, { parentID: 'msg_b1', role: 'assistant', mode: 'compaction', agent: 'compaction', summary: true, time: { created: T0 + 1, completed: T0 + 1 } });
+    insPart('msg_b2', 0, { type: 'text', text: 'summary of the compacted run' });
+    insMsg('msg_b3', T0 + 2, { role: 'user', time: { created: T0 + 2 }, agent: 'build' });
+    insPart('msg_b3', 0, { type: 'text', text: 'after the boundary' });
+  } finally {
+    db.close();
+  }
+
+  const ir = await adapter.parse('ses_b1', root);
+  const dumped = JSON.stringify(ir.messages);
+  assert.ok(dumped.includes('[user interrupted]'), 'the boundary row own text part must survive the parse');
+  assert.equal(ir.compaction?.length, 1);
+  assert.match(ir.compaction![0].summary, /summary of the compacted run/);
+  const after = ir.messages.find((m) => (m.content[0] as { text?: string } | undefined)?.text === 'after the boundary');
+  assert.ok(after, 'messages after the boundary unaffected');
+});
+
+test('OpenCode DB listSessions: absent db → [] or mirror; a db that fails to open or query throws', async () => {
+  const adapter = new OpenCodeAdapter();
+
+  // 1. explicit root with NO db file → [] (hermetic, no store exists)
+  const emptyRoot = await tempRoot();
+  try {
+    assert.deepEqual(await adapter.listSessions(emptyRoot), []);
+  } finally {
+    await fs.rm(emptyRoot, { recursive: true, force: true });
+  }
+
+  // 2. corrupt db file at the path: open succeeds but the query fails — must
+  // throw, never silently return [] (and never fall back to the mirror).
+  const badRoot = await tempRoot();
+  const badPath = join(badRoot, 'opencode.db');
+  await fs.writeFile(badPath, 'certainly not a sqlite database'.repeat(100));
+  try {
+    await assert.rejects(
+      () => adapter.listSessions(badRoot),
+      (e: unknown) => {
+        assert.ok(e instanceof Error);
+        assert.match(e.message, /not a database|cannot open/i);
+        return true;
+      },
+      'a corrupt store must surface as an error, never as []',
+    );
+  } finally {
+    await fs.rm(badRoot, { recursive: true, force: true });
+  }
+});
+
 test('OpenCode DB session.path is worktree-relative, never the absolute directory (real-store shape)', async () => {
   const adapter = new OpenCodeAdapter();
 

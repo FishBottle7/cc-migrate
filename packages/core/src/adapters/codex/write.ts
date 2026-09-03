@@ -166,10 +166,14 @@ export function buildRolloutLines(
   let turnSeq = 0;
   let openTurnId: string | undefined;
   let lastAssistantText: string | undefined;
+  // Chronology fallback for time-less archived rows (see emitUnmapped): the
+  // newest timestamp rendered so far, so a migrated stream never invents an
+  // epoch-0 row ordering BEFORE its real history.
+  let lastTsMs = createdAt;
 
   for (const em of emitters) {
     if (em.kind === 'event') {
-      emitUnmapped(lines, em.ev, paginated);
+      emitUnmapped(lines, em.ev, paginated, Number.isFinite(em.ev.time) ? (em.ev.time as number) : lastTsMs);
       continue;
     }
     if (em.kind === 'turnRow') {
@@ -229,6 +233,8 @@ export function buildRolloutLines(
     }
     for (const item of messageToResponseItems(msg, ir, createdAt)) {
       lines.push(item);
+      const em = Number.isFinite(msg.timestamp) ? (msg.timestamp as number) : createdAt;
+      if (em > lastTsMs) lastTsMs = em;
     }
   }
   if (!sessionCodex && openTurnId) {
@@ -750,8 +756,12 @@ function syntheticTurnId(atMs: number, turnSeq: number): string {
 /* unmappedEvents replay                                               */
 /* ------------------------------------------------------------------ */
 
-function emitUnmapped(lines: RolloutLineRaw[], ev: MigratedUnmappedEvent, paginated: boolean): void {
-  const ts = Number.isFinite(ev.time) ? rolloutTimestamp(ev.time as number) : rolloutTimestamp(0);
+function emitUnmapped(lines: RolloutLineRaw[], ev: MigratedUnmappedEvent, paginated: boolean, fallbackMs: number): void {
+  // No wall-clock "now" and no epoch-0 either: a migrated stream keeps causal
+  // order even when the source row carried no parseable time — fall back to
+  // the last timestamp already rendered into this stream (the session's own
+  // chronology, derivable from the IR rather than fabricated).
+  const ts = Number.isFinite(ev.time) ? rolloutTimestamp(ev.time as number) : rolloutTimestamp(fallbackMs);
   const ordinal = paginated ? ev.seq : undefined;
   const data = ev.data as Record<string, unknown> | undefined;
 
@@ -858,12 +868,19 @@ function stableStringify(v: unknown): string {
   }
 }
 
-/** Title used for the session_index append row (docs/agents/codex.md §9.7). */
-export function sessionIndexTitle(ir: MigratedSession): string {
+/**
+ * Title for the session_index append row (docs/agents/codex.md §9.7):
+ * `ir.title` → native sessionIndex.thread_name → first real user prompt
+ * (60-char cut). Undefined when the session has NO name codex would ever have
+ * recorded — codex only appends an index row when it actually learned a title,
+ * so a migrated '(untitled)' placeholder would be a row codex itself never
+ * writes; the caller must skip the append in that case.
+ */
+export function sessionIndexTitle(ir: MigratedSession): string | undefined {
   if (ir.title) return ir.title;
   const nativeIndex = ((ir.meta as Record<string, unknown> | undefined)?.codex as Record<string, unknown> | undefined)?.sessionIndex as
     | { thread_name?: unknown }
     | undefined;
   if (typeof nativeIndex?.thread_name === 'string' && nativeIndex.thread_name.trim()) return nativeIndex.thread_name;
-  return titleFromMessages(ir.messages) ?? '(untitled)';
+  return titleFromMessages(ir.messages);
 }

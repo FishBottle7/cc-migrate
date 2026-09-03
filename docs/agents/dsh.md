@@ -61,3 +61,4 @@
 
 - `MigratedMessage` ↔ surface 三类；`cwd` 参与 `projectKey`；`model` 仅提示；旁链为独立 session 文件（`parentSession` 引用）
 - **v3 breaking（`schemaVersion: 2`）**：`agent→IR` 零过滤（除 `encrypted_content/encrypted` 占位 `[encrypted omitted]`），`goal/change → goals`、`plan/mode → planModes`、`todo/write → todos`，其余 `~40` 类 `known-event-type` 进 `unmappedEvents`（含 `surfaceOp/sourceEventSeqs`），`session/title` 促升为 `ir.title` + 保留原事件；`IR→DSH` 按 `time` 合并重排 `seq 0..N-1` 写回，全量保留。`IR→Claude/Codex/OpenCode/Pi` 按能力表丢弃领域桶（见 `docs/plans/ir-v3-lossless-100.md §2.4`）。
+- claude teammate 侧链：dsh 端显式丢弃并警告——team 事件语义不同构，转译待专项调查

@@ -280,3 +280,294 @@ test('listSessions: uuid gate + isSidechain/teamName filters', async () => {
   assert.ok(ids.includes(sid));
   assert.ok(!ids.includes('not-a-uuid'));
 });
+
+/* ------------------------------------------------------------------
+ * 审查缺陷修复（P0/P1）
+ * ------------------------------------------------------------------ */
+
+async function rowsOf(path: string): Promise<Record<string, unknown>[]> {
+  const text = await fs.readFile(path, 'utf8');
+  return text
+    .split('\n')
+    .filter(Boolean)
+    .map((l) => JSON.parse(l) as Record<string, unknown>);
+}
+
+test('P0-A: 投影写直通重放 sessionEvents 原生 system 行，re-parse 回桶', async () => {
+  // dsh IR 的 sessionEvents 桶携带 claude 原生 system 行（claude→dsh 迁移残留）——
+  // 投影写必须落盘这两行，否则桶整桶静默丢失（v3.2 登记：写端直通重放）。
+  const root = await tempRoot();
+  const ir: MigratedSession = {
+    schemaVersion: 2,
+    originTool: 'dsh',
+    cwd: 'D:\\proj',
+    messages: [
+      { role: 'user', content: [{ type: 'text', text: 'run' }] },
+      { role: 'assistant', content: [{ type: 'text', text: 'done' }] },
+    ],
+    sessionEvents: [
+      {
+        seq: 5,
+        time: 1760000000000,
+        type: 'turn_duration',
+        data: { type: 'system', subtype: 'turn_duration', durationMs: 42, messageCount: 4, uuid: 's-old-1', parentUuid: 'a-old', timestamp: '2026-01-01T00:00:00.050Z' },
+      },
+      {
+        seq: 6,
+        time: 1760000000100,
+        type: 'stop_hook_summary',
+        data: { type: 'system', subtype: 'stop_hook_summary', hookCount: 2, hookErrors: null, preventedContinuation: false, uuid: 's-old-2', parentUuid: 's-old-1', timestamp: '2026-01-01T00:00:00.060Z' },
+      },
+    ],
+  };
+  const adapter = new ClaudeAdapter();
+  const res = await adapter.write(ir, { root, targetCwd: 'D:\\proj' });
+  const rows = await rowsOf(res.paths[0]);
+
+  const td = rows.find((r) => r.type === 'system' && r.subtype === 'turn_duration');
+  const shs = rows.find((r) => r.type === 'system' && r.subtype === 'stop_hook_summary');
+  assert.ok(td, 'turn_duration 行落盘');
+  assert.ok(shs, 'stop_hook_summary 行落盘');
+  assert.equal(td!.durationMs, 42, 'payload 原样重放');
+  assert.equal(td!.messageCount, 4);
+  assert.equal(shs!.hookCount, 2);
+  // 源 uuid 体系不进文件：换新 uuid + parentUuid 重锚到本文件链
+  assert.notEqual(td!.uuid, 's-old-1');
+  assert.ok(typeof td!.uuid === 'string' && td!.uuid, '新 uuid');
+  assert.ok(typeof td!.parentUuid === 'string' && td!.parentUuid, 'parentUuid 重锚（非悬挂）');
+
+  // re-parse：两行回到 sessionEvents 桶（读端把非对话 subtype 行归桶）
+  const back = await adapter.parse(res.sessionId, root);
+  assert.ok(back.sessionEvents?.some((e) => e.type === 'turn_duration'), 'turn_duration 回桶');
+  assert.ok(back.sessionEvents?.some((e) => e.type === 'stop_hook_summary'), 'stop_hook_summary 回桶');
+  // 会话主体不受重放行干扰
+  assert.equal(back.messages.length, 2);
+});
+
+test('P0-A: compact_boundary subtype 与 compaction 桶重叠，sessionEvents 不双写', () => {
+  const ir: MigratedSession = {
+    schemaVersion: 2,
+    originTool: 'dsh',
+    cwd: 'D:\\proj',
+    messages: [{ role: 'user', content: [{ type: 'text', text: 'q' }] }],
+    compaction: [{ summary: 'S', anchorIndex: 0 }],
+    // 外来 IR 硬塞 compact_boundary 行进桶：compaction 桶已承载 boundary，
+    // 重放会造成第二份无配对 boundary（双写），必须跳过
+    sessionEvents: [
+      { seq: 3, time: 1, type: 'compact_boundary', data: { type: 'system', subtype: 'compact_boundary', uuid: 'dup-b', timestamp: TS0 } },
+      { seq: 4, time: 1, type: 'informational', data: { type: 'system', subtype: 'informational', content: 'info', uuid: 'info-b', timestamp: TS0 } },
+    ],
+  };
+  const built = buildMainRecords(ir, 'sess-a', { targetCwd: 'D:\\proj', nowMs: 1000 });
+  const boundaries = built.records.filter((r) => r.subtype === 'compact_boundary');
+  assert.equal(boundaries.length, 1, 'boundary 只由 compaction 桶产出一份');
+  assert.ok(built.records.some((r) => r.subtype === 'informational'), '非重叠 subtype 照常重放');
+});
+
+test('P0-B: 跨工具 compaction 的 stale preservedMessages 不落盘，re-parse 消息不缩水', async () => {
+  const root = await tempRoot();
+  const SUMMARY = 'This session is being continued from a previous conversation… 摘要';
+  const ir: MigratedSession = {
+    schemaVersion: 2,
+    originTool: 'dsh',
+    cwd: 'D:\\proj',
+    messages: [
+      { role: 'user', content: [{ type: 'text', text: 'q1' }] },
+      { role: 'assistant', content: [{ type: 'text', text: 'r1' }] },
+      { role: 'user', content: [{ type: 'text', text: SUMMARY }] },
+      { role: 'user', content: [{ type: 'text', text: 'after compact' }] },
+      { role: 'assistant', content: [{ type: 'text', text: 'post-compact reply' }] },
+    ],
+    compaction: [
+      {
+        summary: SUMMARY,
+        anchorIndex: 2,
+        meta: {
+          claude: {
+            compactMetadata: {
+              trigger: 'manual',
+              preTokens: 1000,
+              preservedMessages: { anchorUuid: 'b-old', uuids: ['u1', 'a1'] }, // 旧 uuid 体系
+            },
+          },
+        },
+      },
+    ],
+  };
+  const adapter = new ClaudeAdapter();
+  const res = await adapter.write(ir, { root, targetCwd: 'D:\\proj' });
+  const boundary = (await rowsOf(res.paths[0])).find((r) => r.subtype === 'compact_boundary') as
+    | { compactMetadata?: { preservedMessages?: unknown; preservedSegment?: unknown; trigger?: string; preTokens?: number } }
+    | undefined;
+  assert.ok(boundary, 'boundary 落盘');
+  // 引用未发射 uuid 的 preserved* 删除——原生读端对缺 preserved 元数据是 no-op + 全史
+  assert.equal(boundary!.compactMetadata?.preservedMessages, undefined, 'stale preservedMessages 删除');
+  assert.equal(boundary!.compactMetadata?.preservedSegment, undefined, 'stale preservedSegment 删除');
+  assert.equal(boundary!.compactMetadata?.trigger, 'manual', '其余 compactMetadata 保留');
+  assert.equal(boundary!.compactMetadata?.preTokens, 1000);
+
+  // re-parse：消息数不缩水（boundary 后 3 行 + compaction 登记）
+  const back = await adapter.parse(res.sessionId, root);
+  assert.ok(back.messages.length >= 3, `re-parse 消息不缩水（got ${back.messages.length}）`);
+  assert.equal(back.compaction?.length, 1, 'compaction 桶登记');
+  assert.ok(back.messages.some((m) => m.content.some((b) => b.type === 'text' && (b as { text: string }).text === 'after compact')));
+  assert.ok(back.messages.some((m) => m.content.some((b) => b.type === 'text' && (b as { text: string }).text === 'post-compact reply')));
+});
+
+test('P1-A: local_command 归 isMeta 族——默认写保留，re-parse 回 user 文本', async () => {
+  // claude.md §2.3: local_command 转用户文本进 API 回放，不是 presentation-only，
+  // 不随 keepSynthetic=false 丢弃（丢弃 = 丢模型上下文）。
+  const root = await tempRoot();
+  const ir: MigratedSession = {
+    schemaVersion: 2,
+    originTool: 'dsh',
+    cwd: 'D:\\proj',
+    messages: [
+      { role: 'user', content: [{ type: 'text', text: 'run' }] },
+      {
+        role: 'user',
+        synthetic: true,
+        content: [{ type: 'text', text: '$ ls\nfile.txt' }],
+        meta: { claude: { systemSubtype: 'local_command', level: 'info' } },
+      },
+    ],
+  };
+  const adapter = new ClaudeAdapter();
+  const res = await adapter.write(ir, { root, targetCwd: 'D:\\proj' }); // 默认不开 keepSynthetic
+  const lc = (await rowsOf(res.paths[0])).find((r) => r.type === 'system' && r.subtype === 'local_command');
+  assert.ok(lc, 'local_command 行默认写保留');
+  assert.equal(lc!.content, '$ ls\nfile.txt');
+
+  const back = await adapter.parse(res.sessionId, root);
+  const lcMsg = back.messages.find(
+    (m) => (m.meta?.claude as { systemSubtype?: string } | undefined)?.systemSubtype === 'local_command',
+  );
+  assert.ok(lcMsg, 're-parse 回 user 文本形态（回放语义）');
+  assert.equal((lcMsg!.content[0] as { text: string }).text, '$ ls\nfile.txt');
+});
+
+test('P1-C: native.content 的 tool_use id 与 IR 块不一致 → 回退合成，无孤儿 tool_use_id', () => {
+  const ir: MigratedSession = {
+    schemaVersion: 2,
+    originTool: 'dsh',
+    cwd: 'D:\\proj',
+    messages: [
+      { role: 'user', content: [{ type: 'text', text: 'go' }] },
+      {
+        role: 'assistant',
+        content: [{ type: 'tool_use', id: 'IR-ID', name: 'Bash', input: {} }],
+        meta: {
+          claude: {
+            message: {
+              id: 'msg_native', role: 'assistant', type: 'message',
+              content: [{ type: 'tool_use', id: 'NATIVE-ONLY-ID', name: 'Bash', input: {} }],
+            },
+          },
+        },
+      },
+      { role: 'tool', content: [{ type: 'tool_result', toolUseId: 'IR-ID', content: 'ok' }] },
+    ],
+  };
+  const built = buildMainRecords(ir, 'sess-c', { targetCwd: 'D:\\proj', nowMs: 1700000000000 });
+  const json = JSON.stringify(built.records);
+  assert.ok(!json.includes('NATIVE-ONLY-ID'), '不一致的 native tool_use id 不落盘（回退合成）');
+  assert.ok(json.includes('IR-ID'), 'IR 块重建的 id 落盘');
+  // 配对自洽：文件内每个 tool_result.tool_use_id 都有对应 tool_use 块
+  const toolUseIds = new Set<string>();
+  for (const r of built.records) {
+    if (r.type !== 'assistant') continue;
+    for (const b of (r.message as { content: Array<{ type?: string; id?: string }> }).content ?? []) {
+      if (b.type === 'tool_use' && b.id) toolUseIds.add(b.id);
+    }
+  }
+  for (const r of built.records) {
+    if (r.type !== 'user') continue;
+    const c = (r.message as { content?: unknown }).content;
+    if (!Array.isArray(c)) continue;
+    for (const b of c as Array<{ type?: string; tool_use_id?: string }>) {
+      if (b?.type === 'tool_result') {
+        assert.ok(toolUseIds.has(b.tool_use_id!), `孤儿 tool_use_id: ${b.tool_use_id}`);
+      }
+    }
+  }
+});
+
+test('P1-C 回归: native.content 与 IR 块一致时仍逐字节透传', () => {
+  const ir: MigratedSession = {
+    schemaVersion: 2,
+    originTool: 'dsh',
+    cwd: 'D:\\proj',
+    messages: [
+      {
+        role: 'assistant',
+        content: [{ type: 'tool_use', id: 'TU-1', name: 'Bash', input: { command: 'ls' } }],
+        meta: {
+          claude: {
+            message: {
+              id: 'msg_native_2', role: 'assistant', type: 'message', model: 'claude-sonnet-4-5',
+              content: [{ type: 'tool_use', id: 'TU-1', name: 'Bash', input: { command: 'ls' }, caller: 'subagent-1' }],
+            },
+          },
+        },
+      },
+    ],
+  };
+  const built = buildMainRecords(ir, 'sess-c2', { targetCwd: 'D:\\proj', nowMs: 1700000000000 });
+  const asst = built.records.find((r) => r.type === 'assistant') as
+    | { message?: { id?: string; content?: Array<{ caller?: string }> } }
+    | undefined;
+  assert.ok(asst, 'assistant 记录落盘');
+  assert.equal(asst!.message?.id, 'msg_native_2', 'native message 透传');
+  assert.equal(asst!.message?.content?.[0]?.caller, 'subagent-1', 'native 块级字段（caller）无损');
+});
+
+test('P1-D: anchor 消息的非摘要块照常 emit（不再整条丢）+ 摘要不双写', async () => {
+  const root = await tempRoot();
+  const SUMMARY = 'This session is being continued from a previous conversation… 摘要';
+  const ir: MigratedSession = {
+    schemaVersion: 2,
+    originTool: 'dsh',
+    cwd: 'D:\\proj',
+    messages: [
+      { role: 'user', content: [{ type: 'text', text: 'q1' }] },
+      { role: 'user', content: [{ type: 'text', text: SUMMARY }, { type: 'text', text: 'ANCHOR-EXTRA-BLOCK' }] },
+      { role: 'user', content: [{ type: 'text', text: 'after' }] },
+    ],
+    compaction: [{ summary: SUMMARY, anchorIndex: 1 }],
+  };
+  const adapter = new ClaudeAdapter();
+  const res = await adapter.write(ir, { root, targetCwd: 'D:\\proj' });
+  const back = await adapter.parse(res.sessionId, root);
+  assert.ok(
+    back.messages.some((m) => m.content.some((b) => b.type === 'text' && (b as { text: string }).text === 'ANCHOR-EXTRA-BLOCK')),
+    'anchor 消息的额外 text 块存活',
+  );
+  const summaryCount = back.messages.filter((m) =>
+    m.content.some((b) => b.type === 'text' && (b as { text: string }).text === SUMMARY),
+  ).length;
+  assert.equal(summaryCount, 1, '摘要只落盘一遍（emitCompactionPair 承载，不双写）');
+  assert.equal(back.compaction?.length, 1);
+});
+
+test('P1-D: 越界 anchorIndex 显式警告，boundary 不静默落盘', () => {
+  const ir: MigratedSession = {
+    schemaVersion: 2,
+    originTool: 'dsh',
+    cwd: 'D:\\proj',
+    messages: [{ role: 'user', content: [{ type: 'text', text: 'q' }] }],
+    compaction: [{ summary: 'S', anchorIndex: 99 }, { summary: 'legacy-no-anchor' }],
+  };
+  const warnings: string[] = [];
+  const origWarn = console.warn;
+  console.warn = (...args: unknown[]) => warnings.push(args.map(String).join(' '));
+  try {
+    const built = buildMainRecords(ir, 'sess-d', { targetCwd: 'D:\\proj', nowMs: 1000 });
+    const boundaries = built.records.filter((r) => r.subtype === 'compact_boundary');
+    // 越界 entry 无锚定点不能伪造位置 → 不落盘；缺 anchorIndex 的遗留形状保持静默跳过
+    assert.equal(boundaries.length, 0);
+    assert.equal(warnings.length, 1, '恰好一条警告');
+    assert.match(warnings[0]!, /anchorIndex 99 out of range/);
+  } finally {
+    console.warn = origWarn;
+  }
+});

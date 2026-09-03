@@ -220,6 +220,23 @@ messages[] 里**全量保留**（含被遮蔽消息）——无损原则；"哪�
 
 第一/三/四层与 claude 重写完全解耦（只碰 `ir.ts`/`migrate.ts`/测试），**先做**——小 diff、现有测试立即验回归；第二层绑重写（依赖 #6/#7 落地时一并守卫）。
 
+## 全适配器深度审查与修复登记（2026-09-03）
+
+三路并行深度审查（读端零丢弃 / 写端契约 / 静默吞 triage，全部带探针证据）共产出 13 项 P0 + 24 项 P1，随后四路并行修复**全部 P0 与高收益 P1 落地**（测试 137→173；全部修复经主会话独立探针复跑抽验）。共性根因：约半数 P0 是「读端按零丢弃承诺归档、写端从未消费」的半成品契约——labels、sessionEvents、侧链桶、firstKeptId 均属此类；既有测试全绿恰恰因为都停在「读端入桶」这一半。
+
+| 适配器 | 已修 P0 | 已修 P1（要点） |
+|--------|---------|------------------|
+| dsh | packed 行写端闸门（catalog∪packed 双集合放行，`verify.ts` 联动）；乱序 IR 的 call-before-result 修正 pass | 子会话 cwd 三级解析（sc.cwd>headerRaw.cwd>父）；零投影 surface 行落 unmappedEvents；teammate 侧链显式丢弃+警告（转译待专项，`docs/agents/dsh.md` 已登记） |
+| claude | sessionEvents 桶投影路径直通重放（compact_boundary 与 compaction 桶协调防双写；新 uuid + parentUuid 重锚链尾）；stale preserved\*/preservedMessages 引用删除（存活判定在 boundary uuid 登记后——anchorUuid 指向 boundary 自身） | local_command 并入 keep 白名单（isMeta 族）；碰撞换号后 finalPath 重算；native content 透传前置校验（tool_use id 集合双向一致否则回退合成）；anchor 消息块级摘除摘要（额外块存活、摘要不双写）+ 越界 anchorIndex warn |
+| codex | 生产 `parse()` 接入 `parseRolloutFile`（history_base 链式拼接此前只在测试路径生效——测试/生产分叉）；合成 call id 跨段撞名（scope 前缀） | 空标题不写 '(untitled)' 进 session_index；事件缺 time 回退流时间轴（非 epoch-0） |
+| pi | label 写回 id 重映射（`meta.pi.labels[].anchorIndex` 加性扩形）；侧链桶全消费（compaction/branch_summary/settingsEvents/labels/customEntries——顺带修侧链 walk 后序遍历倒序 bug）；firstKeptEntryId 保真映射（pi→pi 不缩活跃面） | 合成 entry timestamp 取会话内数据（anchor 消息 ts），不再 Date.now() |
+| zcode | 孤儿 tool_result 降级 `[tool result]` user 行；无主 sidechain drain 成子会话；孙代递归；pending 调用写原生 pending 态（不伪造 completed+''） | synthetic 门（默认丢/keepSynthetic 时 hidden semantics）；`zcode.session` extension 回写 version/permission（slug/taskType 行级身份不回灌——防 child extension 嫁接污染）；listSessions 吞错改抛错 |
+| opencode | compaction 锚豁免 synthetic/system 门（pi v3.3 官方锚形状此前落即蒸发——锚优先级高于角色门，同 DSH checkpoint 豁免先例） | writeToDb 事务包裹（BEGIN IMMEDIATE/ROLLBACK，中途失败零残留）；boundary 行自带 text part 不再吞掉（实库 23/44 边界行带 `[user interrupted]`）；listSessions 吞错改抛错（不误落 mirror） |
+
+**裁决延后项**（需专项设计，非本轮范围）：claude preserved 段全量 rekey；dsh teammate→team 事件转译；zcode 嵌套子会话内 Agent tool_use 的 metadata 回链。审查报告的 P2 测试盲区已随修复落地大部分护栏测试。
+
+**pi labels anchorIndex 扩形**（命名空间内加性，不 bump IR_VERSION）：`meta.pi.labels[]` 条目新增可选 `anchorIndex`（targetId 对应的 messages[] 投影下标，读端归档时计算）——写端经它把源 targetId 重映射到本次生成的 entry id 后再发 label 行（pi 的 `appendLabelChange` 有 `byId.has` guard，旧 id 必被拒）。语义同 v3.3 anchor 契约先例：加性可选字段、旧端忽略即可。详见 `packages/core/src/adapters/pi/index.ts` 头注释。
+
 ## 适配器适配状态
 
 > 下表的"✅"不再是自述——`Adapter.irVersion` 已由 registry 硬闸门机器强制（落后 = 无法注册），契约测试锁定各写端行为。

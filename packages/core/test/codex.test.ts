@@ -1166,3 +1166,203 @@ test('read: spawn_agent task_name links a subagent to its summoning call', async
   assert.equal(nina.agentId, otherId);
   assert.equal(nina.parentMessageId, undefined, 'no spawn call matches a foreign task_name');
 });
+
+/* ------------------------------------------------------------------ */
+/* P0/P1 review fixes: history_base in production parse, scoped      */
+/* synthetic ids, untitled index skip, chronology fallback             */
+/* ------------------------------------------------------------------ */
+
+/** prefix + suffix rollout pair linked by history_base, on the real dir tree. */
+async function writePaginatedPair(root: string): Promise<{ suffixPath: string; threadId: string }> {
+  const dir = join(root, 'sessions', '2026', '01', '12');
+  await fs.mkdir(dir, { recursive: true });
+  const threadId = '019b0000-0000-7000-8000-00000000abcd';
+  const suffixId = '019b0000-0000-7000-8000-00000000ffff';
+
+  const prefixRecords = [
+    { timestamp: TS, ordinal: 0, type: 'session_meta', payload: { id: threadId, session_id: threadId, timestamp: TS, cwd: 'D:\\proj', originator: 'codex_cli_rs', cli_version: '0.146.0', history_mode: 'paginated' } },
+    { timestamp: TS, ordinal: 1, type: 'response_item', payload: { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'prefix question' }] } },
+    { timestamp: TS, ordinal: 2, type: 'response_item', payload: { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'prefix answer' }] } },
+  ];
+  const prefixText = prefixRecords.map((r) => JSON.stringify(r)).join('\n') + '\n';
+  await fs.writeFile(join(dir, `rollout-2026-01-12T20-55-47-${threadId}.jsonl`), prefixText, 'utf8');
+
+  const suffixRecords = [
+    { timestamp: TS, ordinal: 3, type: 'session_meta', payload: {
+      id: threadId, session_id: threadId, timestamp: TS, cwd: 'D:\\proj', originator: 'codex_cli_rs', cli_version: '0.146.0',
+      history_mode: 'paginated',
+      history_base: { thread_id: threadId, end_ordinal_exclusive: 3, end_byte_offset: Buffer.byteLength(prefixText, 'utf8') },
+    } },
+    { timestamp: TS, ordinal: 4, type: 'response_item', payload: { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'suffix question' }] } },
+    { timestamp: TS, ordinal: 5, type: 'response_item', payload: { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'suffix answer' }] } },
+  ];
+  const suffixPath = join(dir, `rollout-2026-01-12T20-55-48-${threadId}_${suffixId}.jsonl`);
+  await fs.writeFile(suffixPath, suffixRecords.map((r) => JSON.stringify(r)).join('\n') + '\n', 'utf8');
+  return { suffixPath, threadId };
+}
+
+test('parse(): history_base chain stitches prefix through the adapter entry point (P0-A)', async () => {
+  const adapter = new CodexAdapter();
+  const root = await tempRoot();
+  const { suffixPath, threadId } = await writePaginatedPair(root);
+
+  // BOTH ids of the pair resolve to the suffix file (newest-mtime / exact
+  // rollout-id match) — regardless of which one the user picked, the parse
+  // must surface the full stitched thread, not just the suffix segment.
+  const ir = await adapter.parse(threadId, root);
+  assert.equal(ir.originSessionId, threadId);
+  assert.equal(
+    ir.messages.length,
+    4,
+    'CodexAdapter.parse returns PREFIX+SUFFIX messages (history_base chain resolved)',
+  );
+  const texts = ir.messages.map((m) => m.content.map((b) => (b.type === 'text' ? b.text : '')).join(''));
+  assert.deepEqual(texts, ['prefix question', 'prefix answer', 'suffix question', 'suffix answer']);
+  const codex = (ir.meta as Record<string, unknown>).codex as Record<string, unknown>;
+  const chain = codex.historyChain as Array<{ rolloutId: string; endByteOffset: number }>;
+  assert.equal(chain?.length, 1, 'chain metadata rides meta.codex.historyChain');
+  assert.equal(chain[0].rolloutId, threadId);
+
+  // the prefix file's own id resolves to the prefix file; its parse is the
+  // prefix alone (no suffix) — identity rules are per-file.
+  const prefixIr = await parseRolloutFile(
+    join(root, 'sessions', '2026', '01', '12', `rollout-2026-01-12T20-55-47-${threadId}.jsonl`),
+    root,
+  );
+  assert.equal(prefixIr.messages.length, 2);
+  void suffixPath;
+});
+
+test('read: synthesized call ids are scoped per stitched chain, so two segments cannot collide (P1-7)', async () => {
+  const adapter = new CodexAdapter();
+  const root = await tempRoot();
+  const dir = join(root, 'sessions', '2026', '01', '12');
+  await fs.mkdir(dir, { recursive: true });
+  const threadId = '019b0000-0000-7000-8000-00000000eeee';
+
+  // Both segments carry a call_id-less local_shell_call at the SAME source
+  // lineSeq (1) — unscoped synthesis would mint `local_shell_1` twice and
+  // the write-back would emit a call and its output paired across segments.
+  const shellAction = { type: 'exec', command: ['pwd'], timeout_ms: null, working_directory: null, env: null, user: null };
+  const prefixRecords = [
+    { timestamp: TS, ordinal: 0, type: 'session_meta', payload: { id: threadId, session_id: threadId, timestamp: TS, cwd: 'D:\\proj', history_mode: 'paginated' } },
+    { timestamp: TS, ordinal: 1, type: 'response_item', payload: { type: 'local_shell_call', call_id: null, status: 'completed', action: shellAction } },
+  ];
+  const prefixText = prefixRecords.map((r) => JSON.stringify(r)).join('\n') + '\n';
+  await fs.writeFile(join(dir, `rollout-2026-01-12T20-55-47-${threadId}.jsonl`), prefixText, 'utf8');
+
+  const suffixRecords = [
+    { timestamp: TS, ordinal: 2, type: 'session_meta', payload: {
+      id: threadId, session_id: threadId, timestamp: TS, cwd: 'D:\\proj', history_mode: 'paginated',
+      history_base: { thread_id: threadId, end_ordinal_exclusive: 2, end_byte_offset: Buffer.byteLength(prefixText, 'utf8') },
+    } },
+    { timestamp: TS, ordinal: 3, type: 'response_item', payload: { type: 'local_shell_call', call_id: null, status: 'completed', action: shellAction } },
+  ];
+  // distinct rolloutId after the underscore — a suffix with rolloutId ===
+  // threadId degenerates both candidates to thread matches and the mtime
+  // tiebreak becomes nondeterministic for same-ms writes.
+  await fs.writeFile(join(dir, `rollout-2026-01-12T20-55-48-${threadId}_019b0000-0000-7000-8000-00000000d0d0.jsonl`), suffixRecords.map((r) => JSON.stringify(r)).join('\n') + '\n', 'utf8');
+
+  const ir = await adapter.parse(threadId, root);
+  const ids = ir.messages.map((m) => m.content[0]).filter((b) => (b as { type?: string }).type === 'tool_use').map((b) => (b as { id: string }).id);
+  assert.equal(ids.length, 2);
+  assert.notEqual(ids[0], ids[1], 'two synthesized ids across the stitched chain differ');
+  assert.ok(ids.every((id) => /^local_shell_s1_/.test(id)), 'ids carry the chain scope marker');
+
+  // single-file parses keep the legacy unscoped id format
+  const single = rolloutRecordsToIr(lines([
+    metaLine({ id: 's', session_id: 's', history_mode: 'paginated' }),
+    item({ type: 'local_shell_call', call_id: null, status: 'completed', action: shellAction }),
+  ]), {});
+  assert.equal((single.messages[0].content[0] as { id: string }).id, 'local_shell_1', 'unscoped single file keeps the legacy id');
+
+  // the distinct ids survive the write-back: both shells replay as native
+  // local_shell_call rows, call_id preserved as explicit null exactly as the
+  // source stored them (the synthesized IR id is pairing-side only — it must
+  // NOT be fabricated into the native payload).
+  const out = buildRolloutLines(ir, 'new-thread', 'D:\\proj', Date.parse(TS), {
+    targetCwd: 'D:\\proj', createdAt: Date.parse(TS), threadId: 'new-thread', keepSynthetic: true,
+  }).map((l) => JSON.parse(l) as Record<string, unknown>);
+  const shellRows = out
+    .filter((r) => r.type === 'response_item' && (r.payload as Record<string, unknown>).type === 'local_shell_call')
+    .map((r) => (r.payload as Record<string, unknown>));
+  assert.equal(shellRows.length, 2, 'both shells replay');
+  assert.ok(shellRows.every((p) => p.call_id === null), 'native call_id:null stays null (no fabricated pairing id)');
+});
+
+test('write: untitled session gets no session_index row (codex writes none for unnamed sessions)', async () => {
+  const adapter = new CodexAdapter();
+  const root = await tempRoot();
+  // assistant-only session: no user prompt → no derivable title
+  const ir: MigratedSession = {
+    schemaVersion: 2,
+    originTool: 'codex',
+    originSessionId: 'no-title-1',
+    createdAt: Date.parse(TS),
+    cwd: 'D:\\proj',
+    messages: [{ role: 'assistant', content: [{ type: 'text', text: 'an answer without a question' }] }],
+    meta: { codex: { sessionMetaLine: { ts: TS, payload: { id: 'no-title-1', session_id: 'no-title-1', cli_version: '1', source: 'cli' } } } },
+  };
+  assert.equal(sessionIndexTitle(ir), undefined, 'no title → no index title (never a fabricated \'(untitled)\')');
+  const res = await adapter.write(ir, { root, targetCwd: 'D:\\proj' });
+  // rollout file written; index file gets NO row for the thread
+  const idxPath = sessionIndexPath(root);
+  const idxText = await fs.readFile(idxPath, 'utf8').catch(() => '');
+  const idxIds = idxText.trim().split('\n').filter(Boolean).map((l) => (JSON.parse(l) as { id: string }).id);
+  assert.ok(!idxIds.includes(res.sessionId), 'untitled thread has no session_index row');
+  assert.equal(idxIds.length, 0, 'index stays empty (or absent) for a fully untitled run');
+
+  // a TITLED write still appends exactly one row (regression guard)
+  const root2 = await tempRoot();
+  const ir2 = fallbackIr();
+  ir2.title = '有名会话';
+  const res2 = await adapter.write(ir2, { root: root2, targetCwd: 'D:\\proj' });
+  const idx2 = await fs.readFile(sessionIndexPath(root2), 'utf8');
+  const rows2 = idx2.trim().split('\n').map((l) => JSON.parse(l) as { id: string; thread_name: string });
+  assert.equal(rows2.length, 1);
+  assert.equal(rows2[0].id, res2.sessionId);
+  assert.equal(rows2[0].thread_name, '有名会话');
+});
+
+test('write: archived rows without time fall back to the stream chronology, never epoch-0 (P1-B)', () => {
+  const ir: MigratedSession = {
+    schemaVersion: 2,
+    originTool: 'codex',
+    originSessionId: 'chron-1',
+    createdAt: Date.parse(TS),
+    cwd: 'D:\\proj',
+    messages: [
+      { role: 'user', timestamp: Date.parse('2026-08-20T02:14:08.000Z'), seq: 0, content: [{ type: 'text', text: 'q' }] },
+      { role: 'assistant', timestamp: Date.parse('2026-08-20T02:14:09.000Z'), seq: 1, content: [{ type: 'text', text: 'a' }] },
+    ],
+    meta: { codex: { sessionMetaLine: { ts: TS, payload: { id: 'chron-1', session_id: 'chron-1', cli_version: '1', source: 'cli' } } } },
+    unmappedEvents: [
+      // a foreign harness row with no time — the only kind that can reach the
+      // fallback (codex-native archives always carry their own ts via rawLine).
+      // seq 2 = its source position after both messages, as in real parses.
+      { seq: 2, time: Number.NaN, type: 'sub_agent_activity', data: { type: 'sub_agent_activity', state: 'completed' } },
+    ],
+  };
+  const out = buildRolloutLines(ir, 'chron-new', 'D:\\proj', Date.parse(TS), {
+    targetCwd: 'D:\\proj', createdAt: Date.parse(TS), threadId: 'chron-new', keepSynthetic: true,
+  }).map((l) => JSON.parse(l) as { type: string; timestamp: string; payload?: Record<string, unknown> });
+  const row = out.find((r) => r.type === 'event_msg');
+  assert.ok(row, 'persisted variant replays');
+  assert.notEqual(row.timestamp, '1970-01-01T00:00:00.000Z', 'no epoch-0 timestamp');
+  // fallback = newest chronology point already rendered: the assistant
+  // message's timestamp (emission order = seq order)
+  assert.equal(row.timestamp, '2026-08-20T02:14:09.000Z');
+
+  // a time-less row that sorts BEFORE any message falls back to session
+  // createdAt — still the session's own chronology, never epoch-0.
+  const early: MigratedSession = {
+    ...ir,
+    messages: [{ role: 'user', timestamp: Date.parse('2026-08-20T02:14:08.000Z'), seq: 1, content: [{ type: 'text', text: 'q' }] }],
+    unmappedEvents: [{ seq: 0, time: Number.NaN, type: 'task_started', data: { type: 'task_started', turn_id: 't' } }],
+  };
+  const outEarly = buildRolloutLines(early, 'chron-early', 'D:\\proj', Date.parse(TS), {
+    targetCwd: 'D:\\proj', createdAt: Date.parse(TS), threadId: 'chron-early', keepSynthetic: true,
+  }).map((l) => JSON.parse(l) as { type: string; timestamp: string });
+  const earlyRow = outEarly.find((r) => r.type === 'event_msg')!;
+  assert.equal(earlyRow.timestamp, TS, 'pre-message row falls back to createdAt, still not epoch-0');
+});

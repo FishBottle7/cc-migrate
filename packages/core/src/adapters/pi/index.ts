@@ -27,6 +27,16 @@
  *    with an explicit "unsupported" error — never silently dropped or
  *    half-parsed (pi.md §7). Legacy v1/v2 files get the same explicit refusal
  *    (open in pi once to migrate, then re-export).
+ *  - IR shape additions (additive, namespace-internal optional fields — no
+ *    IR_VERSION bump per ir-protocol v3.3 precedent, shapes stay inside the
+ *    meta.pi namespace):
+ *    · `meta.pi.labels[].anchorIndex` — messages[] index of the entry the
+ *      label's targetId names. The write side mints fresh entry ids, so the
+ *      source id alone can never re-anchor a label; position is the pointer.
+ *    · `compaction[].meta.pi.firstKeptIndex` — messages[] index the native
+ *      cut point (firstKeptEntryId) maps to; write-back maps it to the new
+ *      entry id instead of synthesizing the compaction's parent (which
+ *      would shrink the active surface by one message).
  *  - Red lines: read-only on source files (never pi's own `open` chain — it
  *    rewrites old files in place); no unlink/rm/trash anywhere; writes go to a
  *    brand-new file created exclusively (`wx`).
@@ -124,8 +134,19 @@ interface PiMessageMeta {
 interface PiSessionMeta {
   header?: Record<string, unknown>;
   settingsEvents?: Array<Record<string, unknown>>;
-  labels?: Array<{ targetId: string; label?: string; time: number }>;
+  /**
+   * `anchorIndex` (additive, optional): index into messages[] of the entry the
+   * `targetId` names. pi write-back mints FRESH entry ids, so the source id is
+   * useless as a pointer — the anchor is what lets the label row re-target the
+   * surviving message. Entries without an anchor (target is a non-message
+   * entry, or a foreign IR hand-built without one) keep the IR archive as-is
+   * and the write side skips them (pi's appendLabelChange would reject a
+   * dangling id anyway).
+   */
+  labels?: Array<{ targetId: string; anchorIndex?: number; label?: string; time: number }>;
   customEntries?: Array<{ customType: string; data?: unknown; time: number }>;
+  /** Sidechain-level branch_summary twins (no typed slot on MigratedSidechain) — same archive as the session bucket. */
+  branchSummaries?: MigratedBranchSummary[];
   titleCleared?: boolean;
 }
 
@@ -209,7 +230,11 @@ export class PiAdapter implements Adapter {
       byId.add(id);
       return id;
     };
-    const entryTimestamp = (t: number | undefined, fallback = Date.now()): string =>
+    // Timestamp fallback = the session's own createdAt, NOT the migration
+    // machine's wall clock: a hand-built IR row without a time is still part
+    // of the session's history, and a "now" would date history to the moment
+    // of copying (P1: derived, never a fabricated present).
+    const entryTimestamp = (t: number | undefined, fallback = ir.createdAt ?? Date.now()): string =>
       new Date(typeof t === 'number' && Number.isFinite(t) ? t : fallback).toISOString();
 
     // --- main chain: messages → native entries --------------------------------
@@ -237,14 +262,16 @@ export class PiAdapter implements Adapter {
       ? [...ir.messages, { role: 'assistant' as const, content: [{ type: 'text' as const, text: '(migrated session — continuation)' }] }]
       : ir.messages;
 
-    // entry id → original message identity (for label target remapping)
-    const entryIdByMsg = new Map<MigratedMessage, string>();
+    // messages[] index → the fresh entry id minted for it (labels / compaction
+    // cut points re-target by position: the write regenerates ids, so the IR's
+    // source ids can never match — position is the only stable pointer).
+    const entryIdByMsgIdx = new Map<number, string>();
 
     for (const [msgIdx, msg] of writeMessages.entries()) {
       const pim = (msg.meta as { pi?: PiMessageMeta } | undefined)?.pi;
       if (!pim?.anchor) {
         const id = nextId();
-        entryIdByMsg.set(msg, id);
+        entryIdByMsgIdx.set(msgIdx, id);
         appendLine({
           type: 'message',
           id,
@@ -263,22 +290,25 @@ export class PiAdapter implements Adapter {
       const comp = compactionByAnchor.get(msgIdx);
       if (comp) {
         const cid = nextId();
-        const cMeta = comp.meta as { entryId?: string; details?: unknown; usage?: unknown; fromHook?: boolean; entryTimestamp?: string } | undefined;
+        const cMeta = comp.meta as { entryId?: string; details?: unknown; usage?: unknown; fromHook?: boolean; entryTimestamp?: string; firstKeptIndex?: number } | undefined;
+        // firstKeptEntryId must reference an entry that EXISTS in this file
+        // (sm.ts:418 buildContextEntries: a dangling pointer keeps
+        // foundFirstKept forever false and the active surface degrades to
+        // the post-compaction tail).
+        // pi→pi with a native cut point (meta.firstKeptIndex, recorded by the
+        // read side): map the source cut to the NEW entry id so the retained
+        // span starts where it did in the source file — a synthesized parent
+        // anchor would shrink the active surface by one message.
+        // Cross-tool (no native cut, 选 3): anchor the kept span at the
+        // compaction's own parent — a REAL entry id, never a fabricated cut.
+        const nativeFirstKept = cMeta?.firstKeptIndex !== undefined ? entryIdByMsgIdx.get(cMeta.firstKeptIndex) : undefined;
         appendLine({
           type: 'compaction',
           id: cid,
           parentId,
-          timestamp: cMeta?.entryTimestamp ?? entryTimestamp(undefined),
+          timestamp: cMeta?.entryTimestamp ?? entryTimestamp(msg.timestamp),
           summary: comp.summary,
-          // firstKeptEntryId must reference an entry that EXISTS in this file
-          // (sm.ts:418 buildContextEntries: a dangling pointer keeps
-          // foundFirstKept forever false and the active surface degrades to
-          // the post-compaction tail). Cross-tool compactions carry a source
-          // cut point we cannot honestly replicate (选 3: full archive, no
-          // fabricated cut) — so we anchor the "kept" span at the compaction's
-          // own parent: everything from there on stays visible next to the
-          // summary. That is a REAL entry id, keeping pi's fold machinery intact.
-          firstKeptEntryId: parentId!,
+          firstKeptEntryId: nativeFirstKept ?? parentId!,
           tokensBefore: typeof comp.tokensBefore === 'number' ? comp.tokensBefore : 0,
           ...(cMeta?.details !== undefined ? { details: cMeta.details } : {}),
           ...(cMeta?.usage !== undefined ? { usage: cMeta.usage } : {}),
@@ -294,7 +324,9 @@ export class PiAdapter implements Adapter {
           type: 'branch_summary',
           id: bid,
           parentId,
-          timestamp: bMeta?.entryTimestamp ?? entryTimestamp(undefined),
+          // Derivable from the anchor twin itself — never a wall-clock "now"
+          // pretending to be history (pi entries carry their own timestamps).
+          timestamp: bMeta?.entryTimestamp ?? entryTimestamp(msg.timestamp),
           fromId: bs.fromId,
           summary: bs.summary,
           ...(bMeta?.details !== undefined ? { details: bMeta.details } : {}),
@@ -355,8 +387,26 @@ export class PiAdapter implements Adapter {
     // a branch_summary tagging it as migrated. Sibling branches stay out of
     // the leaf path, so pi's resume context keeps the main chain active.
     if (ir.sidechains?.length) {
-      const mainFirstId = entryIdByMsg.get(writeMessages[0]) ?? null;
+      const mainFirstId = entryIdByMsgIdx.get(0) ?? null;
       for (const sc of ir.sidechains) {
+        const scMeta = (sc.meta as { pi?: PiSessionMeta } | undefined)?.pi;
+        // The sidechain's OWN buckets (read side: dead-branch compactions,
+        // branch summaries, labels, custom entries): replay them into this
+        // branch so a pi→pi round-trip keeps the branch's native state — a
+        // branch whose compaction/labels evaporated on write-back would be a
+        // one-way loss the IR promised never to make. Same projection as the
+        // main chain: bucket → native entry at anchorIndex, anchor message
+        // skipped.
+        const scCompByAnchor = new Map<number, MigratedCompaction>();
+        for (const c of sc.compaction ?? []) {
+          if (typeof c.anchorIndex === 'number') scCompByAnchor.set(c.anchorIndex, c);
+        }
+        const scBranchByAnchor = new Map<number, MigratedBranchSummary>();
+        for (const bs of scMeta?.branchSummaries ?? []) {
+          if (typeof bs.anchorIndex === 'number') scBranchByAnchor.set(bs.anchorIndex, bs);
+        }
+        // position → fresh entry id minted for the branch's message at it
+        const scIdByPos = new Map<number, string>();
         // A meta-only sidechain (branch carried labels/compactions but no
         // messages — the read side archives these) has no branch to draw: its
         // native form was dead-branch state that cannot attach without a host
@@ -365,19 +415,117 @@ export class PiAdapter implements Adapter {
         if (!sc.messages.length) continue;
         let branchParent = mainFirstId;
         let branchLeaf = branchParent;
-        for (const msg of sc.messages) {
+        for (const [pos, msg] of sc.messages.entries()) {
           const pim = (msg.meta as { pi?: PiMessageMeta } | undefined)?.pi;
-          if (pim?.anchor) continue; // anchor twin — bucket side provides the entry
-          const bid = nextId();
+          if (!pim?.anchor) {
+            const bid = nextId();
+            scIdByPos.set(pos, bid);
+            appendLine({
+              type: 'message',
+              id: bid,
+              parentId: branchParent,
+              timestamp: entryTimestamp(msg.timestamp),
+              message: piMessageFromMigrated(msg),
+            });
+            branchParent = bid;
+            branchLeaf = bid;
+          }
+          // bucket twins land at their anchor position (same contract as the
+          // main chain — the anchor message is skipped, the bucket entry IS
+          // the native row)
+          const comp = scCompByAnchor.get(pos);
+          if (comp) {
+            const cid = nextId();
+            const cMeta = comp.meta as { entryTimestamp?: string; firstKeptIndex?: number; details?: unknown; usage?: unknown; fromHook?: boolean } | undefined;
+            const nativeFirstKept = cMeta?.firstKeptIndex !== undefined ? scIdByPos.get(cMeta.firstKeptIndex) : undefined;
+            appendLine({
+              type: 'compaction',
+              id: cid,
+              parentId: branchParent,
+              timestamp: cMeta?.entryTimestamp ?? entryTimestamp(msg.timestamp),
+              summary: comp.summary,
+              firstKeptEntryId: nativeFirstKept ?? branchParent!,
+              tokensBefore: typeof comp.tokensBefore === 'number' ? comp.tokensBefore : 0,
+              ...(cMeta?.details !== undefined ? { details: cMeta.details } : {}),
+              ...(cMeta?.usage !== undefined ? { usage: cMeta.usage } : {}),
+              ...(cMeta?.fromHook !== undefined ? { fromHook: cMeta.fromHook } : {}),
+            });
+            branchParent = cid;
+            branchLeaf = cid;
+          }
+          const bs = scBranchByAnchor.get(pos);
+          if (bs) {
+            const bid2 = nextId();
+            const bMeta = bs.meta as { details?: unknown; usage?: unknown; fromHook?: boolean; entryTimestamp?: string } | undefined;
+            appendLine({
+              type: 'branch_summary',
+              id: bid2,
+              parentId: branchParent,
+              timestamp: bMeta?.entryTimestamp ?? entryTimestamp(msg.timestamp),
+              fromId: bs.fromId,
+              summary: bs.summary,
+              ...(bMeta?.details !== undefined ? { details: bMeta.details } : {}),
+              ...(bMeta?.usage !== undefined ? { usage: bMeta.usage } : {}),
+              ...(bMeta?.fromHook !== undefined ? { fromHook: bMeta.fromHook } : {}),
+            });
+            branchParent = bid2;
+            branchLeaf = bid2;
+          }
+        }
+        // branch-level settings sequence (model/thinking/session_info rows
+        // the read side archived off the leaf path) replays at the branch tail
+        for (const ev of scMeta?.settingsEvents ?? []) {
+          if (!isRecord(ev)) continue;
+          const time = typeof ev.time === 'number' ? ev.time : undefined;
+          if (ev.type === 'model_change' && typeof ev.provider === 'string' && typeof ev.modelId === 'string') {
+            const id = nextId();
+            appendLine({ type: 'model_change', id, parentId: branchParent, timestamp: entryTimestamp(time), provider: ev.provider, modelId: ev.modelId });
+            branchParent = id;
+            branchLeaf = id;
+          } else if (ev.type === 'thinking_level_change' && typeof ev.thinkingLevel === 'string') {
+            const id = nextId();
+            appendLine({ type: 'thinking_level_change', id, parentId: branchParent, timestamp: entryTimestamp(time), thinkingLevel: ev.thinkingLevel });
+            branchParent = id;
+            branchLeaf = id;
+          } else if (ev.type === 'session_info' && typeof ev.name === 'string') {
+            const id = nextId();
+            appendLine({ type: 'session_info', id, parentId: branchParent, timestamp: entryTimestamp(time), name: ev.name });
+            branchParent = id;
+            branchLeaf = id;
+          }
+        }
+        // branch-level labels re-target through scIdByPos (same remapping as
+        // the session-level labels below)
+        for (const l of scMeta?.labels ?? []) {
+          if (!isRecord(l) || typeof l.targetId !== 'string') continue;
+          const remap = l.anchorIndex !== undefined ? scIdByPos.get(l.anchorIndex as number) : undefined;
+          if (!remap) continue;
+          const id = nextId();
           appendLine({
-            type: 'message',
-            id: bid,
+            type: 'label',
+            id,
             parentId: branchParent,
-            timestamp: entryTimestamp(msg.timestamp),
-            message: piMessageFromMigrated(msg),
+            timestamp: entryTimestamp(l.time as number),
+            targetId: remap,
+            label: typeof l.label === 'string' && l.label ? l.label : null,
           });
-          branchParent = bid;
-          branchLeaf = bid;
+          branchParent = id;
+          branchLeaf = id;
+        }
+        // branch-level custom entries
+        for (const ce of scMeta?.customEntries ?? []) {
+          if (!isRecord(ce) || typeof ce.customType !== 'string') continue;
+          const id = nextId();
+          appendLine({
+            type: 'custom',
+            id,
+            parentId: branchParent,
+            timestamp: entryTimestamp(ce.time as number),
+            customType: ce.customType,
+            ...(ce.data !== undefined ? { data: ce.data } : {}),
+          });
+          branchParent = id;
+          branchLeaf = id;
         }
         const sid = nextId();
         const summaryText = sc.agentType ? `sidechain ${sc.agentId} (${sc.agentType})` : `sidechain ${sc.agentId} (${sc.kind})`;
@@ -385,7 +533,7 @@ export class PiAdapter implements Adapter {
           type: 'branch_summary',
           id: sid,
           parentId: branchLeaf,
-          timestamp: entryTimestamp(undefined),
+          timestamp: entryTimestamp(sc.createdAt),
           fromId: branchLeaf ?? sid,
           summary: summaryText,
         });
@@ -397,9 +545,21 @@ export class PiAdapter implements Adapter {
     if (Array.isArray(labels)) {
       for (const l of labels) {
         if (!isRecord(l)) continue;
-        // pi's appendLabelChange guards byId.has(targetId) — only write labels
-        // whose target survived into this file (an entry id we generated).
-        if (typeof l.targetId !== 'string' || !byId.has(l.targetId)) continue;
+        // pi's appendLabelChange guards byId.has(targetId) — and this write
+        // minted FRESH entry ids, so the IR's source targetId can never match
+        // by construction. The read side records anchorIndex (messages[]
+        // position of the labelled entry's projection) precisely so the label
+        // can re-anchor to the new id; labels whose anchor resolved to nothing
+        // (target was a non-message entry, or a foreign IR hand-built without
+        // anchors) are skipped with a warning — writing them would be a row
+        // pi itself rejects on load (dangling target).
+        const anchor = typeof l.anchorIndex === 'number' ? entryIdByMsgIdx.get(l.anchorIndex) : undefined;
+        if (!anchor) {
+          if (typeof l.targetId === 'string' && l.targetId) {
+            console.warn(`[pi write] label targeting entry ${l.targetId} has no anchorIndex mapping — kept in IR, not written (pi rejects dangling label targets)`);
+          }
+          continue;
+        }
         const id = nextId();
         // clear semantics ride an explicit `label: null` row (pi.md §12 —
         // `undefined` and absent serialize identically, so the clear must be
@@ -409,7 +569,7 @@ export class PiAdapter implements Adapter {
           id,
           parentId,
           timestamp: entryTimestamp(l.time),
-          targetId: l.targetId,
+          targetId: anchor,
           label: undefined,
         };
         labelEntry.label = typeof l.label === 'string' && l.label ? l.label : null;
@@ -783,6 +943,14 @@ export async function parsePiFile(path: string): Promise<MigratedSession> {
     mainPath.push(...chain);
   }
 
+  // Leaf-path entry id → index of its projected message in messages[] (main
+  // chain only; the sidechain pass keeps its own). Filled as the pass below
+  // runs in root→leaf order, so by the time a compaction (cut point) or label
+  // (target) references an EARLIER entry, its position is already recorded.
+  // Non-message entries never enter the map — references to them legitimately
+  // stay unresolved (write-back falls back, never fabricates).
+  const entryIdToMsgIndex = new Map<string, number>();
+
   const messages: MigratedMessage[] = [];
   const compaction: MigratedCompaction[] = [];
   const branchSummaries: MigratedBranchSummary[] = [];
@@ -810,6 +978,7 @@ export async function parsePiFile(path: string): Promise<MigratedSession> {
         if (msg) {
           if (msg.timestamp === undefined) msg.timestamp = toEpochMs(e.timestamp);
           messages.push(msg);
+          if (e.id) entryIdToMsgIndex.set(e.id, messages.length - 1);
           // settings derivation also honours assistant rows (sm.ts:362 three
           // sources last-wins: thinking/model changes + assistant provider/model)
           if (msg.role === 'assistant' && msg.provider && msg.model) {
@@ -835,6 +1004,15 @@ export async function parsePiFile(path: string): Promise<MigratedSession> {
         if (e.details !== undefined) meta.details = e.details;
         if (e.usage !== undefined) meta.usage = e.usage;
         if (e.fromHook !== undefined) meta.fromHook = e.fromHook;
+        // Position of the native cut point inside messages[], derived from
+        // the leaf-path walk we are doing anyway: firstKeptEntryId names a
+        // main-path ENTRY; whichever main-path message-entry maps to it is the
+        // retained span's first message. Undefined when the cut point is not
+        // message-carried (compaction entry itself / dangling / non-message)
+        // — write-back then falls back to the parent anchor, never a fake cut.
+        const firstKeptIdRaw = typeof e.firstKeptEntryId === 'string' ? e.firstKeptEntryId : undefined;
+        const firstKeptIndex = firstKeptIdRaw !== undefined ? entryIdToMsgIndex.get(firstKeptIdRaw) : undefined;
+        if (firstKeptIndex !== undefined) meta.firstKeptIndex = firstKeptIndex;
         compaction.push({
           summary,
           tokensBefore: typeof e.tokensBefore === 'number' ? e.tokensBefore : undefined,
@@ -900,8 +1078,17 @@ export async function parsePiFile(path: string): Promise<MigratedSession> {
         // pi.md §8 #5: user-made bookmarks — targetId, label (undefined/null =
         // clear), time. Only labels on leaf-path entries are reachable in the
         // active surface, but record ALL of them (zero drop).
+        // anchorIndex (additive): the messages[] index of the entry the
+        // targetId names — the read pass resolves it here because this is the
+        // only place that knows entry id → projected message position. The
+        // write side regenerates fresh entry ids, so WITHOUT this anchor the
+        // label's stale source id can never be re-anchored and would be
+        // dropped by pi's own byId.has guard on every write-back.
+        const targetId = typeof e.targetId === 'string' ? e.targetId : '';
+        const anchorIndex = targetId ? entryIdToMsgIndex.get(targetId) : undefined;
         labels.push({
-          targetId: typeof e.targetId === 'string' ? e.targetId : '',
+          targetId,
+          ...(anchorIndex !== undefined ? { anchorIndex } : {}),
           label: typeof e.label === 'string' && e.label ? e.label : undefined,
           time: toEpochMs(e.timestamp) ?? 0,
         });
@@ -966,14 +1153,20 @@ export async function parsePiFile(path: string): Promise<MigratedSession> {
       const groupById = new Map(group.map((e) => [e.id ?? '', e]));
       const ordered: PiEntry[] = [];
       const visited = new Set<string>();
+      // Pre-order (self BEFORE children): the branch must read root→leaf, the
+      // same direction as the main chain — post-order emits a parent AFTER its
+      // children, so messages project in reverse and, worse, a compaction or
+      // label entry is processed before the entry it references has been
+      // projected (childEntryIdToMsgIndex misses it → cut point / label anchor
+      // unresolvable, and the branch folds to a synthesized cut).
       const walk = (e: PiEntry): void => {
         const eid = e.id ?? '';
         if (visited.has(eid)) return;
         visited.add(eid);
+        ordered.push(e);
         for (const child of group) {
           if (child.parentId === eid) walk(child);
         }
-        ordered.push(e);
       };
       // roots first: entries whose parent is outside the group
       for (const e of group) {
@@ -983,10 +1176,14 @@ export async function parsePiFile(path: string): Promise<MigratedSession> {
 
       const msgs: MigratedMessage[] = [];
       const childSettings: Array<Record<string, unknown>> = [];
-      const childLabels: Array<{ targetId: string; label?: string; time: number }> = [];
+      const childLabels: Array<{ targetId: string; anchorIndex?: number; label?: string; time: number }> = [];
       const childCustom: Array<{ customType: string; data?: unknown; time: number }> = [];
       const childCompactions: MigratedCompaction[] = [];
       const childBranches: MigratedBranchSummary[] = [];
+      // Same entry-id→messages[] map as the main-chain pass, scoped to this
+      // branch's msgs[] so sidechain compaction cut points and labels anchor
+      // against the sidechain's own projected messages.
+      const childEntryIdToMsgIndex = new Map<string, number>();
       for (const e of ordered) {
         const time = epochOf(e);
         switch (e.type) {
@@ -997,6 +1194,7 @@ export async function parsePiFile(path: string): Promise<MigratedSession> {
             if (msg) {
               if (msg.timestamp === undefined) msg.timestamp = toEpochMs(e.timestamp);
               msgs.push(msg);
+              if (e.id) childEntryIdToMsgIndex.set(e.id, msgs.length - 1);
             }
             break;
           }
@@ -1014,10 +1212,15 @@ export async function parsePiFile(path: string): Promise<MigratedSession> {
             if (e.details !== undefined) meta.details = e.details;
             if (e.usage !== undefined) meta.usage = e.usage;
             if (e.fromHook !== undefined) meta.fromHook = e.fromHook;
+            // Native cut point → position in this branch's msgs[] (see the
+            // main-chain compaction case for the contract).
+            const fkRaw = typeof e.firstKeptEntryId === 'string' ? e.firstKeptEntryId : undefined;
+            const fkIndex = fkRaw !== undefined ? childEntryIdToMsgIndex.get(fkRaw) : undefined;
+            if (fkIndex !== undefined) meta.firstKeptIndex = fkIndex;
             childCompactions.push({
               summary,
               tokensBefore: typeof e.tokensBefore === 'number' ? e.tokensBefore : undefined,
-              firstKeptId: typeof e.firstKeptEntryId === 'string' ? e.firstKeptEntryId : undefined,
+              firstKeptId: fkRaw,
               anchorIndex: msgs.length - 1,
               meta,
             });
@@ -1070,6 +1273,9 @@ export async function parsePiFile(path: string): Promise<MigratedSession> {
           case 'label':
             childLabels.push({
               targetId: typeof e.targetId === 'string' ? e.targetId : '',
+              ...(typeof e.targetId === 'string' && e.targetId && childEntryIdToMsgIndex.has(e.targetId)
+                ? { anchorIndex: childEntryIdToMsgIndex.get(e.targetId) }
+                : {}),
               label: typeof e.label === 'string' && e.label ? e.label : undefined,
               time: toEpochMs(e.timestamp) ?? 0,
             });

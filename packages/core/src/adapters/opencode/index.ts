@@ -251,7 +251,23 @@ export class OpenCodeAdapter implements Adapter {
               `WP DB helpers are not applicable here (different sandbox domain).`,
             );
           }
-          const written = writeToDb(db, ir, newId, targetCwd, flatten, opts?.keepSynthetic ?? false);
+          // Atomic write (opencode.md「BEGIN IMMEDIATE 事务写库」): the whole
+          // project+session+message+part insert is one transaction, so a
+          // mid-write failure leaves the store untouched instead of orphaned
+          // half-session rows. node:sqlite accepts plain BEGIN/COMMIT syntax.
+          db.exec('BEGIN IMMEDIATE');
+          let written: string;
+          try {
+            written = writeToDb(db, ir, newId, targetCwd, flatten, opts?.keepSynthetic ?? false);
+            db.exec('COMMIT');
+          } catch (e) {
+            try { db.exec('ROLLBACK'); } catch { /* no transaction was active */ }
+            const msg = String((e as Error)?.message ?? e);
+            if (msg.includes('SQLITE_BUSY') || msg.includes('database is locked')) {
+              throw new Error(`OpenCode: ${dbPath} is locked (SQLITE_BUSY) — another process (the opencode app?) is mid-write. Retry or write to a sandbox copy via --dst-root.`);
+            }
+            throw e;
+          }
           return { tool: 'opencode', sessionId: written, paths: [dbPath ?? '<db>'] };
         } finally {
           try { db.close(); } catch { /* ignore */ }
@@ -278,29 +294,37 @@ export class OpenCodeAdapter implements Adapter {
     const rootExplicit = !!(root && root.trim());
     if (shouldUseDb(dbPath, rootExplicit)) {
       const db = await openDb(dbPath!, { readOnly: true });
-      if (db) {
-        try {
-          // TOP-LEVEL sessions only: task subagents are native child session
-          // rows (session.parent_id) and OpenCode's own UI groups them under
-          // their parent — listing them as peers would flatten 955 subagent
-          // sessions into the picker of a real store. Orphaned children whose
-          // parent row vanished stay visible (nothing silently unlistable).
-          const rows = db.prepare('SELECT id, title, time_created, directory FROM session WHERE parent_id IS NULL OR parent_id NOT IN (SELECT id FROM session) ORDER BY time_created DESC').all() as OpRow[];
-          return rows.map((r) => ({
-            tool: 'opencode' as const,
-            sessionId: String(r.id ?? ''),
-            title: r.title ? String(r.title) : undefined,
-            createdAt: typeof r.time_created === 'number' ? r.time_created : undefined,
-            cwd: r.directory ? String(r.directory) : undefined,
-            sourcePath: dbPath ?? undefined,
-          }));
-        } catch {
-          return [];
-        } finally {
-          try { db.close(); } catch { /* ignore */ }
-        }
+      if (!db) {
+        // The db file EXISTS (shouldUseDb checked) but will not open —
+        // driver failure or a lock. That must surface as an error, not an
+        // empty list ("nothing to migrate" would send the caller the wrong
+        // way) and must not fall through to the mirror (a real store is
+        // present; the mirror is only for explicit roots with no db).
+        throw new Error(
+          `OpenCode: cannot open ${dbPath} read-only to list sessions (no sqlite driver / locked — busy hint: close the opencode app or retry).`,
+        );
+      }
+      try {
+        // TOP-LEVEL sessions only: task subagents are native child session
+        // rows (session.parent_id) and OpenCode's own UI groups them under
+        // their parent — listing them as peers would flatten 955 subagent
+        // sessions into the picker of a real store. Orphaned children whose
+        // parent row vanished stay visible (nothing silently unlistable).
+        const rows = db.prepare('SELECT id, title, time_created, directory FROM session WHERE parent_id IS NULL OR parent_id NOT IN (SELECT id FROM session) ORDER BY time_created DESC').all() as OpRow[];
+        return rows.map((r) => ({
+          tool: 'opencode' as const,
+          sessionId: String(r.id ?? ''),
+          title: r.title ? String(r.title) : undefined,
+          createdAt: typeof r.time_created === 'number' ? r.time_created : undefined,
+          cwd: r.directory ? String(r.directory) : undefined,
+          sourcePath: dbPath ?? undefined,
+        }));
+      } finally {
+        try { db.close(); } catch { /* ignore */ }
       }
     }
+    // No DB at the resolved path (or a non-explicit default with no real
+    // store): mirror listing for explicit roots only.
     const mirrorDir = root ? join(root.endsWith('.db') ? dirname(root) : root, 'opencode-mirror') : null;
     if (!mirrorDir) return [];
     let entries: string[];
@@ -553,12 +577,15 @@ function walkSession(db: DbHandle, sessionId: string, seen: Set<string>): WalkRe
           // compaction entry on write.
           messages.push({ role: 'user', content: [{ type: 'text', text: summaryText }], timestamp: ts });
           compactions.push({ summary: summaryText, anchorIndex: messages.length - 1, meta: { opencode: ocMeta } });
-          continue;
+          // NO continue here: 23/44 boundary rows in a real 1.18 store also
+          // carry ordinary text/file parts (e.g. `[user interrupted]`) —
+          // falling through projects them below so they do not evaporate.
+        } else {
+          // Boundary without a summary pair (failed compaction): keep the typed
+          // record without an anchor — the conversational stream has nothing to
+          // carry it on.
+          compactions.push({ summary: '', meta: { opencode: ocMeta } });
         }
-        // Boundary without a summary pair (failed compaction): keep the typed
-        // record without an anchor — the conversational stream has nothing to
-        // carry it on.
-        compactions.push({ summary: '', meta: { opencode: ocMeta } });
       }
       const content: ContentBlock[] = [];
       for (const p of parts) {
@@ -926,13 +953,21 @@ function writeMessages(
 
   messages.forEach((m, idx) => {
     if (consumedToolMsgs.has(idx) && m.role === 'tool') return; // merged into tool part
-    if (m.role === 'system') return; // system prompts are opencode config, not chat rows
+    // A compaction ANCHOR is exempt from both gates below: pi v3.3's official
+    // anchor shape is a `synthetic: true` user projection, and other sources
+    // project it as system-role. The anchor is the canonical carrier of the
+    // compressed conversation — dropping it (or skipping it as a system row)
+    // would lose the whole summary. Checkpoint exemption precedent: the DSH
+    // read side marks compaction checkpoints NOT synthetic for the same
+    // reason (ir-protocol「checkpoint 识别速查」). Anchor priority > role gate.
+    const isCompactionAnchor = compactionByAnchor.has(idx);
+    if (m.role === 'system' && !isCompactionAnchor) return; // system prompts are opencode config, not chat rows
     // Harness-injected messages (DSH runtime context / <system-reminder>):
     // default drop — OpenCode manages its own runtime context. With
     // keepSynthetic, keep them but write text parts `ignored: true` so the
     // TUI hides them (index.tsx) AND toModelMessagesEffect skips them on
     // LLM replay — lossless storage without polluting the model context.
-    if (m.synthetic && !keepSynthetic) return;
+    if (m.synthetic && !keepSynthetic && !isCompactionAnchor) return;
     const time = m.timestamp ?? now;
     const id = scope.newMsgId(time);
 

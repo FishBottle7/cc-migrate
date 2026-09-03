@@ -526,3 +526,222 @@ test('round-trip symmetry: session_info sequence replays without duplicate final
   const back = await parsePiFile(res.paths[0]!);
   assert.equal(back.title, 'Final Name', 'last-wins title after replay');
 });
+
+/* ------------------------------------------------------------------ *
+ * Review-fix gates: label re-anchoring, sidechain buckets, native cut
+ * ------------------------------------------------------------------ */
+
+test('P0-B: pi→pi round-trip writes label rows re-targeted at the NEW entry ids', async () => {
+  const adapter = new PiAdapter();
+  const root = await tempRoot();
+  const dir = join(root, '--tmp-proj--');
+  await fs.mkdir(dir, { recursive: true });
+  const path = join(dir, '2024-12-03T14-00-00-000Z_labl00000.jsonl');
+  const lines = [
+    JSON.stringify({ type: 'session', version: 3, id: 'labl00000', timestamp: '2024-12-03T14:00:00.000Z', cwd: '/tmp/proj' }),
+    JSON.stringify({ type: 'message', id: 'aaaaaaaa', parentId: null, timestamp: '2024-12-03T14:00:01.000Z', message: { role: 'user', content: 'look at this', timestamp: 1733229600000 } }),
+    JSON.stringify({ type: 'message', id: 'bbbbbbbb', parentId: 'aaaaaaaa', timestamp: '2024-12-03T14:00:02.000Z', message: { role: 'assistant', content: [{ type: 'text', text: 'checked' }], timestamp: 1733229601000 } }),
+    // label on the FIRST message entry (source id aaaaaaaa)
+    JSON.stringify({ type: 'label', id: 'cccccccc', parentId: 'bbbbbbbb', timestamp: '2024-12-03T14:00:03.000Z', targetId: 'aaaaaaaa', label: 'key moment' }),
+  ].join('\n') + '\n';
+  await fs.writeFile(path, lines, 'utf8');
+
+  const ir = await parsePiFile(path);
+  const label = (ir.meta as { pi: { labels: Array<{ targetId: string; anchorIndex?: number; label?: string }> } }).pi.labels[0]!;
+  assert.equal(label.targetId, 'aaaaaaaa');
+  assert.equal(label.label, 'key moment');
+  assert.equal(label.anchorIndex, 0, 'read side records the labelled entry\'s messages[] position');
+
+  const res = await adapter.write(ir, { root: join(root, 'out'), targetCwd: '/tmp/proj' });
+  const raw = await fs.readFile(res.paths[0]!, 'utf8');
+  const rows = raw.split('\n').filter((l) => l.trim()).map((l) => JSON.parse(l) as { type: string; id?: string; targetId?: string; label?: string | null; message?: unknown });
+  const labelRows = rows.filter((r) => r.type === 'label');
+  assert.equal(labelRows.length, 1, 'label row written back (was 0 before the fix)');
+  const labelRow = labelRows[0]!;
+  assert.equal(labelRow.label, 'key moment');
+  // targetId must be a REAL entry id in this file (pi's appendLabelChange
+  // byId.has guard) — the new id of the message the label was anchored to
+  const entryIds = new Set(rows.filter((r) => r.type === 'message').map((r) => r.id));
+  assert.ok(entryIds.has(labelRow.targetId!), 'label targetId points at an entry id minted in THIS file');
+  assert.notEqual(labelRow.targetId, 'aaaaaaaa', 'never the stale source id');
+  // and it points at the RIGHT message: the first message's entry
+  const firstMsg = rows.find((r) => r.type === 'message')!;
+  assert.equal(labelRow.targetId, firstMsg.id, 'label targets the same logical message it labelled in the source');
+});
+
+test('P0-C: sidechain buckets (compaction/branchSummaries/settings/labels/custom) are written back, not evaporated', async () => {
+  const adapter = new PiAdapter();
+  const root = await tempRoot();
+  const dir = join(root, '--tmp-proj--');
+  await fs.mkdir(dir, { recursive: true });
+  const path = join(dir, '2024-12-03T14-00-00-000Z_scbranch0.jsonl');
+  const lines = [
+    // main chain
+    JSON.stringify({ type: 'session', version: 3, id: 'scbranch0', timestamp: '2024-12-03T14:00:00.000Z', cwd: '/tmp/proj' }),
+    JSON.stringify({ type: 'message', id: 'aaaaaaaa', parentId: null, timestamp: '2024-12-03T14:00:01.000Z', message: { role: 'user', content: 'main ask', timestamp: 1733229600000 } }),
+    JSON.stringify({ type: 'message', id: 'bbbbbbbb', parentId: 'aaaaaaaa', timestamp: '2024-12-03T14:00:02.000Z', message: { role: 'assistant', content: [{ type: 'text', text: 'main answer' }], timestamp: 1733229601000 } }),
+    // sibling branch off aaaaaaaa carrying EVERY off-path bucket type:
+    // messages + compaction (native cut) + branch_summary + settings + label + custom
+    JSON.stringify({ type: 'message', id: 'c1c1c1c1', parentId: 'aaaaaaaa', timestamp: '2024-12-03T14:00:03.000Z', message: { role: 'user', content: 'fold me in the branch', timestamp: 1733229602000 } }),
+    JSON.stringify({ type: 'message', id: 'd1d1d1d1', parentId: 'c1c1c1c1', timestamp: '2024-12-03T14:00:04.000Z', message: { role: 'assistant', content: [{ type: 'text', text: 'branch answer' }], timestamp: 1733229603000 } }),
+    JSON.stringify({ type: 'message', id: 'e1e1e1e1', parentId: 'd1d1d1d1', timestamp: '2024-12-03T14:00:05.000Z', message: { role: 'user', content: 'kept after cut', timestamp: 1733229604000 } }),
+    JSON.stringify({ type: 'compaction', id: 'f1f1f1f1', parentId: 'e1e1e1e1', timestamp: '2024-12-03T14:00:06.000Z', summary: 'branch fold summary', firstKeptEntryId: 'e1e1e1e1', tokensBefore: 500 }),
+    JSON.stringify({ type: 'branch_summary', id: 'a2a2a2a2', parentId: 'f1f1f1f1', timestamp: '2024-12-03T14:00:07.000Z', fromId: 'd1d1d1d1', summary: 'came back from here' }),
+    JSON.stringify({ type: 'model_change', id: 'b2b2b2b2', parentId: 'a2a2a2a2', timestamp: '2024-12-03T14:00:08.000Z', provider: 'anthropic', modelId: 'claude-x' }),
+    JSON.stringify({ type: 'label', id: 'c2c2c2c2', parentId: 'b2b2b2b2', timestamp: '2024-12-03T14:00:09.000Z', targetId: 'd1d1d1d1', label: 'branch mark' }),
+    JSON.stringify({ type: 'custom', id: 'd2d2d2d2', parentId: 'c2c2c2c2', timestamp: '2024-12-03T14:00:10.000Z', customType: 'ext-state', data: { k: 9 } }),
+    // tail keeps the main chain the leaf path (last entry = on-path)
+    JSON.stringify({ type: 'message', id: '99999999', parentId: 'bbbbbbbb', timestamp: '2024-12-03T14:00:11.000Z', message: { role: 'user', content: 'tail', timestamp: 1733229606000 } }),
+  ].join('\n') + '\n';
+  await fs.writeFile(path, lines, 'utf8');
+
+  const ir = await parsePiFile(path);
+  assert.ok((ir.sidechains?.length ?? 0) === 1, 'sibling branch grouped as sidechain');
+  const sc = ir.sidechains![0]!;
+  assert.ok(sc.compaction?.length, 'sidechain compaction bucket archived at read time');
+
+  const res = await adapter.write(ir, { root: join(root, 'out'), targetCwd: '/tmp/proj' });
+  const raw = await fs.readFile(res.paths[0]!, 'utf8');
+  const rows = raw.split('\n').filter((l) => l.trim()).map((l) => JSON.parse(l) as Record<string, unknown>);
+
+  // sidechain compaction: native entry written inside the sibling branch, with
+  // the summary text AND the native cut re-anchored at a branch entry id
+  const branchComp = rows.filter((r) => r.type === 'compaction');
+  assert.equal(branchComp.length, 1, 'sidechain compaction consumed from the bucket (was 0 before)');
+  assert.equal((branchComp[0] as { summary: string }).summary, 'branch fold summary');
+  const branchEntryIds = new Set(rows.filter((r) => r.type === 'message').map((r) => r.id as string));
+  assert.ok(branchEntryIds.has((branchComp[0] as { firstKeptEntryId: string }).firstKeptEntryId), 'branch cut point is an entry id in this file');
+  assert.equal((branchComp[0] as { firstKeptEntryId: string }).firstKeptEntryId,
+    rows.filter((r) => r.type === 'message').find((r) => JSON.stringify(r.message).includes('kept after cut'))!.id,
+    'cut re-anchors at the branch entry that replaced firstKeptEntryId (e1e1e1e1)');
+
+  // sidechain branch_summaries from meta.pi.branchSummaries
+  const bsRows = rows.filter((r) => r.type === 'branch_summary') as Array<{ summary: string; fromId: string }>;
+  assert.ok(bsRows.some((b) => b.summary === 'came back from here'), 'sidechain branch_summary restored');
+
+  // sidechain settings events (model_change in the branch)
+  const mcRows = rows.filter((r) => r.type === 'model_change') as Array<{ modelId: string }>;
+  assert.ok(mcRows.some((m) => m.modelId === 'claude-x'), 'sidechain model_change replayed');
+
+  // sidechain labels re-targeted at the branch's new entry ids
+  const labelRows = rows.filter((r) => r.type === 'label') as Array<{ targetId: string; label: string | null }>;
+  assert.equal(labelRows.length, 1, 'sidechain label written back re-anchored');
+  assert.ok(branchEntryIds.has(labelRows[0]!.targetId), 'sidechain label targetId exists in this file');
+
+  // sidechain custom entries
+  const customRows = rows.filter((r) => r.type === 'custom') as Array<{ customType: string }>;
+  assert.ok(customRows.some((c) => c.customType === 'ext-state'), 'sidechain custom entry replayed');
+
+  // the branch's own messages survived (not just its state)
+  const msgs = rows.filter((r) => r.type === 'message');
+  assert.ok(msgs.some((m) => JSON.stringify(m.message).includes('branch answer')), 'branch messages kept');
+  assert.ok(msgs.some((m) => JSON.stringify(m.message).includes('fold me in the branch')), 'branch pre-cut message kept (full archive, 选 3)');
+
+  // ...and the round-trip second pass still parses cleanly with the buckets back
+  const back = await parsePiFile(res.paths[0]!);
+  assert.ok((back.sidechains?.length ?? 0) >= 1, 'sibling branch re-reads as sidechain');
+});
+
+test('P0-D: native firstKeptEntryId survives pi→pi round-trip pointing at the kept span, not the compaction parent', async () => {
+  const adapter = new PiAdapter();
+  const root = await tempRoot();
+  const dir = join(root, '--tmp-proj--');
+  await fs.mkdir(dir, { recursive: true });
+  const path = join(dir, '2024-12-03T14-00-00-000Z_cutpt0000.jsonl');
+  const lines = [
+    JSON.stringify({ type: 'session', version: 3, id: 'cutpt0000', timestamp: '2024-12-03T14:00:00.000Z', cwd: '/tmp/proj' }),
+    JSON.stringify({ type: 'message', id: 'aaaaaaaa', parentId: null, timestamp: '2024-12-03T14:00:01.000Z', message: { role: 'user', content: 'folded question', timestamp: 1733229600000 } }),
+    JSON.stringify({ type: 'message', id: 'bbbbbbbb', parentId: 'aaaaaaaa', timestamp: '2024-12-03T14:00:02.000Z', message: { role: 'assistant', content: [{ type: 'text', text: 'folded answer' }], timestamp: 1733229601000 } }),
+    // the retained span starts at cccccccc (BEFORE the compaction entry itself):
+    // context = [compaction] + [cccccccc..compaction) + post-compaction
+    JSON.stringify({ type: 'message', id: 'cccccccc', parentId: 'bbbbbbbb', timestamp: '2024-12-03T14:00:03.000Z', message: { role: 'user', content: 'kept question', timestamp: 1733229602000 } }),
+    JSON.stringify({ type: 'compaction', id: 'dddddddd', parentId: 'cccccccc', timestamp: '2024-12-03T14:00:04.000Z', summary: 'fold of the early span', firstKeptEntryId: 'cccccccc', tokensBefore: 900 }),
+    JSON.stringify({ type: 'message', id: 'eeeeeeee', parentId: 'dddddddd', timestamp: '2024-12-03T14:00:05.000Z', message: { role: 'assistant', content: [{ type: 'text', text: 'post-compaction answer' }], timestamp: 1733229603000 } }),
+  ].join('\n') + '\n';
+  await fs.writeFile(path, lines, 'utf8');
+
+  const ir = await parsePiFile(path);
+  const comp = ir.compaction![0]!;
+  assert.equal(comp.firstKeptId, 'cccccccc');
+  assert.equal((comp.meta as { firstKeptIndex?: number }).firstKeptIndex, 2, 'read side resolves the cut to a messages[] position');
+
+  const res = await adapter.write(ir, { root: join(root, 'out'), targetCwd: '/tmp/proj' });
+  const raw = await fs.readFile(res.paths[0]!, 'utf8');
+  const rows = raw.split('\n').filter((l) => l.trim()).map((l) => JSON.parse(l) as Record<string, unknown>);
+  const compRow = rows.find((r) => r.type === 'compaction') as { id: string; firstKeptEntryId: string };
+  const compId = compRow.id;
+  const msgRows = rows.filter((r) => r.type === 'message') as Array<{ id: string; message: unknown; parentId: string | null }>;
+
+  // buildContextEntries semantics: [compaction] + [firstKept..compaction) + rest.
+  // firstKeptEntryId must be the entry carrying 'kept question' — NOT the
+  // compaction's parent (which here IS that same entry only by accident of
+  // the chain; the assertion is on identity, i.e. the native cut survived).
+  const keptRow = msgRows.find((m) => JSON.stringify(m.message).includes('kept question'))!;
+  assert.equal(compRow.firstKeptEntryId, keptRow.id, 'native cut point maps to the kept span\'s first entry in the NEW file');
+  assert.notEqual(compRow.firstKeptEntryId, compId, 'never the compaction entry itself');
+
+  // active-surface replay (probe-AM style): [compaction] + [firstKept..compaction) + after
+  const compRowFull = rows.find((r) => r.type === 'compaction') as { id: string; firstKeptEntryId: string; parentId: string | null };
+  const byId = new Map(msgRows.map((m) => [m.id as string, m]));
+  const context: string[] = [];
+  let cur: { id: string; parentId: string | null } | undefined = compRowFull;
+  const pathIds: string[] = [];
+  while (cur) {
+    pathIds.push(cur.id);
+    cur = cur.parentId ? byId.get(cur.parentId) : undefined;
+  }
+  pathIds.reverse(); // root→leaf
+  const cutIdx = pathIds.indexOf(compRow.firstKeptEntryId);
+  const compIdx = pathIds.indexOf(compId);
+  context.push('compaction'); // the summary rides the compaction entry itself
+  for (let i = cutIdx; i < compIdx; i++) {
+    const m = byId.get(pathIds[i]!)!;
+    context.push(JSON.stringify(m.message));
+  }
+  for (let i = compIdx + 1; i < pathIds.length; i++) {
+    const m = byId.get(pathIds[i]!)!;
+    context.push(JSON.stringify(m.message));
+  }
+  // the kept span's first message survives the fold (was lost when the cut
+  // was replaced by the compaction's parent = one message too late)
+  assert.ok(context.some((c) => c.includes('kept question')), 'kept-span first message stays on the active surface');
+});
+
+test('P1-C: synthesized entry timestamps derive from the session, never the migration wall clock', async () => {
+  const adapter = new PiAdapter();
+  const root = await tempRoot();
+  const dir = join(root, '--tmp-proj--');
+  await fs.mkdir(dir, { recursive: true });
+  const path = join(dir, '2024-12-03T14-00-00-000Z_ts000000.jsonl');
+  const lines = [
+    JSON.stringify({ type: 'session', version: 3, id: 'ts000000', timestamp: '2024-12-03T14:00:00.000Z', cwd: '/tmp/proj' }),
+    JSON.stringify({ type: 'message', id: 'aaaaaaaa', parentId: null, timestamp: '2024-12-03T14:00:01.000Z', message: { role: 'user', content: 'q', timestamp: 1733229600000 } }),
+    JSON.stringify({ type: 'message', id: 'bbbbbbbb', parentId: 'aaaaaaaa', timestamp: '2024-12-03T14:00:02.000Z', message: { role: 'assistant', content: [{ type: 'text', text: 'a' }], timestamp: 1733229601000 } }),
+  ].join('\n') + '\n';
+  await fs.writeFile(path, lines, 'utf8');
+  const ir = await parsePiFile(path);
+  assert.equal(ir.createdAt, Date.parse('2024-12-03T14:00:00.000Z'), 'createdAt from header');
+
+  // hand-strip the timestamps the write would otherwise have: a synthetic
+  // cross-tool IR typically has no per-entry times — the write must not stamp
+  // them with the copy machine's "now"
+  const noTs: typeof ir = JSON.parse(JSON.stringify(ir));
+  for (const m of noTs.messages) delete m.timestamp;
+  const before = Date.now();
+  const res = await adapter.write(noTs, { root: join(root, 'out'), targetCwd: '/tmp/proj' });
+  const after = Date.now();
+  const raw = await fs.readFile(res.paths[0]!, 'utf8');
+  const rows = raw.split('\n').filter((l) => l.trim()).map((l) => JSON.parse(l) as { type: string; timestamp?: string });
+  for (const r of rows) {
+    if (typeof r.timestamp !== 'string') continue;
+    const t = Date.parse(r.timestamp);
+    assert.ok(
+      Math.abs(t - Date.parse('2024-12-03T14:00:00.000Z')) < 60_000,
+      `timestamp ${r.timestamp} derives from the session, not the wall clock`,
+    );
+    assert.ok(t < before - 1000 || t > after + 1000 ? true : t < before, `timestamp ${r.timestamp} is not the migration machine's now`);
+  }
+  // the synthesized sidechain branch_summary timestamp (no time anywhere)
+  // also derives: check the simplest invariant — every row is 2024-dated
+  assert.ok(rows.every((r) => !r.timestamp || r.timestamp.startsWith('2024-')), 'no wall-clock now anywhere in the file');
+});
