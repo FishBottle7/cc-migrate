@@ -30,3 +30,4 @@ Thumbs.db
 
 # electron-builder 产物（apps/desktop-app/release）
 apps/desktop-app/release/
+*.tgz
