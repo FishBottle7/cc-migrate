@@ -4,7 +4,7 @@
  * 主进程只保留窗口/对话框/shell 这类必须由 Electron 完成的事。
  */
 
-import type { SessionMeta, ToolId } from '@session-migrate/core';
+import type { SessionMeta, ToolId } from '@cc-migrate/core';
 import type {
   MigrateOutcome,
   MigrateParams,

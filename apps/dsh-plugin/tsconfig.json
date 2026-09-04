@@ -17,7 +17,7 @@
       // 纯 tsc 不认 .vue SFC：typecheck 期把 ui 源码包重定向到本地桩
       // （src/ui-stub.d.ts，只声明 GUI 层消费的形状）。运行时动态 import
       // 解析真实包，由宿主构建带 vue 编译；见 src/gui.ts 头注。
-      "@session-migrate/ui": ["./src/ui-stub.d.ts"]
+      "@cc-migrate/ui": ["./src/ui-stub.d.ts"]
     }
   },
   "include": ["src/**/*.ts", "src/**/*.d.ts"]

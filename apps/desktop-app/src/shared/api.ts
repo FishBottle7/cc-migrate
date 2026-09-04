@@ -3,7 +3,7 @@
  * 形状 = ui 组件的 MigrationBackend + 版本信息。
  */
 
-import type { SessionMeta, ToolId } from '@session-migrate/core';
+import type { SessionMeta, ToolId } from '@cc-migrate/core';
 import type { MigrateOutcome, MigrateParams, PreviewPayload, ToolInfo } from '../main/ipc-types.js';
 
 export type { SessionMeta, ToolId, MigrateOutcome, MigrateParams, PreviewPayload, ToolInfo };

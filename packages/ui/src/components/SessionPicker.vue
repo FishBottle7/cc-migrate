@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, provide, ref } from 'vue';
-import type { SessionMeta } from '@session-migrate/core';
+import type { SessionMeta } from '@cc-migrate/core';
 import { SP_FOLDED_SUBS, buildNodes, countNodes, type SessionNode } from './sessionTree.js';
 import SpSessionRow from './SpSessionRow.vue';
 

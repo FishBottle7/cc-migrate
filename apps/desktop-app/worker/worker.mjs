@@ -8,7 +8,7 @@
  * { id, method, params } → { id, ok, result | error }。
  */
 
-import { builtinRegistry, listSessions, readSource, writeTarget, projectKey, defaultDshRoot, readFirstFrameLine } from '@session-migrate/core';
+import { builtinRegistry, listSessions, readSource, writeTarget, projectKey, defaultDshRoot, readFirstFrameLine } from '@cc-migrate/core';
 import { homedir } from 'node:os';
 import { readFile } from 'node:fs/promises';
 import { join } from 'node:path';

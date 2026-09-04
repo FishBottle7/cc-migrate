@@ -3,7 +3,7 @@
  */
 
 import { homedir } from 'node:os';
-import type { ToolId } from '@session-migrate/core';
+import type { ToolId } from '@cc-migrate/core';
 import type { ToolInfo } from './ipc-types.js';
 
 export const TOOL_ENTRIES: ToolInfo[] = [

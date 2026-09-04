@@ -1,5 +1,5 @@
 /**
- * session-migrate DSH plugin — GUI wizard mounting layer (design.md Phase 3
+ * cc-migrate DSH plugin — GUI wizard mounting layer (design.md Phase 3
  * 第 15 项：向导「选会话 → 预览 → 配置 → 写入」).
  *
  * DSH 宿主提供一个 `GuiHost`（挂载点 + 数据通道），本文件把宿主通道桥接成
@@ -9,7 +9,7 @@
  * 访问点需要跟着宿主调整。
  *
  * ── 沙箱边界纪律（不可违反）──────────────────────────────────────
- * 本层【绝不 import @session-migrate/core】：GUI 层不知道迁移引擎的存在。
+ * 本层【绝不 import @cc-migrate/core】：GUI 层不知道迁移引擎的存在。
  * 所有数据经 GuiHost 注入的通道函数走宿主转发到命令层（src/commands.ts），
  * 宿主自行处理沙箱/线程边界（DSH 前端可能是 worker / iframe / 独立 VM，
  * core 的 zstd 解压只能跑在宿主的 Node 侧）。同理 ui 组件也是动态 import：
@@ -39,7 +39,7 @@ import type { CommandError } from './commands.js';
 export interface GuiHost {
   logger: { info(...args: unknown[]): void; warn(...args: unknown[]): void; error(...args: unknown[]): void };
   /**
-   * Mount `component` (a Vue component from @session-migrate/ui) with `props`
+   * Mount `component` (a Vue component from @cc-migrate/ui) with `props`
    * into `container` (host-defined: DOM element or equivalent). Returns an
    * unmount function.
    */
@@ -177,7 +177,7 @@ export function createWizardBackend(host: GuiHost, opts: { dstRoot?: string } = 
     async pickDirectory(_defaultPath?: string): Promise<string | null> {
       const picker = (host as { pickDirectory?(defaultPath?: string): Promise<string | null> }).pickDirectory;
       if (!picker) {
-        host.logger.warn('session-migrate gui: host provides no directory picker — showing the raw input only');
+        host.logger.warn('cc-migrate gui: host provides no directory picker — showing the raw input only');
         return null;
       }
       return picker(_defaultPath);
@@ -186,7 +186,7 @@ export function createWizardBackend(host: GuiHost, opts: { dstRoot?: string } = 
     async openPath(path: string): Promise<void> {
       const opener = (host as { openPath?(path: string): Promise<void> }).openPath;
       if (!opener) {
-        host.logger.warn(`session-migrate gui: host provides no openPath — path not opened: ${path}`);
+        host.logger.warn(`cc-migrate gui: host provides no openPath — path not opened: ${path}`);
         return;
       }
       return opener(path);
@@ -196,7 +196,7 @@ export function createWizardBackend(host: GuiHost, opts: { dstRoot?: string } = 
 }
 
 /**
- * Mount the session-migrate wizard into a host container.
+ * Mount the cc-migrate wizard into a host container.
  *
  * Composition choice: ui's ready-made `MigrateWizard` — it already assembles
  * ToolSelect → SessionPicker + SessionPreview → TargetConfig with the exact
@@ -220,7 +220,7 @@ export async function createSessionMigrateWizard(
   // 动态 import：ui 是源码包（main: src/index.ts，.vue 由宿主构建编译）。
   // 任何失败（宿主没打包 ui / 沙箱不允许）都变成可读错误而不是炸宿主。
   const load = opts.loadWizardComponent ?? (async () => {
-    const ui = (await import('@session-migrate/ui')) as { MigrateWizard: unknown };
+    const ui = (await import('@cc-migrate/ui')) as { MigrateWizard: unknown };
     return ui.MigrateWizard;
   });
   let MigrateWizard: unknown;
@@ -229,11 +229,11 @@ export async function createSessionMigrateWizard(
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
     throw new Error(
-      `session-migrate gui: cannot load @session-migrate/ui (the host must bundle it — it is a source package): ${msg}`,
+      `cc-migrate gui: cannot load @cc-migrate/ui (the host must bundle it — it is a source package): ${msg}`,
     );
   }
   if (!MigrateWizard || typeof MigrateWizard !== 'object') {
-    throw new Error('session-migrate gui: @session-migrate/ui did not export a MigrateWizard component');
+    throw new Error('cc-migrate gui: @cc-migrate/ui did not export a MigrateWizard component');
   }
 
   const unmount = host.mount(opts.container, MigrateWizard, { backend });
@@ -247,7 +247,7 @@ export async function createSessionMigrateWizard(
       try {
         unmount();
       } catch (e) {
-        host.logger.warn(`session-migrate gui: unmount threw: ${e instanceof Error ? e.message : String(e)}`);
+        host.logger.warn(`cc-migrate gui: unmount threw: ${e instanceof Error ? e.message : String(e)}`);
       }
     },
   };

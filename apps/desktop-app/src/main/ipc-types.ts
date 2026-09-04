@@ -1,12 +1,12 @@
 /**
  * App 自有的 IPC 契约（主进程 ↔ 渲染进程）。
  *
- * 形状与 @session-migrate/ui 的组件契约（MigrationBackend）结构兼容，
+ * 形状与 @cc-migrate/ui 的组件契约（MigrationBackend）结构兼容，
  * 但独立定义：主进程只依赖 core 的 .d.ts，避免把 ui 的 .ts 源码拉进
  * 主进程的 emit 程序。渲染进程做结构对接。
  */
 
-import type { SessionMeta, ToolId } from '@session-migrate/core';
+import type { SessionMeta, ToolId } from '@cc-migrate/core';
 
 export interface ToolInfo {
   id: ToolId;

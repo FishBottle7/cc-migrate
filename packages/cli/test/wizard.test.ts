@@ -5,7 +5,7 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { builtinRegistry, fallbackIr } from '@session-migrate/core';
+import { builtinRegistry, fallbackIr } from '@cc-migrate/core';
 import {
   filterMetas,
   formatMetaLine,
@@ -82,7 +82,7 @@ test('runWizard happy path (src dsh -> dst dsh, picks first session, confirms)',
   const registry = builtinRegistry();
   const dsh = registry.get('dsh');
   const ir = fallbackIr();
-  const { writeTarget, previewSession, readSource, listSessions } = await import('@session-migrate/core');
+  const { writeTarget, previewSession, readSource, listSessions } = await import('@cc-migrate/core');
   const seed = await writeTarget(dsh, ir, { root: srcRoot, targetCwd: 'D:\\proj' });
   // ensure list finds it
   const metas = await listSessions(dsh, srcRoot);
@@ -114,7 +114,7 @@ test('runWizard cancel at preview returns null', async () => {
   const srcRoot = await mkdtemp(join(tmpdir(), 'wiz-cancel-'));
   const registry = builtinRegistry();
   const dsh = registry.get('dsh');
-  const { writeTarget, previewSession, readSource, listSessions } = await import('@session-migrate/core');
+  const { writeTarget, previewSession, readSource, listSessions } = await import('@cc-migrate/core');
   await writeTarget(dsh, fallbackIr(), { root: srcRoot, targetCwd: 'D:\\proj' });
 
   const io = makeFakeIO([
@@ -142,7 +142,7 @@ test('runWizard dsh->opencode without sidechain does not ask flatten', async () 
   const dstRoot = await mkdtemp(join(tmpdir(), 'wiz-dsh-op-2-'));
   const registry = builtinRegistry();
   const dsh = registry.get('dsh');
-  const { writeTarget, previewSession, readSource, listSessions } = await import('@session-migrate/core');
+  const { writeTarget, previewSession, readSource, listSessions } = await import('@cc-migrate/core');
   await writeTarget(dsh, fallbackIr(), { root: srcRoot, targetCwd: 'D:\\proj' });
 
   const answers = [
@@ -171,7 +171,7 @@ test('runWizard dsh->opencode with sidechain DOES ask flatten (target opencode w
   const dstRoot = await mkdtemp(join(tmpdir(), 'wiz-dsh-op-sc2-'));
   const registry = builtinRegistry();
   const dsh = registry.get('dsh');
-  const { writeTarget, previewSession, readSource, listSessions } = await import('@session-migrate/core');
+  const { writeTarget, previewSession, readSource, listSessions } = await import('@cc-migrate/core');
   const ir = {
     ...fallbackIr(),
     sidechains: [{ agentId: 'sc-1', kind: 'subagent' as const, messages: [{ role: 'user' as const, content: [{ type: 'text' as const, text: 'hi side' }] }] }],
@@ -206,7 +206,7 @@ test('runWizard opencode->dsh always asks flatten (source wording)', async () =>
   const dstRoot = await mkdtemp(join(tmpdir(), 'wiz-oc-dst-'));
   const registry = builtinRegistry();
   const oc = registry.get('opencode');
-  const { writeTarget, previewSession, readSource, listSessions } = await import('@session-migrate/core');
+  const { writeTarget, previewSession, readSource, listSessions } = await import('@cc-migrate/core');
   await writeTarget(oc, fallbackIr(), { root: srcRoot, targetCwd: '/tmp/p' });
 
   const answers = [

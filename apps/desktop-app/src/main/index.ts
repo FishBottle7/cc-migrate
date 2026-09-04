@@ -22,7 +22,7 @@ function createWindow(): void {
     minWidth: 960,
     minHeight: 620,
     backgroundColor: '#ffffff',
-    title: 'session-migrate',
+    title: 'cc-migrate',
     autoHideMenuBar: true,
     show: false,
     webPreferences: {

@@ -1,15 +1,15 @@
 /**
- * session-migrate DSH cordis plugin entry.
+ * cc-migrate DSH cordis plugin entry.
  *
- * Thin shell around `@session-migrate/core` (design.md §5): the plugin only
+ * Thin shell around `@cc-migrate/core` (design.md §5): the plugin only
  * exposes the "any tool → DSH" line as slash commands. All migration logic
  * lives in the shared core; this file deals purely with registration,
  * argument parsing and fiber-clean disposal.
  *
  * Commands registered (design.md §5 conventions):
- *   /session-migrate list-sources [tool] [--root <dir>]
- *   /session-migrate preview <tool> <sessionId> [--root <dir>]
- *   /session-migrate import <tool> <sessionId> [--cwd <dir>] [--root <dstRoot>]
+ *   /cc-migrate list-sources [tool] [--root <dir>]
+ *   /cc-migrate preview <tool> <sessionId> [--root <dir>]
+ *   /cc-migrate import <tool> <sessionId> [--cwd <dir>] [--root <dstRoot>]
  *
  * Structural typing only — no cordis import, so the plugin stays
  * independent of the exact @deepseek-ai/cordis version DSH ships.
@@ -36,11 +36,18 @@ import type { GuiHost } from './gui.js';
  */
 interface PluginContext {
   logger: { info(...args: unknown[]): void; warn(...args: unknown[]): void; error(...args: unknown[]): void };
-  /** Minimal assumed shape of DSH's slash-command service. */
-  commands?: { register(name: string, handler: (...args: string[]) => unknown): () => void };
+  /**
+   * dsh-commands 宿主契约（真机加载验证锚定，@deepseek-ai/dsh-commands 的
+   * normalizeDefinition/normalizeResult）：register(definition) 收
+   * {name, description, input?, recordInput?, handler}——description 必填
+   * 非空（缺失时 normalizeDefinition 抛 TypeError 炸整棵插件树），handler
+   * 收单个 invocation（rawInput = 命令名后的原始文本）、必须返回
+   * CommandResult {kind, text}。返回注销函数（fiber 清理用）。
+   */
+  commands?: { register(definition: { name: string; description: string; input?: { hint: string; images?: boolean }; recordInput?: boolean; handler: (invocation: CommandInvocation) => Promise<CommandResult> | CommandResult }): () => void };
   /**
    * Optional GUI service (design.md Phase 3 §15): when the host exposes one,
-   * the session-migrate wizard mounts through it. Same structural-typing
+   * the cc-migrate wizard mounts through it. Same structural-typing
    * discipline — see src/gui.ts's GuiHost for the full protocol. Hosts
    * without a GUI keep the commands-only behavior (backward compatible).
    */
@@ -55,7 +62,7 @@ export interface SessionMigrateConfig {
   dstRoot?: string;
 }
 
-export const name = 'session-migrate';
+export const name = 'cc-migrate';
 // `inject` declares the services this plugin consumes from the DSH host.
 // DSH's command registry is provided by the 'commands' service (same pattern
 // the llm plugin uses with 'llm'/'credentials'/'settings'). The access in
@@ -72,7 +79,7 @@ interface CommandInvocation {
 }
 
 /** Parse `["claude", "--root", "X"]` into `{ positionals, flags }`. */
-export function parseArgs(argv: string[]): CommandInvocation {
+export function parseArgs(argv: string[]): { positionals: string[]; flags: Record<string, string | true> } {
   const positionals: string[] = [];
   const flags: Record<string, string | true> = {};
   for (let i = 0; i < argv.length; i++) {
@@ -112,10 +119,37 @@ function truncate(s: string, n: number): string {
 }
 
 /** Registered command names, for tests to assert against. */
-export const COMMAND_NAMES = ['list-sources', 'preview', 'import'] as const;
+export const COMMAND_NAMES = ['cc-migrate-list-sources', 'cc-migrate-preview', 'cc-migrate-import'] as const;
 
 /**
- * Plugin apply: registers the three /session-migrate subcommands.
+ * dsh-commands 宿主契约（真机加载验证锚定，@deepseek-ai/dsh-commands/lib/index.js
+ * 的 normalizeDefinition/normalizeResult/dispatch）：
+ *  - 命令名是扁平小写 `^[a-z][a-z0-9_-]*$`——没有「插件名 子命令」的层级语法，
+ *    三个子命令因此各自注册为独立命令，`cc-migrate-` 前缀即命名空间。
+ *  - definition 必须 {name, description(非空 string), handler}——缺
+ *    description 在 normalizeDefinition 直接抛 TypeError 并炸整棵插件树
+ *    （真机首装时踩过：mock ctx 的宽松形状没拦住这个）。
+ *  - handler 收单个 invocation {rawInput, agent, attachments, signal}，
+ *    rawInput = 命令名之后的原始文本（含前导空格，dispatch 前自行 split）。
+ *  - 返回值必须 {kind:'success'|'error', text}——裸返回命令层结果对象
+ *    会被 normalizeResult 当 TypeError 拒绝。
+ */
+interface CommandInvocation {
+  /** 命令名之后的原始输入（未分词，含前导空格）。 */
+  rawInput: string;
+  agent?: unknown;
+  attachments?: unknown;
+  signal?: AbortSignal;
+}
+
+interface CommandResult {
+  kind: 'success' | 'error';
+  text: string;
+}
+
+/**
+ * Plugin apply: registers the three cc-migrate commands (flat dsh-command
+ * names — see COMMAND_NAMES 头注的宿主契约)。
  *
  * Each `commands.register` call returns an unregister function; every one is
  * routed through `ctx.effect` so the cordis fiber disposal unregisters all
@@ -126,15 +160,24 @@ export function apply(ctx: PluginContext, config: SessionMigrateConfig = {}): vo
   const logger = ctx.logger;
   const defaultRoot = config.dstRoot;
 
-  const register = (name: string, handler: (...args: string[]) => unknown): void => {
-    const disposer = ctx.commands?.register(name, handler);
+  const register = (name: string, description: string, run: (argv: string[]) => Promise<unknown>): void => {
+    const disposer = ctx.commands?.register({
+      name,
+      description,
+      handler: async (invocation: CommandInvocation): Promise<CommandResult> => {
+        const argv = String(invocation?.rawInput ?? '').trim().split(/\s+/).filter(Boolean);
+        const res = (await run(argv)) as { ok?: boolean; error?: string } | undefined;
+        if (res && res.ok === false) return { kind: 'error', text: res.error ?? 'command failed' };
+        return { kind: 'success', text: typeof res === 'object' && res && 'summary' in res ? String((res as { summary?: string }).summary) : 'done' };
+      },
+    });
     if (disposer) {
       ctx.effect?.(() => disposer);
     }
   };
 
-  // -- /session-migrate list-sources [tool] [--root <dir>] --
-  register('list-sources', async (...argv: string[]) => {
+  // -- /cc-migrate-list-sources [tool] [--root <dir>] --
+  register('cc-migrate-list-sources', 'list a source tool\'s sessions for migration (tool id, time, title)', async (argv) => {
     const { positionals, flags } = parseArgs(argv);
     const tool = positionals[0] ?? 'dsh';
     const root = flagString(flags, 'root') ?? flagString(flags, 'src-root');
@@ -142,30 +185,29 @@ export function apply(ctx: PluginContext, config: SessionMigrateConfig = {}): vo
     if (!res.ok) return res;
     const lines = [`found ${res.sessions.length} session(s) in ${tool}${root ? ` @ ${root}` : ''}`];
     res.sessions.slice(0, 50).forEach((m, i) => lines.push(formatSessionLine(i, m)));
-    if (res.sessions.length > 50) lines.push(`  ... ${res.sessions.length - 50} more (use preview/import with a session id)`);
-    logger.info(lines.join('\n'));
-    return res;
+    if (res.sessions.length > 50) lines.push(`  ... ${res.sessions.length - 50} more (use cc-migrate-preview/cc-migrate-import with a session id)`);
+    return { ...res, ok: true as const, summary: lines.join('\n') };
   });
 
-  // -- /session-migrate preview <tool> <sessionId> [--root <dir>] --
-  register('preview', async (...argv: string[]) => {
+  // -- /cc-migrate-preview <tool> <sessionId> [--root <dir>] --
+  register('cc-migrate-preview', 'preview a source session as offline text before migrating', async (argv) => {
     const { positionals, flags } = parseArgs(argv);
     const [tool, sessionId] = positionals;
     if (!tool || !sessionId) {
-      return { ok: false as const, error: `usage: /session-migrate preview <tool> <sessionId> [tool: ${SOURCE_TOOLS.join('|')}]` };
+      return { ok: false as const, error: `usage: /cc-migrate-preview <tool> <sessionId> [tool: ${SOURCE_TOOLS.join('|')}]` };
     }
     const root = flagString(flags, 'root') ?? flagString(flags, 'src-root');
     const res = await preview(tool, sessionId, root);
-    if (res.ok) logger.info(res.text);
+    if (res.ok) return { ...res, ok: true as const, summary: res.text };
     return res;
   });
 
-  // -- /session-migrate import <tool> <sessionId> [--src-root <dir>] [--cwd <dir>] [--root <dstRoot>] --
-  register('import', async (...argv: string[]) => {
+  // -- /cc-migrate-import <tool> <sessionId> [--src-root <dir>] [--cwd <dir>] [--root <dstRoot>] --
+  register('cc-migrate-import', 'import a source session into DSH as a resumable native session', async (argv) => {
     const { positionals, flags } = parseArgs(argv);
     const [tool, sessionId] = positionals;
     if (!tool || !sessionId) {
-      return { ok: false as const, error: `usage: /session-migrate import <tool> <sessionId> [--src-root <dir>] [--cwd <dir>] [tool: ${SOURCE_TOOLS.join('|')}]` };
+      return { ok: false as const, error: `usage: /cc-migrate-import <tool> <sessionId> [--src-root <dir>] [--cwd <dir>] [tool: ${SOURCE_TOOLS.join('|')}]` };
     }
     const res = await importSession(tool, sessionId, {
       // --src-root points at the SOURCE tool's storage (e.g. a custom claude dir).
@@ -176,31 +218,39 @@ export function apply(ctx: PluginContext, config: SessionMigrateConfig = {}): vo
       root: flagString(flags, 'root') ?? flagString(flags, 'dst-root') ?? defaultRoot,
     });
     if (res.ok) {
-      logger.info(`imported ${res.source.tool}:${res.source.sessionId} -> dsh:${res.target.sessionId}\n  ${res.target.paths.join('\n  ')}`);
-    } else {
-      logger.error(res.error);
+      return { ...res, ok: true as const, summary: `imported ${res.source.tool}:${res.source.sessionId} -> dsh:${res.target.sessionId}\n  ${res.target.paths.join('\n  ')}` };
     }
     return res;
   });
 
-  logger.info(`session-migrate: registered ${COMMAND_NAMES.length} commands (/session-migrate ${COMMAND_NAMES.join(' | ')})`);
+  logger.info(`cc-migrate: registered ${COMMAND_NAMES.length} commands (/${COMMAND_NAMES.join(' | /')})`);
 
   // -- optional GUI wizard: only when the host exposes a gui service --
   // 挂载走动态 import（src/gui.ts 再动态 import ui 组件），老宿主没有
-  // ctx.gui 时这里完全零成本；unmount 也走 ctx.effect，和命令同一套 fiber 清理。
-  if (ctx.gui) {
+  // gui 服务时这里完全零成本；unmount 也走 ctx.effect，和命令同一套 fiber 清理。
+  // ⚠ cordis 的 ctx 是按 inject 列表门禁的 Proxy：访问未 inject 的属性
+  // 直接抛「cannot get property "gui" without inject」而不是返回 undefined
+  // （真机首装验证踩过）——所以 gui 探测必须 try/catch 包裹，不能裸 if。
+  let gui: GuiHost | undefined;
+  try {
+    gui = ctx.gui;
+  } catch {
+    gui = undefined; // 宿主未注入 gui 服务——命令层照常工作
+  }
+  if (gui) {
+    const guiHost = gui;
     ctx.effect?.(() => {
       let disposed = false;
       void (async () => {
         const { createSessionMigrateWizard } = await import('./gui.js');
         if (disposed) return;
-        const handle = await createSessionMigrateWizard(ctx.gui!, {
+        const handle = await createSessionMigrateWizard(guiHost, {
           container: undefined,
           dstRoot: defaultRoot,
         });
         if (disposed) handle.dispose();
       })().catch((e) => {
-        ctx.logger.warn(`session-migrate gui: wizard mount skipped/failed: ${e instanceof Error ? e.message : String(e)}`);
+        ctx.logger.warn(`cc-migrate gui: wizard mount skipped/failed: ${e instanceof Error ? e.message : String(e)}`);
       });
       return () => {
         disposed = true;

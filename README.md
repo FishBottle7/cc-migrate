@@ -1,4 +1,4 @@
-# session-migrate
+# cc-migrate
 
 把 AI 编码工具的对话在工具之间迁移，目标像原生 `continue`/`/resume` 一样接着聊。
 核心是一个「统一中间表示（IR）+ 每工具两个适配器」的引擎，避免 N² 两两转换。
@@ -21,14 +21,14 @@ docs/            架构设计 + 格式审计 + 一 agent 一档
 
 ```bash
 pnpm install
-pnpm --filter @session-migrate/core run test           # round-trip 测试
-pnpm --filter @session-migrate/cli run build
-node packages/cli/dist/index.js demo                    # DSH→DSH 自环 demo
-node packages/cli/dist/index.js list dsh                # 列出 ~/.dsh 真实会话
-node packages/cli/dist/index.js preview dsh <会话id>     # 离线预览会话内容
+pnpm --filter @cc-migrate/core run test           # round-trip 测试
+pnpm --filter @cc-migrate/cli run build
+node packages/cli/dist/src/index.js demo                    # DSH→DSH 自环 demo
+node packages/cli/dist/src/index.js list dsh                # 列出 ~/.dsh 真实会话
+node packages/cli/dist/src/index.js preview dsh <会话id>     # 离线预览会话内容
 
 # 独立 GUI（Electron）
-pnpm --filter @session-migrate/desktop-app run build && pnpm --filter @session-migrate/desktop-app start
+pnpm --filter @cc-migrate/desktop-app run build && pnpm --filter @cc-migrate/desktop-app start
 ```
 
 ## 设计核心

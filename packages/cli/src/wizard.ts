@@ -1,5 +1,5 @@
 /**
- * Interactive wizard for `session-migrate`.
+ * Interactive wizard for `cc-migrate`.
  *
  * Runs in a terminal without extra dependencies. Flow:
  *   1) pick source tool (+ optional source root for DSH/Claude/Codex/Pi)
@@ -11,7 +11,7 @@
  * selection logic can be covered by hermetic tests without a terminal.
  */
 
-import type { SessionMeta, ToolId } from '@session-migrate/core';
+import type { SessionMeta, ToolId } from '@cc-migrate/core';
 
 export const TOOLS: ToolId[] = ['dsh', 'claude', 'codex', 'pi', 'opencode', 'zcode'];
 
@@ -160,7 +160,7 @@ export async function runWizard(io: WizardIO, deps: WizardDeps, pre?: Partial<Wi
   let srcTool = pre?.srcTool;
   if (!srcTool) {
     io.print('');
-    io.print('== session-migrate wizard ==');
+    io.print('== cc-migrate wizard ==');
     io.print(`源工具 (source): ${TOOLS.join(' / ')}  [默认 dsh]`);
     const ans = (await io.question('源工具 > ')).trim().toLowerCase() || 'dsh';
     if (!TOOLS.includes(ans as ToolId)) {

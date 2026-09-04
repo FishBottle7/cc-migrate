@@ -567,7 +567,7 @@ export class DshAdapter implements Adapter {
       // 落盘形态与 team/* 不发的理由，语义边界保持可见，绝不无声改写。
       // eslint-disable-next-line no-console -- migration-time visibility contract: teammate carry-over must be announced, not silent
       console.log(
-        `[session-migrate/dsh] ${teammateCount} teammate sidechain(s) written as standalone child sessions (dsh team/* events are runtime-only state — content preserved, live-team semantics not translatable; see docs/agents/dsh.md)`,
+        `[cc-migrate/dsh] ${teammateCount} teammate sidechain(s) written as standalone child sessions (dsh team/* events are runtime-only state — content preserved, live-team semantics not translatable; see docs/agents/dsh.md)`,
       );
     }
     const now = Date.now();
@@ -694,7 +694,7 @@ export class DshAdapter implements Adapter {
     if (unknownKinds.length > 0) {
       // eslint-disable-next-line no-console -- migration-time visibility contract: silent drops are the bug class this guards
       console.warn(
-        `[session-migrate/dsh] ${unknownKinds.length} sidechain(s) of unknown kind(s) ${[...new Set(unknownKinds.map((s) => s.kind))].join(', ')} dropped (no dsh carry-over defined — see docs/agents/dsh.md)`,
+        `[cc-migrate/dsh] ${unknownKinds.length} sidechain(s) of unknown kind(s) ${[...new Set(unknownKinds.map((s) => s.kind))].join(', ')} dropped (no dsh carry-over defined — see docs/agents/dsh.md)`,
       );
     }
     for (const sc of (ir.sidechains ?? []).filter((s) => s.kind === 'subagent' || s.kind === 'teammate')) {

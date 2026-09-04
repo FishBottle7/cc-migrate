@@ -1,15 +1,19 @@
 /**
- * Smoke test for the session-migrate DSH plugin.
+ * Smoke test for the cc-migrate DSH plugin.
  *
- * Verifies against a mock cordis ctx (no DSH host needed):
- *   1. apply() registers exactly the 3 commands and ctx.effect collects
- *      their disposers (fiber-clean unload).
- *   2. list-sources returns a session array for a source tool under a
+ * Verifies against a mock cordis ctx modeled on the REAL dsh-commands host
+ * contract (normalizeDefinition / normalizeResult — see src/index.ts's
+ * PluginContext 头注；真机首装时踩过「description 缺失炸插件树」的坑，
+ * mock 必须与宿主同形，不能再放行宽松形状):
+ *   1. apply() registers exactly the 3 flat commands with {name, description,
+ *      handler} and ctx.effect collects their disposers (fiber-clean unload).
+ *   2. handlers return CommandResult {kind, text} — the shape the host's
+ *      normalizeResult enforces.
+ *   3. list-sources returns a session array for a source tool under a
  *      temp root (data seeded with the core's own write pipeline — never
  *      the real ~/.dsh).
- *   3. preview returns text.
- *   4. import writes a NEW resumable session into a temp DSH root and the
- *      existing file survives untouched (read-old-write-new).
+ *   4. preview returns text; import writes a NEW resumable session into a
+ *      temp DSH root and the existing file survives untouched.
  *   5. dispose path: running every registered disposer throws nothing.
  *
  * Safety: everything happens inside os.tmpdir(); no unlink/rm anywhere.
@@ -22,11 +26,27 @@ import { tmpdir } from 'node:os';
 
 // The plugin entry (built lib) — importing it pulls in the command layer.
 const plugin = await import('../lib/index.js');
-const core = await import('@session-migrate/core');
+const core = await import('@cc-migrate/core');
 const { apply, COMMAND_NAMES } = plugin;
 
-// ── mock cordis ctx ──────────────────────────────────────────────────
-const registered = [];            // [name, handler]
+/** 复刻 dsh-commands 的 normalizeDefinition 校验（宽松 mock 会让真实契约
+ *  违例静默漏网——见头注）。 */
+const COMMAND_NAME = /^[a-z][a-z0-9_-]*$/u;
+function hostValidateDefinition(def) {
+  if (!COMMAND_NAME.test(def.name)) throw new TypeError(`command name "${def.name}" must match ${String(COMMAND_NAME)}`);
+  if (typeof def.description !== 'string') throw new TypeError(`command "${def.name}" description must be a string`);
+  if (def.description.trim().length === 0) throw new TypeError(`command "${def.name}" description must not be empty`);
+  if (typeof def.handler !== 'function') throw new TypeError(`command "${def.name}" handler must be a function`);
+}
+/** 复刻 normalizeResult 的返回值契约。 */
+function hostValidateResult(name, value) {
+  if (typeof value !== 'object' || value === null || !('kind' in value)) {
+    throw new TypeError(`command "${name}" handler must return a CommandResult`);
+  }
+}
+
+// ── mock cordis ctx（宿主同形，不是宽松形状）──────────────────────────
+const registered = [];            // {name, description, handler}
 const disposers = [];             // disposers returned by effect(fn)
 const logs = [];
 const mockCtx = {
@@ -36,9 +56,10 @@ const mockCtx = {
     error: (...a) => logs.push(['error', ...a]),
   },
   commands: {
-    register(name, handler) {
-      registered.push([name, handler]);
-      return () => {};            // unregister fn — recorded via effect below
+    register(definition) {
+      hostValidateDefinition(definition);   // ← 与真宿主同款校验，违例在此炸
+      registered.push(definition);
+      return () => {};                       // unregister fn — recorded via effect below
     },
   },
   effect(fn) {
@@ -48,24 +69,31 @@ const mockCtx = {
   },
 };
 
-// ── 1. apply() registers the 3 commands ──────────────────────────────
+// ── 1. apply() registers the 3 flat commands（宿主校验全过）──────────
 apply(mockCtx, {});
-const names = registered.map(([n]) => n);
+const names = registered.map((d) => d.name);
 assert.deepEqual(
   [...names].sort(),
   [...COMMAND_NAMES].sort(),
   `expected the 3 commands registered, got: ${names.join(', ')}`,
 );
 assert.equal(registered.length, 3, 'exactly 3 commands');
+for (const def of registered) {
+  assert.ok(def.description.trim().length > 0, `command ${def.name} carries a description (host contract)`);
+}
 assert.ok(disposers.length >= 3, 'every register routed through ctx.effect');
 console.log(`[1] commands registered: ${names.join(', ')} (${disposers.length} disposers via ctx.effect)`);
 
-const handlers = new Map(registered);
-const run = (name, ...args) => handlers.get(name)(...args);
+/** 按宿主 dispatch 形态调用：rawInput = 命令名后的原始文本。 */
+const invoke = (name, ...args) => {
+  const def = registered.find((d) => d.name === name);
+  const result = def.handler({ rawInput: ' ' + args.join(' '), agent: undefined, attachments: [], signal: undefined });
+  return Promise.resolve(result).then((r) => { hostValidateResult(name, r); return r; });
+};
 
 // ── seed a source session with core's own pipeline (temp dirs only) ──
-const srcRoot = await mkdtemp(join(tmpdir(), 'sm-plugin-src-'));   // claude side
-const dstRoot = await mkdtemp(join(tmpdir(), 'sm-plugin-dst-'));   // dsh side
+const srcRoot = await mkdtemp(join(tmpdir(), 'cc-plugin-src-'));   // claude side
+const dstRoot = await mkdtemp(join(tmpdir(), 'cc-plugin-dst-'));   // dsh side
 const registry = core.builtinRegistry();
 const ir = core.fallbackIr();
 const claude = registry.get('claude');
@@ -73,45 +101,46 @@ const written = await core.writeTarget(claude, ir, { root: srcRoot, targetCwd: '
 const srcSessionId = written.sessionId;
 
 // ── 2. list-sources over the temp claude root ────────────────────────
-const listRes = await run('list-sources', 'claude', '--root', srcRoot);
-assert.equal(listRes.ok, true, `list-sources failed: ${listRes.error}`);
-assert.ok(Array.isArray(listRes.sessions), 'sessions is an array');
-assert.ok(listRes.sessions.length >= 1, 'at least one session listed');
-const meta = listRes.sessions.find((s) => s.sessionId === srcSessionId);
-assert.ok(meta, 'seeded session appears in list-sources');
-console.log(`[2] list-sources claude @ tmp -> ${listRes.sessions.length} session(s), seeded id found: ${Boolean(meta)}`);
+const listCmd = names.find((n) => n.endsWith('list-sources'));
+const listRes = await invoke(listCmd, 'claude', '--root', srcRoot);
+assert.equal(listRes.kind, 'success', `list-sources failed: ${listRes.text}`);
+assert.ok(listRes.text.includes('session(s)'), 'success text carries the listing');
+console.log(`[2] ${listCmd} claude @ tmp -> ${listRes.text.split('\n')[0]}`);
 
 // ── 3. preview the seeded session ───────────────────────────────────
-const prevRes = await run('preview', 'claude', srcSessionId, '--root', srcRoot);
-assert.equal(prevRes.ok, true, `preview failed: ${prevRes.error}`);
-assert.equal(typeof prevRes.text, 'string');
+const prevCmd = names.find((n) => n.endsWith('preview'));
+const prevRes = await invoke(prevCmd, 'claude', srcSessionId, '--root', srcRoot);
+assert.equal(prevRes.kind, 'success', `preview failed: ${prevRes.text}`);
 assert.ok(prevRes.text.length > 0, 'preview text non-empty');
-console.log(`[3] preview ok, ${prevRes.text.split('\n').length} line(s)`);
+console.log(`[3] ${prevCmd} ok, ${prevRes.text.split('\n').length} line(s)`);
 
 // ── 4. import claude session into a temp DSH root ────────────────────
-const importRes = await run('import', 'claude', srcSessionId, '--src-root', srcRoot, '--cwd', 'D:\\demo\\proj', '--root', dstRoot);
-assert.equal(importRes.ok, true, `import failed: ${importRes.error}`);
-assert.equal(importRes.target.tool, 'dsh');
-assert.ok(importRes.target.paths.length >= 1, 'import wrote at least one path');
-const importedPath = importRes.target.paths[0];
+const importCmd = names.find((n) => n.endsWith('import'));
+const importRes = await invoke(importCmd, 'claude', srcSessionId, '--src-root', srcRoot, '--cwd', 'D:\\demo\\proj', '--root', dstRoot);
+assert.equal(importRes.kind, 'success', `import failed: ${importRes.text}`);
+assert.ok(importRes.text.includes('-> dsh:'), 'success text reports the migrated id');
+// 找到迁移产物（summary 文本里有路径行）
+const pathLine = importRes.text.split('\n').map((l) => l.trim()).find((l) => l.includes('session.jsonl.zstd'));
+assert.ok(pathLine, 'success text lists the written artifact');
+const importedPath = pathLine.replace(/^  /, '');
 const before = await readFile(importedPath);
 assert.ok(before.length > 0, 'written zstd file non-empty');
-console.log(`[4] import claude:${srcSessionId} -> dsh:${importRes.target.sessionId}`);
+console.log(`[4] ${importCmd}: ${importRes.text.split('\n')[0]}`);
 console.log(`    wrote: ${importedPath}`);
 
 // re-import must NOT overwrite: a second import writes a different new file
-const importRes2 = await run('import', 'claude', srcSessionId, '--src-root', srcRoot, '--cwd', 'D:\\demo\\proj', '--root', dstRoot);
-assert.equal(importRes2.ok, true, `second import failed: ${importRes2.error}`);
-assert.notEqual(importRes2.target.sessionId, importRes.target.sessionId, 'import always mints a new session id');
+const importRes2 = await invoke(importCmd, 'claude', srcSessionId, '--src-root', srcRoot, '--cwd', 'D:\\demo\\proj', '--root', dstRoot);
+assert.equal(importRes2.kind, 'success', `second import failed: ${importRes2.text}`);
+assert.notEqual(importRes2.text, importRes.text, 'import always mints a new session id (summary differs)');
 const firstStillThere = await stat(importedPath);
 assert.ok(firstStillThere.size > 0, 'first imported session untouched after second import');
-console.log(`[4b] second import minted new id ${importRes2.target.sessionId}; first file intact`);
+console.log(`[4b] second import minted a new id; first file intact`);
 
 // ── 5. structured errors instead of thrown exceptions ────────────────
-const badTool = await run('list-sources', 'not-a-tool');
-assert.equal(badTool.ok, false);
-assert.ok(typeof badTool.error === 'string');
-console.log(`[5] unknown tool -> structured error: ${badTool.error.slice(0, 60)}...`);
+const badTool = await invoke(listCmd, 'not-a-tool');
+assert.equal(badTool.kind, 'error');
+assert.ok(typeof badTool.text === 'string' && badTool.text.length > 0);
+console.log(`[5] unknown tool -> CommandResult error: ${badTool.text.slice(0, 60)}...`);
 
 // ── 6. dispose path throws nothing ───────────────────────────────────
 for (const d of disposers) {
@@ -119,4 +148,4 @@ for (const d of disposers) {
 }
 console.log(`[6] ${disposers.length} disposers ran clean (no throw)`);
 
-console.log('\nSMOKE OK — 3 commands registered, list-sources/preview/import verified in temp roots.');
+console.log('\nSMOKE OK — 3 flat commands registered under the host-shaped mock, list/preview/import verified in temp roots.');

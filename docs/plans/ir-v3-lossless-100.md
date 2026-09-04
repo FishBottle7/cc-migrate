@@ -101,7 +101,7 @@ export interface MigratedSession {
 
 ## 5. 验证
 
-- `pnpm --filter @session-migrate/core build` OK
+- `pnpm --filter @cc-migrate/core build` OK
 - `node --test --test-isolation=none dist/test/*.test.js` 含新增 goal 用例
 - `cli` 用 `--dst-root <tmp>` 做 `dsh→dsh`（goal 保留）与 `dsh→claude→dsh`（goal 经 IR 中转恢复）双链路验证
 

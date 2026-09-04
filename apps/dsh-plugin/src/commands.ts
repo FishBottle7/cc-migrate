@@ -1,8 +1,8 @@
 /**
- * session-migrate DSH plugin — command layer.
+ * cc-migrate DSH plugin — command layer.
  *
  * Pure functions decoupled from the cordis host: they receive plain
- * arguments, call the shared `@session-migrate/core` engine, and return
+ * arguments, call the shared `@cc-migrate/core` engine, and return
  * result objects. The cordis side (src/index.ts) only deals with
  * interaction (argument parsing, logging, dispose); all migration logic
  * lives here so it stays testable without a DSH host.
@@ -25,7 +25,7 @@ import {
   previewSession,
   readSource,
   writeTarget,
-} from '@session-migrate/core';
+} from '@cc-migrate/core';
 import type {
   AdapterRegistry,
   MigratedMessage,
@@ -33,7 +33,7 @@ import type {
   SessionMeta,
   ToolId,
   WriteResult,
-} from '@session-migrate/core';
+} from '@cc-migrate/core';
 
 /** Tools this plugin can import FROM (target is always DSH). */
 export const SOURCE_TOOLS: ToolId[] = ['dsh', 'claude', 'codex', 'opencode', 'pi', 'zcode'];
@@ -224,7 +224,7 @@ function flattenSidechains(list: MigratedSidechain[] | undefined, out: PreviewSi
 }
 
 /** MigratedSession → GUI 预览载荷（IR 已读入，投影纯同步、无 IO）。 */
-export function projectPreviewPayload(tool: ToolId, sessionId: string, ir: import('@session-migrate/core').MigratedSession): PreviewPayload {
+export function projectPreviewPayload(tool: ToolId, sessionId: string, ir: import('@cc-migrate/core').MigratedSession): PreviewPayload {
   return {
     tool,
     sessionId,
@@ -250,7 +250,7 @@ function isSourceTool(tool: string): tool is ToolId {
 }
 
 /**
- * `/session-migrate list-sources <tool> [--root <dir>]`
+ * `/cc-migrate list-sources <tool> [--root <dir>]`
  *
  * Lists a source tool's sessions (title / time / id / cwd) via the shared
  * registry. Read-only.
@@ -269,7 +269,7 @@ export async function listSources(tool: string, root?: string): Promise<ListSour
 }
 
 /**
- * `/session-migrate preview <tool> <sessionId> [--root <dir>]`
+ * `/cc-migrate preview <tool> <sessionId> [--root <dir>]`
  *
  * Parses the source session into IR and renders the offline text preview.
  * Read-only.
@@ -292,7 +292,7 @@ export async function preview(tool: string, sessionId: string, root?: string): P
 }
 
 /**
- * `/session-migrate preview <tool> <sessionId> [--root <dir>]` — GUI variant.
+ * `/cc-migrate preview <tool> <sessionId> [--root <dir>]` — GUI variant.
  *
  * Same read-only parse as the CLI preview, but returns the STRUCTURED payload
  * ui's SessionPreview eats (PreviewPayload DTO) instead of flat text. The
@@ -316,7 +316,7 @@ export async function previewPayload(tool: string, sessionId: string, root?: str
 }
 
 /**
- * `/session-migrate import <tool> <sessionId> [--src-root <dir>] [--cwd <dir>] [--root <dstRoot>]`
+ * `/cc-migrate import <tool> <sessionId> [--src-root <dir>] [--cwd <dir>] [--root <dstRoot>]`
  *
  * Parses the source session into IR, then writes it into DSH's native
  * resumable storage as a BRAND-NEW session (fresh id; existing sessions

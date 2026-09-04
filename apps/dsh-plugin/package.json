@@ -1,7 +1,7 @@
 {
-  "name": "@session-migrate/dsh-plugin",
+  "name": "@cc-migrate/dsh-plugin",
   "version": "0.1.0",
-  "description": "session-migrate DSH plugin: bring any AI coding tool's session into DSH as a resumable native session.",
+  "description": "cc-migrate DSH plugin: bring any AI coding tool's session into DSH as a resumable native session.",
   "type": "module",
   "main": "lib/index.js",
   "exports": {
@@ -26,24 +26,33 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test": "pnpm run build && node test/smoke.mjs && node test/gui-smoke.mjs"
+    "bundle": "tsdown",
+    "pack": "pnpm run build:smoke && pnpm run bundle && node scripts/pack.mjs",
+    "build:smoke": "pnpm run build && node test/smoke.mjs && node test/gui-smoke.mjs",
+    "test": "pnpm run build:smoke"
   },
   "keywords": [
     "dsh",
     "dsh-plugin",
-    "session-migrate",
+    "cc-migrate",
+    "cc-migrate",
     "cordis",
     "cordis-plugin",
     "deepseek-harness"
   ],
   "license": "MIT",
   "dependencies": {
-    "@session-migrate/core": "workspace:*",
-    "@session-migrate/ui": "workspace:*",
+    "@cc-migrate/core": "workspace:*",
+    "@cc-migrate/ui": "workspace:*",
+    "vue": "^3.5.0"
+  },
+  "peerDependencies": {
+    "@cc-migrate/ui": "*",
     "vue": "^3.5.0"
   },
   "devDependencies": {
     "@types/node": "^24.0.0",
+    "tsdown": "^0.22.0",
     "typescript": "^5.6.0"
   }
 }

@@ -1,9 +1,9 @@
 {
-  "name": "@session-migrate/desktop-app",
+  "name": "@cc-migrate/desktop-app",
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "session-migrate 独立跨平台 App（Electron 主进程直连 core + Vue 3 渲染进程）",
+  "description": "cc-migrate 独立跨平台 App（Electron 主进程直连 core + Vue 3 渲染进程）",
   "main": "dist/index.js",
   "scripts": {
     "build:main": "tsc -p tsconfig.main.json",
@@ -21,8 +21,8 @@
     "smoke:packaged": "node scripts/smoke-packaged.mjs"
   },
   "dependencies": {
-    "@session-migrate/core": "workspace:*",
-    "@session-migrate/ui": "workspace:*",
+    "@cc-migrate/core": "workspace:*",
+    "@cc-migrate/ui": "workspace:*",
     "vue": "^3.5.0"
   },
   "devDependencies": {

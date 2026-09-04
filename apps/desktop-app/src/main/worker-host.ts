@@ -26,14 +26,14 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
  *   主进程跑在 resources/app.asar/dist/index.js（Electron 把 asar 虚拟文件
  *   系统挂进 __dirname）。但 worker 由【系统 Node】子进程加载——系统 Node
  *   不认识 asar，没法 require 虚拟路径里的 ESM 及其依赖链。所以 electron-
- *   builder.yml 把 worker/ 与 node_modules/@session-migrate/core asarUnpack
+ *   builder.yml 把 worker/ 与 node_modules/@cc-migrate/core asarUnpack
  *   到了 resources/app.asar.unpacked/。这里把 asar 内的路径改写成
  *   .unpacked 下的真实路径：
  *     .../app.asar/dist  →  .../app.asar.unpacked/dist   （作为 appRoot 的锚点）
  *     .../app.asar/worker/worker.mjs → .../app.asar.unpacked/worker/worker.mjs
  *
  * appRoot（spawn 的 cwd）在打包形态下取 resources/ 目录：worker.mjs 用
- * `@session-migrate/core` 裸导入，Node 从 worker 文件位置逐级向上找
+ * `@cc-migrate/core` 裸导入，Node 从 worker 文件位置逐级向上找
  * node_modules —— app.asar.unpacked/worker → app.asar.unpacked/node_modules
  * （asarUnpack 的 core 就在这，满足解析）。dev 形态下则必须保持
  * <app> 根，指向 apps/desktop-app/node_modules（pnpm symlink 到 packages/core）。

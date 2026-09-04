@@ -1,5 +1,5 @@
 /**
- * gen-icon.mjs — session-migrate 应用图标生成（零外部依赖，可重复生成）
+ * gen-icon.mjs — cc-migrate 应用图标生成（零外部依赖，可重复生成）
  *
  * 背景：本机无 ImageMagick/GraphicsMagick/Inkscape，node_modules 依赖树（.pnpm
  * store 全量排查）里也没有 sharp/canvas/pngjs/to-ico，ffmpeg 是 essentials 构建
@@ -8,7 +8,7 @@
  * deflateSync 编码 PNG，再手写 ICO（PNG-in-ICO，Vista+ 支持）与 ICNS（各层嵌
  * PNG 的 icns 容器）两个格式。全程无时间戳注入，gen:icon 幂等重跑字节一致。
  *
- * 设计（session-migrate 语义：会话 / 迁移 / 流动）：
+ * 设计（cc-migrate 语义：会话 / 迁移 / 流动）：
  *   深蓝→青渐变圆角方底（深浅色任务栏都可辨）+ 对角排布的两个对话气泡
  *   （左上=源工具，右下=目标工具）+ 一支穿过两气泡的对角双向箭头（迁移 ⇄）。
  *
@@ -295,7 +295,7 @@ function svgSource() {
   const { cx, cy, halfLen, halfWid } = SHAFT;
   return `<?xml version="1.0" encoding="UTF-8"?>
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${W} ${W}" width="${W}" height="${W}">
-  <title>session-migrate</title>
+  <title>cc-migrate</title>
   <defs>
     <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
       <stop offset="0" stop-color="#0e4f9e"/>

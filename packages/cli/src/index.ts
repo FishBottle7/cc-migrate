@@ -1,28 +1,28 @@
 #!/usr/bin/env node
 /**
- * session-migrate CLI.
+ * cc-migrate CLI.
  *
  * Usage:
- *   session-migrate list <tool> [--root <dir>]
- *   session-migrate preview <tool> <sessionId> [--root <dir>]
- *   session-migrate migrate <srcTool> <srcSessionId> <dstTool>
+ *   cc-migrate list <tool> [--root <dir>]
+ *   cc-migrate preview <tool> <sessionId> [--root <dir>]
+ *   cc-migrate migrate <srcTool> <srcSessionId> <dstTool>
  *                    [--src-root <dir>] [--dst-root <dir>] [--target-cwd <path>]
  *                    [--keep-runtime-context]
- *   session-migrate wizard [--src-root <dir>] [--dst-root <dir>]  # interactive
- *   session-migrate reconcile dsh [--root <dir>]  # fix workspace.json registration
- *   session-migrate verify dsh [--root <dir>] [sessionId]  # validate artifacts
- *   session-migrate demo      # dsh->dsh self round-trip
- *   session-migrate demo2     # claude<->dsh round-trip in a temp dir
+ *   cc-migrate wizard [--src-root <dir>] [--dst-root <dir>]  # interactive
+ *   cc-migrate reconcile dsh [--root <dir>]  # fix workspace.json registration
+ *   cc-migrate verify dsh [--root <dir>] [sessionId]  # validate artifacts
+ *   cc-migrate demo      # dsh->dsh self round-trip
+ *   cc-migrate demo2     # claude<->dsh round-trip in a temp dir
  */
 
-import { builtinRegistry } from '@session-migrate/core';
+import { builtinRegistry } from '@cc-migrate/core';
 import {
   previewSession,
   readSource,
   writeTarget,
   listSessions,
   fallbackIr,
-} from '@session-migrate/core';
+} from '@cc-migrate/core';
 
 interface Flags {
   srcRoot?: string;
@@ -82,7 +82,7 @@ async function main(argv: string[]) {
     }
     case 'preview': {
       if (!a || !b) {
-        console.error('usage: session-migrate preview <tool> <sessionId> [--full]');
+        console.error('usage: cc-migrate preview <tool> <sessionId> [--full]');
         process.exit(1);
       }
       const adapter = registry.get(a as never);
@@ -100,7 +100,7 @@ async function main(argv: string[]) {
     }
     case 'migrate': {
       if (!a || !b || !c) {
-        console.error('usage: session-migrate migrate <srcTool> <srcSessionId> <dstTool>');
+        console.error('usage: cc-migrate migrate <srcTool> <srcSessionId> <dstTool>');
         process.exit(1);
       }
       const ir = await readSource(registry, a, b, flags.root ?? flags.srcRoot);
@@ -120,8 +120,8 @@ async function main(argv: string[]) {
     }
     case 'reconcile': {
       if (a === 'dsh' || !a) {
-        const { reconcileWorkspaces } = await import('@session-migrate/core/workspace');
-        const { defaultDshRoot } = await import('@session-migrate/core');
+        const { reconcileWorkspaces } = await import('@cc-migrate/core/workspace');
+        const { defaultDshRoot } = await import('@cc-migrate/core');
         const root = (flags.root ?? flags.dstRoot ?? (defaultDshRoot as unknown as () => string | null)()) as string;
         if (!root) { console.error('cannot resolve DSH sessions root'); process.exit(1); }
         const res = await (reconcileWorkspaces as any)(root);
@@ -129,13 +129,13 @@ async function main(argv: string[]) {
         if (res.errors?.length) for (const e of res.errors) console.error('  ' + e);
         return;
       }
-      console.error('usage: session-migrate reconcile [dsh] [--root <dir>]');
+      console.error('usage: cc-migrate reconcile [dsh] [--root <dir>]');
       process.exit(1);
     }
     case 'verify': {
       if (a === 'dsh' || !a) {
-        const { verifySessionById, verifyAllSessions } = await import('@session-migrate/core/verify');
-        const { defaultDshRoot } = await import('@session-migrate/core');
+        const { verifySessionById, verifyAllSessions } = await import('@cc-migrate/core/verify');
+        const { defaultDshRoot } = await import('@cc-migrate/core');
         const root = (flags.root ?? flags.dstRoot ?? (defaultDshRoot as unknown as () => string | null)()) as string | undefined;
         const sid = b;
         const results = sid ? [await verifySessionById(sid, root)] : await verifyAllSessions(root);
@@ -157,7 +157,7 @@ async function main(argv: string[]) {
         if (failed > 0) process.exit(1);
         return;
       }
-      console.error('usage: session-migrate verify [dsh] [--root <dir>] [sessionId]');
+      console.error('usage: cc-migrate verify [dsh] [--root <dir>] [sessionId]');
       process.exit(1);
     }
     case 'wizard':
@@ -180,10 +180,10 @@ async function main(argv: string[]) {
       try {
         const res = await runWizard(io, {
           builtinRegistry,
-          previewSession: (await import('@session-migrate/core')).previewSession as never,
-          readSource: (await import('@session-migrate/core')).readSource as never,
-          writeTarget: (await import('@session-migrate/core')).writeTarget as never,
-          listSessions: (await import('@session-migrate/core')).listSessions as never,
+          previewSession: (await import('@cc-migrate/core')).previewSession as never,
+          readSource: (await import('@cc-migrate/core')).readSource as never,
+          writeTarget: (await import('@cc-migrate/core')).writeTarget as never,
+          listSessions: (await import('@cc-migrate/core')).listSessions as never,
         }, pre as never);
         if (!res) process.exit(1);
       } finally {
@@ -200,7 +200,7 @@ async function main(argv: string[]) {
       return;
     }
     default:
-      console.error('usage: session-migrate <list|preview|migrate|verify|reconcile|wizard|demo|demo2> [...]');
+      console.error('usage: cc-migrate <list|preview|migrate|verify|reconcile|wizard|demo|demo2> [...]');
       process.exit(1);
   }
 }

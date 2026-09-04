@@ -31,10 +31,10 @@ import { tmpdir } from 'node:os';
 // lib 构建（test script 先跑过 build）。
 const gui = await import('../lib/gui.js');
 const { createSessionMigrateWizard, GUI_SOURCE_TOOLS } = gui;
-const core = await import('@session-migrate/core');
+const core = await import('@cc-migrate/core');
 
 // ── 1. 主入口不携带 Vue 运行时 ──────────────────────────────────────
-// index.js 动态引 gui.js；gui.js 只动态引 @session-migrate/ui。
+// index.js 动态引 gui.js；gui.js 只动态引 @cc-migrate/ui。
 // 若隔离被破坏（顶层静态 import .vue），这里第一时间暴露。
 const pluginIndex = await import('../lib/index.js');
 assert.equal(typeof pluginIndex.apply, 'function', 'plugin entry still exports apply()');
@@ -80,9 +80,9 @@ await assert.rejects(
   createSessionMigrateWizard(host, { container: fakeContainer, dstRoot }),
   (e) => {
     const msg = e instanceof Error ? e.message : String(e);
-    assert.ok(msg.includes('session-migrate gui'), `error must mention the gui layer, got: ${msg}`);
+    assert.ok(msg.includes('cc-migrate gui'), `error must mention the gui layer, got: ${msg}`);
     assert.ok(
-      msg.includes('@session-migrate/ui') || msg.includes('cannot load'),
+      msg.includes('@cc-migrate/ui') || msg.includes('cannot load'),
       `error must name the ui load failure, got: ${msg}`,
     );
     return true;
@@ -240,4 +240,4 @@ for (const d of [...disposers, ...disposersLegacy]) if (typeof d === 'function')
 console.log(`[10] apply() with ctx.gui mounts via effect (${disposers.length} disposers); legacy host unchanged (${disposersLegacy.length})`);
 
 console.log('\nGUI SMOKE OK — wizard mount protocol + backend bridge verified headless in temp roots.');
-console.log('(component rendering is guaranteed by @session-migrate/ui typecheck — vue-tsc; real-host mounting is joint-debug scope)');
+console.log('(component rendering is guaranteed by @cc-migrate/ui typecheck — vue-tsc; real-host mounting is joint-debug scope)');

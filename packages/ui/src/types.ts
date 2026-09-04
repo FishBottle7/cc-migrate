@@ -1,5 +1,5 @@
 /**
- * @session-migrate/ui — 前端与宿主（Electron 主进程 / DSH 插件）之间的契约。
+ * @cc-migrate/ui — 前端与宿主（Electron 主进程 / DSH 插件）之间的契约。
  *
  * 组件是纯展示层：所有数据获取通过宿主注入的 `MigrationBackend` 完成，
  * 这是 core 五能力（listSessions / parse / preview / write / resolveCwd）
@@ -7,7 +7,7 @@
  * 组件逻辑零改动复用。
  */
 
-import type { SessionMeta, ToolId } from '@session-migrate/core';
+import type { SessionMeta, ToolId } from '@cc-migrate/core';
 
 /** 工具元数据（供工具选择卡片渲染）。 */
 export interface ToolInfo {

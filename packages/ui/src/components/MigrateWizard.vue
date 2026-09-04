@@ -10,7 +10,7 @@
  * 视觉：左侧竖排进度轨 + 右侧步骤舞台；步骤切换带方向感知滑动。
  */
 import { computed, onUnmounted, ref, watch } from 'vue';
-import type { SessionMeta, ToolId } from '@session-migrate/core';
+import type { SessionMeta, ToolId } from '@cc-migrate/core';
 import type { MigrateOutcome, MigrationBackend, PreviewPayload, ToolInfo } from '../types.js';
 import ToolSelect from './ToolSelect.vue';
 import SessionPicker from './SessionPicker.vue';
@@ -388,7 +388,7 @@ function startDrag(e: MouseEvent) {
       <div class="brand">
         <span class="seal" aria-hidden="true">迁</span>
         <span class="brand-text">
-          <b class="sm-mono">session-migrate</b>
+          <b class="sm-mono">cc-migrate</b>
           <i>AI 编码会话迁移</i>
         </span>
       </div>

@@ -1,17 +1,17 @@
 # electron-builder 配置 —— 打包形态下「system-Node worker」仍可用的关键是：
 # worker/worker.mjs 由【系统 Node】子进程加载（不是 Electron 内置 Node，见
 # worker.mjs 头注的 zstd 崩溃规避），因此：
-#   1. worker 及其依赖链（node_modules/@session-migrate/core）必须在【真实文件系统】
+#   1. worker 及其依赖链（node_modules/@cc-migrate/core）必须在【真实文件系统】
 #      上可 require —— 系统 Node 不认识 Electron 的 asar 虚拟文件系统，
 #      所以 worker + core 一律 asarUnpack 到 app.asar.unpacked；
-#   2. pnpm workspace 下 node_modules/@session-migrate/core 是指向
+#   2. pnpm workspace 下 node_modules/@cc-migrate/core 是指向
 #      ../../packages/core 的 symlink。electron-builder 的 files 匹配 node_modules
 #      时会把 symlink 解析后的真实文件收进来（构建实测验证），并保持包内相对布局。
 #
 # 渲染层产物在 dist/renderer 下，被 files 的 dist/** 自然覆盖，无需单列。
 
-appId: com.fishbottle.session-migrate # 个人工具命名，无域名冲突风险即可
-productName: session-migrate # 与 BrowserWindow title / package name 一致
+appId: com.fishbottle.cc-migrate # 个人工具命名，无域名冲突风险即可
+productName: cc-migrate # 与 BrowserWindow title / package name 一致
 
 directories:
   # 产物目录。默认会写到 SM_DIST_DIR 指定的路径（见 scripts 说明）：
@@ -27,13 +27,13 @@ files:
   - dist/** # 主进程产物（dist/*.js 平铺）+ 渲染层（dist/renderer/）
   - preload/** # contextBridge 桥（.cjs 源文件直接加载）
   - worker/** # system-Node worker（纯 JS 无构建）
-  # 渲染层的 vue/@session-migrate/ui 已被 vite 打进 dist/renderer（源码 alias 编译），
-  # asar 里不需要任何运行时 node_modules —— 先整目录排除，再【重新放行】worker
-  # 真正依赖的 @session-migrate/core（glob 顺序即优先级，后者覆盖前者）。
+# 渲染层的 vue/@cc-migrate/ui 已被 vite 打进 dist/renderer（源码 alias 编译），
+# asar 里不需要任何运行时 node_modules —— 先整目录排除，再【重新放行】worker
+# 真正依赖的 @cc-migrate/core（glob 顺序即优先级，后者覆盖前者）。
   # core 是 pnpm workspace symlink，electron-builder 解析后按真实文件收进来。
   - "!node_modules/**"
-  - node_modules/@session-migrate/core/dist/src/**
-  - node_modules/@session-migrate/core/package.json
+  - node_modules/@cc-migrate/core/dist/src/**
+  - node_modules/@cc-migrate/core/package.json
 
 asar: true
 
@@ -42,7 +42,7 @@ asar: true
 # asar 内路径重写到 .unpacked）。
 asarUnpack:
   - worker/**
-  - node_modules/@session-migrate/core/**
+  - node_modules/@cc-migrate/core/**
 
 # 无签名（个人工具）：electron-builder 默认不签名，仅显式声明意图
 win:

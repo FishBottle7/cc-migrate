@@ -2,7 +2,7 @@
  * 会话选择器的树模型（主会话在上、子会话挂父节点下）+ 行内小工具。
  * 渲染在 SessionPicker（工作区分组 + 递归 SpSessionRow）。
  */
-import type { SessionMeta } from '@session-migrate/core';
+import type { SessionMeta } from '@cc-migrate/core';
 import type { InjectionKey, Ref } from 'vue';
 
 /** 子会话折叠集合（provide/inject 下发——走 prop 会让整棵树跟着集合换新而全量重渲染）。 */

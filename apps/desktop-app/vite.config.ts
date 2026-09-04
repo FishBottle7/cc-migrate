@@ -4,7 +4,7 @@ import { fileURLToPath, URL } from 'node:url';
 
 /**
  * 只负责渲染进程：Vue 3 SFC 编译 + 打包。
- * @session-migrate/ui 以源码形式被编译（packages/ui 不单独构建），
+ * @cc-migrate/ui 以源码形式被编译（packages/ui 不单独构建），
  * 与未来 DSH 插件前端的消费方式一致。
  */
 export default defineConfig({
@@ -13,7 +13,7 @@ export default defineConfig({
   plugins: [vue()],
   resolve: {
     alias: {
-      '@session-migrate/ui': fileURLToPath(new URL('../../packages/ui/src/index.ts', import.meta.url)),
+      '@cc-migrate/ui': fileURLToPath(new URL('../../packages/ui/src/index.ts', import.meta.url)),
     },
   },
   build: {

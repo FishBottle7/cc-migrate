@@ -7,14 +7,14 @@
  *   或：node scripts/smoke-packaged.mjs release/win-unpacked
  *
  * 不启动 GUI：无头环境起不了窗口，也不需要 —— 本冒烟只关心「Electron 之外」
- * 的核心架构约束：worker.mjs 及其 @session-migrate/core 依赖链在 asar.unpacked
+ * 的核心架构约束：worker.mjs 及其 @cc-migrate/core 依赖链在 asar.unpacked
  * 真实目录里可被系统 Node require/spawn。这正是主进程 worker-host.ts 在打包
  * 形态下做的事（spawn 系统 Node 跑 app.asar.unpacked/worker/worker.mjs）。
  *
  * 检查项：
  *   1. 产物目录布局：resources/app.asar 存在，asar 内有 dist/preload/worker；
  *      resources/app.asar.unpacked/worker/worker.mjs 与
- *      node_modules/@session-migrate/core 存在（asarUnpack 生效）
+ *      node_modules/@cc-migrate/core 存在（asarUnpack 生效）
  *   2. 系统 Node 以【主进程同样的方式】spawn unpacked 的 worker.mjs，
  *      发送一条 list-tools JSON-RPC，断言收到 ok:true 且工具列表非空
  *      —— 证明 core 从 asar.unpacked/node_modules 正常解析（zstd 等重活可用）
@@ -47,10 +47,10 @@ const unpackedWorker = path.join(unpackedDir, 'worker', 'worker.mjs');
 if (!fs.existsSync(unpackedWorker)) {
   fail(`${unpackedWorker} 不存在 —— asarUnpack 没把 worker/ 解出来，系统 Node 将无法加载 worker`);
 }
-const unpackedCore = path.join(unpackedDir, 'node_modules', '@session-migrate', 'core');
+const unpackedCore = path.join(unpackedDir, 'node_modules', '@cc-migrate', 'core');
 for (const rel of ['package.json', path.join('dist', 'src', 'index.js')]) {
   if (!fs.existsSync(path.join(unpackedCore, rel))) {
-    fail(`${path.join(unpackedCore, rel)} 不存在 —— asarUnpack 没把 @session-migrate/core 解出来，worker 将无法解析依赖链`);
+    fail(`${path.join(unpackedCore, rel)} 不存在 —— asarUnpack 没把 @cc-migrate/core 解出来，worker 将无法解析依赖链`);
   }
 }
 console.log('[layout] app.asar / app.asar.unpacked(worker+core) 布局 OK');

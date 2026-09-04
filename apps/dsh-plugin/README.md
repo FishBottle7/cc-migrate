@@ -1,7 +1,7 @@
-# @session-migrate/dsh-plugin
+# @cc-migrate/dsh-plugin
 
 DSH cordis 插件：把任意 AI 编码工具（claude / codex / opencode / pi / zcode / dsh）的会话
-迁移成 DSH 原生可 resume 的 session。本插件是 `@session-migrate/core` 引擎的薄封装，
+迁移成 DSH 原生可 resume 的 session。本插件是 `@cc-migrate/core` 引擎的薄封装，
 只暴露「任意工具 → DSH」一条线（design.md §5）。命令层（`src/commands.ts`）是与宿主
 解耦的纯函数；cordis 侧（`src/index.ts`）只做注册、参数解析与 fiber 清理。
 
@@ -14,13 +14,13 @@ cordis 版本。**DSH 宿主命令服务的实际名称/形状以宿主为准**�
 
 构建产物入口 `lib/index.js`，patch 文件 `cordis.patch.yml`。DSH 侧挂载方式（bundle patch）：
 
-1. 安装本包（`@session-migrate/dsh-plugin`），让 DSH 的 node_modules 可解析到它。
+1. 安装本包（`@cc-migrate/dsh-plugin`），让 DSH 的 node_modules 可解析到它。
 2. 在 DSH 的 bundle patch 列表里加入本包导出的 patch 行（`exports['./cordis.patch.yml']`）：
 
 ```yaml
 - insert:
-    - id: session-migrate
-      name: '@session-migrate/dsh-plugin'
+    - id: cc-migrate
+      name: '@cc-migrate/dsh-plugin'
       config: {}
 ```
 
@@ -30,17 +30,17 @@ cordis 版本。**DSH 宿主命令服务的实际名称/形状以宿主为准**�
 构建与自检（仓库内）：
 
 ```bash
-pnpm --filter @session-migrate/dsh-plugin run build   # tsc 零错误（GUI 层经本地 ui 类型桩过纯 tsc）
-pnpm --filter @session-migrate/dsh-plugin run test     # 冒烟 ×2：命令层（mock ctx 注册 3 命令）+ GUI 协议层（见下）
+pnpm --filter @cc-migrate/dsh-plugin run build   # tsc 零错误（GUI 层经本地 ui 类型桩过纯 tsc）
+pnpm --filter @cc-migrate/dsh-plugin run test     # 冒烟 ×2：命令层（mock ctx 注册 3 命令）+ GUI 协议层（见下）
 ```
 
 ## 命令用法
 
 | 命令 | 用法 | 说明 |
 |---|---|---|
-| list-sources | `/session-migrate list-sources <tool> [--root <dir>]` | 列出源工具的历史会话（标题/时间/id/cwd）。tool ∈ dsh, claude, codex, opencode, pi, zcode |
-| preview | `/session-migrate preview <tool> <sessionId> [--root <dir>]` | 离线文本预览该会话（不调 LLM、不写任何文件） |
-| import | `/session-migrate import <tool> <sessionId> [--src-root <dir>] [--cwd <dir>] [--root <dstRoot>] [--session-id <id>]` | 把源会话写成 DSH 原生可 resume 的新会话 |
+| list-sources | `/cc-migrate-list-sources <tool> [--root <dir>]` | 列出源工具的历史会话（标题/时间/id/cwd）。tool ∈ dsh, claude, codex, opencode, pi, zcode |
+| preview | `/cc-migrate-preview <tool> <sessionId> [--root <dir>]` | 离线文本预览该会话（不调 LLM、不写任何文件） |
+| import | `/cc-migrate-import <tool> <sessionId> [--src-root <dir>] [--cwd <dir>] [--root <dstRoot>] [--session-id <id>]` | 把源会话写成 DSH 原生可 resume 的新会话 |
 
 - `--cwd`：新 DSH 会话的工作目录（默认沿用源会话的 cwd）。绝对路径 → `--<projectKey>--`
   布局；非绝对/缺失时安全降级到 `_no-cwd`（core 保证，不会写坏文件）。
@@ -51,15 +51,15 @@ pnpm --filter @session-migrate/dsh-plugin run test     # 冒烟 ×2：命令层�
 示例：
 
 ```
-/session-migrate list-sources claude
-/session-migrate preview claude 84c74b02-5ad2-4226-831d-98dc2a10c2ff
-/session-migrate import claude 84c74b02-5ad2-4226-831d-98dc2a10c2ff --cwd D:\codes\myproj
+/cc-migrate-list-sources claude
+/cc-migrate-preview claude 84c74b02-5ad2-4226-831d-98dc2a10c2ff
+/cc-migrate-import claude 84c74b02-5ad2-4226-831d-98dc2a10c2ff --cwd D:\codes\myproj
 ```
 
 ## GUI 向导（宿主挂载，design.md Phase 3 §15）
 
 除三个斜杠命令外，插件还带一条「选会话 → 预览 → 配置 → 写入」的向导入口
-（`@session-migrate/ui` 的现成 `MigrateWizard` 组件）。GUI 层是**独立入口
+（`@cc-migrate/ui` 的现成 `MigrateWizard` 组件）。GUI 层是**独立入口
 `exports['./gui']`**（`lib/gui.js`）：主入口不静态引它，命令层宿主完全不受
 Vue 运行时影响；DSH 前端挂载 Vue 组件的方式没有实机参考，所以本期交付的
 是「组件 + 数据桥 + 无头测试」，宿主真实挂载点以 `GuiHost` 协议对接。
@@ -80,15 +80,15 @@ Vue 运行时影响；DSH 前端挂载 Vue 组件的方式没有实机参考，�
 | `openPath(path)` | `Promise<void>`（可选） | 在文件管理器中展示写入结果；缺失时仅 warn |
 
 GUI 层（`src/gui.ts`）把这些桥接成 ui 组件的 `MigrationBackend` 契约并挂
-`MigrateWizard`。**沙箱边界纪律**：GUI 层绝不 import `@session-migrate/core`，
+`MigrateWizard`。**沙箱边界纪律**：GUI 层绝不 import `@cc-migrate/core`，
 数据全走注入；core 的 zstd 解压只能跑在宿主 Node 侧，宿主自行决定通道落在
 哪个线程/进程。
 
 ### DSH 宿主接入步骤（宿主侧清单）
 
-1. **打包 ui**：`@session-migrate/ui` 是源码包（`main: ./src/index.ts`，.vue
+1. **打包 ui**：`@cc-migrate/ui` 是源码包（`main: ./src/index.ts`，.vue
    由宿主构建编译），宿主前端构建链需带 vue/vite（peer `vue: ^3.5.0` 已在
-   本包 dependencies 里声明）。`lib/gui.js` 运行时动态 `import('@session-migrate/ui')`
+   本包 dependencies 里声明）。`lib/gui.js` 运行时动态 `import('@cc-migrate/ui')`
    —— 宿主没打包它时挂载失败并给出可读错误，命令层不受影响。
 2. **提供 `ctx.gui`**：按上表实现服务。数据通道直接转发到本包命令层
    （`lib/commands.js` 的 `listSources` / `previewPayload` / `importSession`）；
@@ -96,7 +96,7 @@ GUI 层（`src/gui.ts`）把这些桥接成 ui 组件的 `MigrationBackend` 契�
 3. **挂载入口（二选一）**：
    - 自动：`apply(ctx)` 检测到 `ctx.gui` 即经 `ctx.effect` 挂向导（容器传
      `undefined`，宿主 `mount` 自行决定落点；适合宿主接管默认位置的场景）；
-   - 手动：宿主自行 `import('@session-migrate/dsh-plugin/gui')` 后调
+   - 手动：宿主自行 `import('@cc-migrate/dsh-plugin/gui')` 后调
      `createSessionMigrateWizard(host, { container, dstRoot })`，拿
      `WizardHandle.dispose()` 自己管理生命周期。`opts.loadWizardComponent`
      可注入宿主自己打包的组件副本（默认动态 import 真实包）。
@@ -111,7 +111,7 @@ GUI 层（`src/gui.ts`）把这些桥接成 ui 组件的 `MigrationBackend` 契�
   结构化 preview / import 全新 id 写入 + 目标白名单）、`handle.dispose()`
   幂等、`apply()` 在有/无 `ctx.gui` 两种宿主下的行为。
 - 组件渲染正确性由 ui 包自己的 vue-tsc 保证：
-  `pnpm --filter @session-migrate/ui run typecheck`。
+  `pnpm --filter @cc-migrate/ui run typecheck`。
 - **真机渲染留宿主联调**（DSH 前端首个 Vue 挂载点）：挂载容器形状、样式
   主题（ui 的 `theme.css`）、`pickDirectory`/`openPath` 的原生对话框桥、
   worker 通道的线程边界——见上面「接入步骤」逐项。

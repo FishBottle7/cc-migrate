@@ -1,5 +1,5 @@
 /**
- * session-migrate core — public entry.
+ * cc-migrate core — public entry.
  */
 
 export * from './ir.js';

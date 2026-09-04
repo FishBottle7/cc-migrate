@@ -1,4 +1,4 @@
-# session-migrate：AI 编码工具会话迁移引擎 — 设计文档
+# cc-migrate：AI 编码工具会话迁移引擎 — 设计文档
 
 > 状态：架构设计 v2（2026-08-28，基于 6 工具真实格式逆向验证）
 > 目标深度：**B 级** —— 迁移后的会话像原生 session 一样能 `continue`/`/resume` 接着原任务干，而不只是文本存档。
@@ -10,7 +10,7 @@
 
 ```
                  ┌────────────────────────────┐
-                 │        session-migrate 引擎       │
+                 │         cc-migrate 引擎            │
                  │     (通用, 任意 ⇄ 任意)         │
                  │                               │
                  │   ┌────────┐   ┌──────────┐   │
@@ -214,7 +214,7 @@ D:\codes\dshPlugins\cc-migrate/
 │           └── pi/                 # Pi（JSONL 树，Phase 2）
 │
 ├── packages/cli/                   # CLI（任意 ⇄ 任意，脚本友好）
-│   └── src/index.ts                # `session-migrate list/preview/migrate/demo`
+│   └── src/index.ts                # `cc-migrate list/preview/migrate/demo`
 │
 ├── packages/ui/                    # 跨端可复用 Vue 3 组件
 │   └── src/components/             # SessionPicker / SessionPreview / MigrateWizard
@@ -260,8 +260,8 @@ D:\codes\dshPlugins\cc-migrate/
 
 DSH 插件 = `core` 的薄消费者。命令示例：
 
-- `/session-migrate import claude <path或jsonl> [--cwd D:\xxx]` → 把一条外部对话写成 DSH 可 resume 的 session
-- `/session-migrate list-sources` → 扫描各工具可用的历史会话，供 GUI/CLI 挑选
+- `/cc-migrate import claude <path或jsonl> [--cwd D:\xxx]` → 把一条外部对话写成 DSH 可 resume 的 session
+- `/cc-migrate list-sources` → 扫描各工具可用的历史会话，供 GUI/CLI 挑选
 
 插件内独有映射（目标固定为 DSH）：
 
@@ -291,7 +291,7 @@ DSH 插件 = `core` 的薄消费者。命令示例：
 12. CLI 支持全矩阵 `任意 <-> 任意`；`list`/`preview` 齐全（Codex/Claude/DSH 已齐）
 
 **Phase 3 —— DSH 插件打包 + GUI 集成**
-13. ✅ 把 core 打进 DSH 插件（`apps/dsh-plugin`，cordis 薄封装）：注册 `/session-migrate list-sources|preview|import` 三命令 + `cordis.patch.yml` bundle 行 + 冒烟测试（mock ctx 全绿、import 恒 mint 新 id 不覆盖）。命令层与宿主解耦（结构类型 PluginContext，零 cordis 依赖）；GUI 接入点已在 `apply(config)` 预留
+13. ✅ 把 core 打进 DSH 插件（`apps/dsh-plugin`，cordis 薄封装）：注册 `/cc-migrate list-sources|preview|import` 三命令 + `cordis.patch.yml` bundle 行 + 冒烟测试（mock ctx 全绿、import 恒 mint 新 id 不覆盖）。命令层与宿主解耦（结构类型 PluginContext，零 cordis 依赖）；GUI 接入点已在 `apply(config)` 预留
 14. ✅ 建 `packages/ui`（SessionPicker / SessionPreview / MigrateWizard，Vue 3）
 15. ✅ DSH GUI 向导（2026-09-03）：`apps/dsh-plugin/src/gui.ts` 挂载层——`GuiHost` 协议（mount + 三条数据通道，结构类型最小假设）桥接 ui 的 `MigrateWizard`（整用组件状态机，与 desktop-app 同款 `MigrationBackend` 契约）；GUI 层零 core import（沙箱纪律），目标钉死 any→dsh；无头协议冒烟 10 节全绿（挂载/dispose/数据通道真实走命令层/非 dsh 目标拒绝/可选服务降级）。真机宿主联调清单见 `apps/dsh-plugin/README.md`（容器形状、ui 打包、主题注入、IPC 转发）
 

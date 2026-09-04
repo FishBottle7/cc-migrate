@@ -7,14 +7,14 @@
 
 ```bash
 pnpm install                      # workspace 根目录（electron 需放行构建脚本：pnpm approve-builds electron）
-pnpm --filter @session-migrate/desktop-app run build   # 主进程 tsc + 渲染层 vite
-pnpm --filter @session-migrate/desktop-app start       # 构建并启动（生产模式，加载 dist/renderer）
+pnpm --filter @cc-migrate/desktop-app run build   # 主进程 tsc + 渲染层 vite
+pnpm --filter @cc-migrate/desktop-app start       # 构建并启动（生产模式，加载 dist/renderer）
 ```
 
 开发模式（vite 热更新 + Electron 自动拉起）：
 
 ```bash
-pnpm --filter @session-migrate/desktop-app run dev
+pnpm --filter @cc-migrate/desktop-app run dev
 ```
 
 ## 架构：为什么有 system-Node worker
@@ -30,7 +30,7 @@ pnpm --filter @session-migrate/desktop-app run dev
 ```
 renderer ──contextBridge──> main（薄壳：窗口 + IPC 转发）
                                 └─ child_process.spawn('node', worker.mjs)
-                                     └─ @session-migrate/core（zstd 解析等重活）
+                                     └─ @cc-migrate/core（zstd 解析等重活）
 ```
 
 - `worker-host.ts`：spawn + JSON-RPC（`process.send`），每请求 180s 超时，
@@ -69,11 +69,11 @@ electron-builder.yml 打包配置（win 本机构建；mac/linux 就绪未构建
 ## 打包分发（electron-builder）
 
 ```bash
-pnpm --filter @session-migrate/desktop-app run gen:icon       # 生成应用图标（assets/icons/，幂等可重跑）
-pnpm --filter @session-migrate/desktop-app run dist:win      # nsis 安装包 + portable + dir（本机 Windows）
-pnpm --filter @session-migrate/desktop-app run dist:win:dir  # 只出未打包目录树（冒烟用，快）
-pnpm --filter @session-migrate/desktop-app run dist:win:check # 出包 + 自动产物校验 + 冒烟 + 汇总表（推荐）
-pnpm --filter @session-migrate/desktop-app run smoke:packaged # 打包产物冒烟（见下）
+pnpm --filter @cc-migrate/desktop-app run gen:icon       # 生成应用图标（assets/icons/，幂等可重跑）
+pnpm --filter @cc-migrate/desktop-app run dist:win      # nsis 安装包 + portable + dir（本机 Windows）
+pnpm --filter @cc-migrate/desktop-app run dist:win:dir  # 只出未打包目录树（冒烟用，快）
+pnpm --filter @cc-migrate/desktop-app run dist:win:check # 出包 + 自动产物校验 + 冒烟 + 汇总表（推荐）
+pnpm --filter @cc-migrate/desktop-app run smoke:packaged # 打包产物冒烟（见下）
 # node scripts/smoke-packaged.mjs <dir产物路径>  等效
 ```
 
@@ -101,15 +101,15 @@ pnpm --filter @session-migrate/desktop-app run smoke:packaged # 打包产物冒�
 所有 core 调用仍跑在**系统 Node 子进程**里——Electron 内置 Node 的 `node:zlib`
 zstd 在部分会话帧上原生崩溃（见上节），打包不能改变这一点。落法：
 
-- `worker/**` 与 `node_modules/@session-migrate/core`（含 `dist/src` + `package.json`）
+- `worker/**` 与 `node_modules/@cc-migrate/core`（含 `dist/src` + `package.json`）
   经 `asarUnpack` 解到 `resources/app.asar.unpacked/` —— 系统 Node 不认识 asar 虚拟
   文件系统，worker 及其依赖链必须在真实文件系统上。
 - 主进程 `dist/**`、渲染层 `dist/renderer/**`、`preload/**` 留在 `app.asar` 内
-  （Electron 自己认识 asar）；渲染层依赖（vue/@session-migrate/ui）已被 vite 打进
+  （Electron 自己认识 asar）；渲染层依赖（vue/@cc-migrate/ui）已被 vite 打进
   bundle，asar 内显式排除全部运行时 `node_modules`，asar 仅 ~280KB。
 - `worker-host.ts` 的 `resolveWorkerPaths()` 按 `__dirname` 是否位于 `app.asar`
   区分 dev/打包形态：打包后 worker 路径改写到 `app.asar.unpacked/worker/worker.mjs`，
-  spawn 的 cwd 取 `resources/`（worker.mjs 的裸导入 `@session-migrate/core` 从
+  spawn 的 cwd 取 `resources/`（worker.mjs 的裸导入 `@cc-migrate/core` 从
   `app.asar.unpacked/node_modules` 解析）。
 - **用户机器需要系统 Node ≥22.15**（PATH 可见）。缺 Node 时 App 给出可操作提示
   （安装 Node.js LTS 或使用便携运行时版）；未来可用 electron-builder `externalBin`

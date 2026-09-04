@@ -1,6 +1,6 @@
 <script setup lang="ts">
-import { MigrateWizard } from '@session-migrate/ui';
-import type { MigrationBackend } from '@session-migrate/ui/types';
+import { MigrateWizard } from '@cc-migrate/ui';
+import type { MigrationBackend } from '@cc-migrate/ui/types';
 
 // preload 注入的 window.api 实现了 MigrationBackend 契约
 const backend = window.api as MigrationBackend;
