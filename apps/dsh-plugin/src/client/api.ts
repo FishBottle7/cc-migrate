@@ -43,6 +43,16 @@ interface WireOk<T> { ok: true; value: T }
 type WireEnvelope<T> = WireOk<T> | { ok: false; error: { code: string; message: string } };
 
 /**
+ * 目标根回显（`defaults` 端点，v0.3.0 新增）：导入确认页红线「显式展示
+ * 目标根」的数据源。dstRoot = 插件 bundle patch 的 config.dstRoot（未配置
+ * null）；dshDefaultRoot = DSH 适配器的常识默认根（显示用）。
+ */
+export interface MigrateDefaults {
+  dstRoot: string | null;
+  dshDefaultRoot: string;
+}
+
+/**
  * 调一个宿主半 method。fetch 失败（网络/非 JSON）折成 Error 抛——向导的
  * React 状态机把异常渲染成可重试的错误行（组件层契约：失败走 throw）。
  */
@@ -91,6 +101,19 @@ export const wizardApi = {
     if ('ok' in value && value.ok === false) throw new Error(value.error);
     // 宿主半 preview 恒走 previewPayload（结构化 DTO），不会回平文本——防御
     return value as PreviewPayload;
+  },
+
+  /**
+   * 目标根回显。展示性数据：老宿主（无 defaults method）/网络失败一律降级
+   * 为 DSH 常识默认根——确认页照常渲染，只是少了插件配置路径的精确回显。
+   * 吞错是刻意的：这个值只影响显示文案，不值得为它挡导入流程。
+   */
+  async defaults(): Promise<MigrateDefaults> {
+    try {
+      return await call<MigrateDefaults>('defaults', {});
+    } catch {
+      return { dstRoot: null, dshDefaultRoot: '~/.dsh/sessions' };
+    }
   },
 
   async migrate(params: {

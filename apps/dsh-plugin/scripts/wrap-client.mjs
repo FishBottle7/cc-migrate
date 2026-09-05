@@ -91,11 +91,18 @@ if (unknown.length > 0) {
 const unique = [...new Set(externals)];
 
 // ── 3. 壳包装（形态 = better-sidebar lib/client.js 头尾逐字段对照） ─────
+// 冒烟锚点导出：src/client/index.tsx 的 migrateViews 表（分组列表/预览流
+// 组件）在 bundle body 里有绑定时追加一行导出——宿主加载器只消费
+// apply/inject，该导出 host-inert；test/client-smoke.mjs 靠它无头渲染新
+// 视图结构。绑定不存在（历史源码）时不加行，工厂不炸 ReferenceError。
+const smokeExport = /\bmigrateViews\b/.test(body)
+  ? '\t\texports.migrateViews = migrateViews;\n'
+  : '';
 const wrapped = `window.__ModuleLoader__.load({
-\tid: "@cc-migrate/dsh-plugin",
-\tfactory: (require) => {
-\t\tvar module = { exports: {} };
-\t\tvar exports = module.exports;
+	id: "@cc-migrate/dsh-plugin",
+	factory: (require) => {
+		var module = { exports: {} };
+		var exports = module.exports;
 ${bindingLines.map((l) => `\t\t${l}`).join('\n')}
 ${body
   .split('\n')
@@ -103,8 +110,8 @@ ${body
   .join('\n')}
 \t\texports.apply = apply;
 \t\texports.inject = inject;
-\t\treturn module.exports;
-\t}
+${smokeExport}\t\treturn module.exports;
+	}
 });
 `;
 

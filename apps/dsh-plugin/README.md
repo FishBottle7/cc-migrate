@@ -85,6 +85,8 @@ node lib/cli.js preview <tool> <sessionId> [--root <dir>] [--json] [--messages K
                                          # --json = ≈1-2KB 决策摘要（计数 + ≤200 字摘录，与 session 体量无关）
 node lib/cli.js migrate <tool> <sessionId> [--src-root <dir>] [--cwd <dir>]
                         [--root <dstRoot>] [--session-id <id>] [--json]
+node lib/cli.js log check <tool> <sessionId> [--json]   # 「这条迁过了吗」（迁移日志查重）
+node lib/cli.js log list [--limit N] [--json]           # 最近迁移记录
 node lib/cli.js skill install [--agent <id,id>|--all] [--dir <path>] [--json]   # 把通用 skill 装进本机其他 agent 框架
 node lib/cli.js skill status [--json]
 ```
@@ -114,10 +116,45 @@ node lib/cli.js skill status [--json]
 ## GUI 会话迁移向导（dsh-better-sidebar 侧边栏 tab）
 
 插件带一条图形界面：DSH web 右侧边栏的「会话迁移」tab（dsh-better-sidebar
-的扩展服务注册），三步流程「选源工具 → 浏览会话 → 预览 → 导入到 DSH」。
-**前提：profile 里已安装 `dsh-better-sidebar`**（v0.12.0+，提供
+的扩展服务注册）。v0.3.0 按 **DSH 窄栏（320-420px）** 重构并对齐独立桌面
+程序的体验：四步流程「选源工具 → 工作区分组浏览 → 富预览 → 导入参数 →
+结果」。**前提：profile 里已安装 `dsh-better-sidebar`**（v0.12.0+，提供
 `betterSidebar` 注册表服务与右侧边栏本体）——没装时 client 半不激活，
 命令层不受影响。
+
+### 侧边栏交互（v0.3.0）
+
+- **工作区分组 + 子会话树**：会话按 `cwd` 分组（组头 = 路径短名 + 会话数
+  徽章，悬停显示全路径），组可折叠/展开，折叠状态 localStorage 记忆
+  （key 前缀 `cc-migrate:`）；组内 `parentSessionId` 的子会话缩进 14px/层
+  挂在父会话下（语义移植自桌面版 `sessionTree.ts` 的 buildNodes）。行内
+  搜索过滤标题 / 会话 id / 工作目录。
+- **富预览**：消息流渲染 text / thinking（弱化斜体披露行）/ tool_use+
+  tool_result（按 callId 融合成折叠卡：工具名 + 参数摘要，展开看输入输出，
+  isErr 红标）/ harness 注入行；子代理旁链与独立程序同构——头部
+  「子代理 · N」切换按钮 → 树形菜单（主会话节点 + 树枝旁链节点，各带消息
+  数），点击节点**整区切换**该旁链的完整消息流；可定位的节点带「定位召唤
+  处」准星，点击跳回主会话流中它的 tool_use 卡并闪烁高亮（召唤点 =
+  parentCallId，缺失时退化到 tool_result 文本匹配）；超长块显示「已截断」
+  角标（语义移植自桌面版 `flow.ts` 的 computeFlow + `SessionPreview.vue`
+  的切换器，markdown 渲染与山峰定位条未移植——零依赖纪律 + 侧栏收益低）。
+- **导入确认（红线）**：确认页显式展示写入目标根（`defaults` 端点回显
+  插件配置的 `dstRoot`；未配置时显示 `~/.dsh/sessions（DSH 默认）`——与
+  命令层 `opts.root ?? defaultRoot` 行为一致），并标注「写入的是全新会话，
+  不会覆盖已有会话」；参数 = 工作目录（留空沿用源会话）+ 拍平子代理旁链
+  （flatten）+ 保留 harness 注入行（keepSynthetic）。结果页给新 session
+  id + 落盘路径 + 「在 DSH 会话列表选中即可 resume」提示。
+- **导入成功自动跳转**（v0.3.3）：结果页出现后自动调宿主 client runtime
+  的 `ctx.sessions.open(新会话 id)`（ISessions，better-sidebar 同款 inject
+  声明），DSH 主界面即切到新会话可直接续聊。open 对「还没进客户端会话
+  列表」的 id 会同步 throw（宿主源码锚定语义），所以带退避重试（~4.5s
+  窗口）等列表刷新；始终失败回落结果页提示行（手动在会话列表选择）。
+  sessions 服务探测失败（老宿主）时功能静默关闭，其余不受影响。
+- **浅色/暗色自适应**：颜色全部走宿主 `--dsw-alias-*` 设计系统 token
+  （`src/client/theme.ts`，与 better-sidebar 同一套），随宿主主题翻转；
+  拿不到变量（老宿主/无头冒烟）时回退内联暗色兜底，观感不变。
+- **窄栏密度**：源工具切换为紧凑 chip 行；会话行单行高密度（标题截断 +
+  相对时间 + 归档/空/子标签）；消息块卡内边距 ≤8px。
 
 ### 双半架构
 
@@ -126,26 +163,34 @@ DSH 插件官方双半规范（与 dsh-better-sidebar 自身同构）：
 ```
 宿主半（Node，lib/index.js）                 client 半（浏览器，lib/client.js）
   apply(ctx)                                   window.__ModuleLoader__.load({id, factory})
-  ├─ ctx.commands.register（3 斜杠命令）        ├─ exports.inject = ['betterSidebar']
-  └─ ctx.webServer.register                    └─ exports.apply(ctx)
-       prefix /cc-migrate/api                    └─ ctx.get('betterSidebar').registerTab({
-         ├─ POST list-sources                       id: 'cc-migrate', title: '会话迁移',
-         ├─ POST preview        ←──── fetch ────      order: 90, single: true,
-         └─ POST import                                 component: (props) => <React 向导/>
+  ├─ ctx.commands.register（3 斜杠命令）        ├─ exports.inject = ['betterSidebar',
+  └─ ctx.webServer.register                    │                    'sessions']
+       prefix /cc-migrate/api                  └─ exports.apply(ctx)
+         ├─ POST list-sources                    └─ ctx.get('betterSidebar').registerTab({
+         ├─ POST preview        ←──── fetch ────      id: 'cc-migrate', title: '会话迁移',
+         ├─ POST import                             order: 90, single: true,
+         └─ POST defaults（目标根回显）            component: (props) => <React 向导/>
        （fence: Host 回环/trustedHosts）            })
 ```
 
 - **数据通道**：client 半的 React 向导 `fetch('/cc-migrate/api/<method>')`
   （POST JSON）；宿主半路由转发到命令层纯函数（`lib/commands.js`），结果以
   `{ok:true,value}` / `{ok:false,error:{code,message}}` 信封回写——实现
-  照抄 dsh-better-sidebar 的 `/sidebar/api` 模式。
+  照抄 dsh-better-sidebar 的 `/sidebar/api` 模式。`defaults` 是 v0.3.0 的
+  加性端点（同 fence 保护，只回显目标根路径配置）。
 - **浏览器信任围栏**：所有路由过 /api 网关同款 fence（Host 头回环或宿主
   `webRuntime.trustedHosts`，带 Origin 时须同主机，`sec-fetch-site:
   cross-site` 拒绝）——防 DNS rebinding / 跨站页打到宿主路由。fence 每请求
   现读 trustedHosts 活性值，宿主换列表即时生效。
 - **UI 原语**：优先宿主 `@deepseek-ai/dsh-client-ui-primitives`（Button/
   Input/Tooltip——client 半经宿主 require 拿），字段缺失自动降级为内联
-  React 元素 + 内联样式（暗色侧栏风），不引第三方 UI 库。
+  React 元素 + 内联样式（`--dsw-alias-*` token + 暗色兜底），不引第三方
+  UI 库。
+- **client 半文件结构**（`src/client/`，全部打进 lib/client.js）：`index.tsx`
+  （tab 注册 + 原语/sessions 服务解析 + migrateViews 冒烟锚点导出）、`wizard.tsx`（四步
+  状态机 + 确认/结果页 + 导入后自动跳转）、`session-list.tsx`（分组 + 折叠记忆 + 树）、
+  `preview-flow.tsx`（computeFlow + 旁链切换器/整区视图 + 分页）、`theme.ts`（主题
+  token）、`api.ts`（fetch 通道）。
 - **构建形态**：client 半由 tsdown 出 rolldown bundle，`scripts/wrap-client.mjs`
   手工包装成 `window.__ModuleLoader__.load({id, factory})` 工厂壳（与
   better-sidebar `lib/client.js` 逐字段同形态）；react / react-dom /
@@ -156,16 +201,20 @@ DSH 插件官方双半规范（与 dsh-better-sidebar 自身同构）：
 ### 安装与使用
 
 ```bash
-dsh plugin --profile web add ./cc-migrate-dsh-plugin-0.1.0.tgz   # 宿主半 + client 半一起装
+dsh plugin --profile web add ./cc-migrate-dsh-plugin-0.3.3.tgz   # 宿主半 + client 半一起装
+# 重装同版本前先清安装位（pnpm integrity 命中不重解压的 stale 坑）：
+#   rm -rf ~/.dsh/profiles/web/node_modules/@cc-migrate/dsh-plugin
 # 重启 dsh web 后：右侧边栏 + 菜单 → 「会话迁移」tab
 ```
 
 1. 打开右侧边栏的 + 菜单，选「会话迁移」（单实例 tab）。
-2. 第一步：点工具卡片（DSH/Claude Code/Codex/Pi/OpenCode/ZCode），下方
-   列出该源库的会话（标题/时间/id）；源库地址可手改后「刷新」。
-3. 第二步：点任一会话 → 结构化预览（消息角色/文本/思考/工具调用，前 30 条）。
-4. 第三步：「导入到 DSH」→ 写入全新 DSH session（read-old-write-new），
-   页脚显示新 session id。
+2. 第一步：点工具 chip（DSH/Claude Code/Codex/Pi/OpenCode/ZCode），下方
+   按工作区分组列出该源库的会话；源库地址可手改后「刷新」，行内搜索框过滤。
+3. 第二步：点任一会话 → 富预览（消息流 / 思考 / 工具卡 / 子代理旁链 /
+   截断角标），「显示更多」翻页。
+4. 第三步：「下一步：导入设置」→ 确认页核对目标根与参数 → 「执行导入」。
+5. 结果页：新 session id + 落盘路径 + resume 提示（read-old-write-new，
+   已有会话不受影响）。
    （截图占位：真机渲染验证后补——见「当前验证状态」。）
 
 为什么不用 `@cc-migrate/ui` 的 MigrateWizard（Vue）：DSH 前端是 React，
@@ -232,14 +281,31 @@ GUI 层（`src/gui.ts`）把这些桥接成 ui 组件的 `MigrationBackend` 契�
   stderr `error: …`）。
 - 无头冒烟 `test/client-smoke.mjs` 覆盖 **better-sidebar GUI 全链**：
   - bundle 形态（`__ModuleLoader__` 壳逐字段断言、无裸 ESM 语句、react
-    不入 bundle）；工厂执行（mock 宿主 require → `{apply, inject}`）；
-    `apply(ctx)` → `registerTab` 收到形状合法的 TabDescriptor（better-sidebar
-    service.d.ts 契约）；组件树经 `react-dom/server` 无头渲染拉通；
-    dispose 链注销。
-  - 宿主半路由：方法表 3 method、前缀路由注册、fence 违例矩阵（跨站
-    Host/Origin/sec-fetch-site 403、同主机 200、GET 405、未知 404、坏
-    JSON 400、trustedHosts 活性生效）、list/preview/import 全链真数据
-    （临时 claude 库）、read-old-write-new（两次导入两个全新 id）。
+    不入 bundle）；工厂执行（mock 宿主 require → `{apply, inject,
+    migrateViews}`）；`apply(ctx)` → `registerTab` 收到形状合法的
+    TabDescriptor（better-sidebar service.d.ts 契约）；组件树经
+    `react-dom/server` 无头渲染拉通；dispose 链注销。
+  - **v0.3.0 新视图结构**（经工厂导出的 migrateViews 渲染 bundle 内的真
+    组件，非冒烟复刻）：工作区分组（cwd 分组/树挂接/孤儿落根/徽章计数/
+    14px 缩进）、受控折叠 + `cc-migrate:` 折叠记忆回环（坏存储降级）、
+    富预览（思考/工具/注入块、截断角标；旁链 = desktop 同款切换器 +
+    整区切换：主视图无内联旁链、菜单树节点/召唤准星、旁链视图主流换出）；
+    自动跳转重试（openSessionWithRetry：撞列表刷新竞态的重试落地 + 节拍
+    耗尽回落 fail——宿主 `select()` 对未知 id 同步 throw 的语义锚定）。
+  - 宿主半路由：方法表 4 method（含 `defaults` 目标根回显）、前缀路由
+    注册、fence 违例矩阵（跨站 Host/Origin/sec-fetch-site 403、同主机
+    200、GET 405、未知 404、坏 JSON 400、trustedHosts 活性生效）、
+    list/preview/import 全链真数据（临时 claude 库）、read-old-write-new
+    （两次导入两个全新 id）；**preview 的真实 wire 载荷喂回 client 预览
+    视图渲染**——命令层 DTO ↔ client 视图两端一致性检查（DTO 漂移在此
+    拦截）。
+- 安装位冒烟 `test/installed-smoke.mjs`（v0.3.0 新增，真机联调前最后一道
+  无头关）：`node test/installed-smoke.mjs [installRoot]` 对 **DSH profile
+  安装位** 的 lib/client.js 做壳形态静态断言 + 工厂执行 + 全视图无头渲染
+  （分组/折叠/富预览/旁链）。能抓 pack 漏文件、安装 stale（pnpm integrity
+  命中不重解压）、wrap 壳炸壳。react/react-dom 按配对纪律选（安装图有同
+  大版本配对就用安装位的，否则整套退回仓库 devDeps——渲染器与工厂绝不跨
+  react 副本混用）。
 - 无头冒烟 `test/gui-smoke.mjs` 覆盖 **旧 Vue 通道协议层**：工厂失败路径
   （ui 未打包 → 可读错误）、成功路径（`mount(container, component,
   { backend })` 契约 + backend 六方法）、三条数据通道真走到命令层、
@@ -256,6 +322,9 @@ GUI 层（`src/gui.ts`）把这些桥接成 ui 组件的 `MigrationBackend` 契�
 
 - **只读源、只写新文件**：import 每次都用全新 session id（`crypto.randomUUID()`）写入
   DSH 存储，绝不覆盖、改写或「修复」任何一侧已有的会话；源端只读。
+- **迁移日志只追加**：每次成功迁移向 `~/.cc-migrate/migrations.jsonl`（`CC_MIGRATE_LOG`
+  覆盖/`off` 关闭）追加一行记录（`log check`/`log list` 查询）——append-only，
+  不 rewrite、不删除，日志写失败不影响迁移本身。
 - 代码中不存在任何 unlink / rm / DELETE / TRUNCATE 类操作。索引/缓存最多追加。
 - **会话的删除只能由人手动执行**——迁移失败或写坏的产物也只是留在原地，由人决定去留
   （见仓库 AGENT.md 全库铁律）。

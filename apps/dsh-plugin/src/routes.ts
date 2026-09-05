@@ -230,8 +230,17 @@ export type MigrateApiMethod = (payload: unknown) => Promise<unknown> | unknown;
  */
 export const MIGRATE_API_PREFIX = '/cc-migrate/api';
 
-/** 三个 method 名（client 半 fetch 路径 + 冒烟断言共用）。 */
-export const MIGRATE_API_METHODS = ['list-sources', 'preview', 'import'] as const;
+/** 四个 method 名（client 半 fetch 路径 + 冒烟断言共用）。 */
+export const MIGRATE_API_METHODS = ['list-sources', 'preview', 'import', 'defaults'] as const;
+
+/**
+ * DSH 适配器的常识默认根（显示用）。import 不带 root 时命令层走
+ * `opts.root ?? defaultRoot`，defaultRoot 由 core 的 dsh 适配器解析为
+ * 真实 ~/.dsh/sessions——client 半拿不到宿主的路径解析，只能显示这个
+ * 常识形态；插件配置了 dstRoot（bundle patch）时走 `defaults` 端点回显
+ * 真值。确认页红线：目标根必须显式展示，不允许「写到哪算哪」。
+ */
+export const DSH_DEFAULT_ROOT_DISPLAY = '~/.dsh/sessions';
 
 /**
  * 方法表构造器：把命令层纯函数映射到 wire method。命令层已把所有失败
@@ -260,6 +269,15 @@ export function buildMigrateApi(opts: { dstRoot?: string } = {}): Record<string,
         flatten: optionalBoolean(payload, 'flatten'),
         keepSynthetic: optionalBoolean(payload, 'keepSynthetic'),
       } satisfies ImportOptions),
+
+    /**
+     * 目标根回显（v0.3.0 新端点）：确认页红线「显式展示目标根」的数据源。
+     * dstRoot 是插件 bundle patch 的配置值（未配置为 null——client 半显示
+     * DSH_DEFAULT_ROOT_DISPLAY）；同 fence 保护（同前缀路由，无独立面），
+     * 只回显路径配置、不回显任何凭据。
+     */
+    'defaults': async (): Promise<{ dstRoot: string | null; dshDefaultRoot: string }> =>
+      ({ dstRoot: opts.dstRoot ?? null, dshDefaultRoot: DSH_DEFAULT_ROOT_DISPLAY }),
   };
 }
 

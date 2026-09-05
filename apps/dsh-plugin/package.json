@@ -1,6 +1,6 @@
 {
   "name": "@cc-migrate/dsh-plugin",
-  "version": "0.2.0",
+  "version": "0.3.3",
   "description": "cc-migrate DSH plugin: bring any AI coding tool's session into DSH as a resumable native session.",
   "type": "module",
   "main": "lib/index.js",

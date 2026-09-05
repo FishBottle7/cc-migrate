@@ -18,7 +18,9 @@
  */
 
 import { createElement } from 'react';
-import { MigrateWizardView, type HostPrimitives } from './wizard.js';
+import { MigrateWizardView, openSessionWithRetry, type HostPrimitives, type MigrateSessionsPort } from './wizard.js';
+import { SessionListView, buildSessionNodes, groupSessions, loadCollapsedCwds, saveCollapsedCwds } from './session-list.js';
+import { PreviewFlowView, computeFlow } from './preview-flow.js';
 
 /** Tab 图标：纯内联 SVG（14px 圆形循环箭头），不依赖宿主 icon 模块。 */
 const TabIcon = (size: number): React.ReactNode =>
@@ -63,6 +65,12 @@ interface BetterSidebarService {
 /** client cordis ctx 的消费面（结构类型——不依赖 cordis 包）。 */
 interface ClientContext {
   get(name: 'betterSidebar'): BetterSidebarService | undefined;
+  /**
+   * 宿主 client runtime 的 sessions 服务（dsh-client-runtime 的
+   * `ctx.sessions: ISessions`，better-sidebar 的 client inject 同款声明）。
+   * 结构探测取 open 子集；缺席（老宿主）时自动跳转功能关闭，tab 照常。
+   */
+  readonly sessions?: MigrateSessionsPort;
   effect(fn: () => () => void, tag?: string): unknown;
   logger?: { warn(...args: unknown[]): void };
 }
@@ -95,10 +103,11 @@ function resolveUiPrimitives(require: PrimitivesRequire): HostPrimitives {
 /**
  * client 插件体：注册「会话迁移」tab。
  *
- * inject 表见 exports.inject（下方）——cordis 按 inject 门禁 ctx 属性访问，
- * 'betterSidebar' 缺席（宿主没装 dsh-better-sidebar）时 apply 不会被调
- * （宿主 modules 加载器等所有 inject 服务就绪才激活）；防御性 get 仍留
- * undefined 分支（同 better-sidebar 的容错姿势）。
+ * inject 表见 exports.inject（下方）——cordis 按 inject 门禁 ctx 属性访问：
+ * 'betterSidebar' 缺席（宿主没装 dsh-better-sidebar）时 apply 不会被调；
+ * 'sessions' 由 DSH client runtime 自带（better-sidebar 自身也 inject 它，
+ * 凡能跑 better-sidebar 的宿主必有）。防御性访问仍包 try/catch（cordis
+ * Proxy 门禁违例是抛而不是 undefined——宿主半同款教训）。
  */
 export function apply(ctx: ClientContext, require?: PrimitivesRequire): void {
   const service = ctx.get('betterSidebar');
@@ -107,6 +116,16 @@ export function apply(ctx: ClientContext, require?: PrimitivesRequire): void {
     return;
   }
   const ui = require === undefined ? {} : resolveUiPrimitives(require);
+  // sessions 服务探测：结构子集（open 是函数才算数），失败 = 自动跳转关闭
+  let sessions: MigrateSessionsPort | undefined;
+  try {
+    const candidate = ctx.sessions as MigrateSessionsPort | undefined;
+    if (candidate !== null && typeof candidate === 'object' && typeof candidate.open === 'function') {
+      sessions = candidate;
+    }
+  } catch {
+    sessions = undefined;
+  }
   ctx.effect(
     () => service.registerTab({
       id: 'cc-migrate',
@@ -120,7 +139,7 @@ export function apply(ctx: ClientContext, require?: PrimitivesRequire): void {
         // createElement 而非 JSX：tsdown 的 client 构建不配 jsx 转换也能走
         // （jsx-runtime require 依赖宿主提供，保持同 better-sidebar 的
         // require("react/jsx-runtime") 外置形态反而更脆——直接 createElement）
-        createElement(MigrateWizardView, { ui, visible: props.visible }),
+        createElement(MigrateWizardView, { ui, visible: props.visible, sessions }),
     }),
     'cc-migrate: register sidebar tab',
   );
@@ -129,7 +148,26 @@ export function apply(ctx: ClientContext, require?: PrimitivesRequire): void {
 /**
  * cordis client 半的服务注入表。'betterSidebar' 由 dsh-better-sidebar 的
  * client 半在激活时 `ctx.provide('betterSidebar', service)`（其
- * src/client/index.tsx）——本包声明 inject 后 cordis 保证 apply 时服务已
- * 就绪。宿主运行时服务（'runtime' 等）不需要：本半不碰宿主 boot 面。
+ * src/client/index.tsx）；'sessions' 由 DSH client runtime 提供
+ * （ISessions——导入成功后 `open(newId)` 自动切到新会话）。宿主 modules
+ * 加载器等所有 inject 服务就绪才激活。
  */
-export const inject = ['betterSidebar'] as const;
+export const inject = ['betterSidebar', 'sessions'] as const;
+
+/**
+ * 无头冒烟渲染锚点（host-inert）：宿主加载器只消费 exports.apply/inject，
+ * 本表是惰性数据面——test/client-smoke.mjs 经工厂的 module.exports 拿到
+ * 分组列表/预览流组件与纯函数，用 react-dom/server 拉树断言新视图结构
+ * （分组渲染/折叠树/旁链挂载）。不放 wizard.tsx 内部私有：导出面稳定，
+ * 冒烟不依赖 bundle 内部符号名。泄漏面为零：多余导出无人消费即死代码。
+ */
+export const migrateViews = {
+  SessionListView,
+  PreviewFlowView,
+  groupSessions,
+  buildSessionNodes,
+  computeFlow,
+  loadCollapsedCwds,
+  saveCollapsedCwds,
+  openSessionWithRetry,
+};
