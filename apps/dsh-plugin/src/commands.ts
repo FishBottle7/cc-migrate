@@ -19,6 +19,9 @@
  * `{ ok: false, error }` instead of blowing up the host process.
  */
 
+import { homedir } from 'node:os';
+import { join } from 'node:path';
+
 import {
   builtinRegistry,
   listSessions,
@@ -245,6 +248,21 @@ function messageOf(e: unknown): string {
   return e instanceof Error ? e.message : String(e);
 }
 
+/**
+ * 展开 root/srcRoot 里的 `~` 前缀（真机 GUI 验证踩过的坑：向导工具卡的
+ * defaultRoot 是给人看的常识性路径 `~/.dsh/sessions`，用户不改输入框时它
+ * 原样传到这里——文件系统把 `~` 当字面目录名，扫出一个不存在的路径，
+ * GUI 渲染「该目录下没有找到会话」；不带 root 的裸调用反而正常）。命令
+ * 层是所有路径入参的收口，展开放这里比 GUI 层各自处理更不会再漏。仅处
+ * 理 `~` 与 `~/` 两种形态（`~user` 语义靠边站，那是 shell 的能力）。
+ */
+function expandHomeRoot(p: string | undefined): string | undefined {
+  if (p === undefined || p === '') return undefined;
+  if (p === '~') return homedir();
+  if (p.startsWith('~/') || p.startsWith('~\\')) return join(homedir(), p.slice(2));
+  return p;
+}
+
 function isSourceTool(tool: string): tool is ToolId {
   return SOURCE_TOOLS.includes(tool as ToolId);
 }
@@ -261,7 +279,7 @@ export async function listSources(tool: string, root?: string): Promise<ListSour
       return { ok: false, error: `unknown tool "${tool}" — supported: ${SOURCE_TOOLS.join(', ')}` };
     }
     const registry = builtinRegistry();
-    const sessions = await listSessions(registry.get(tool), root);
+    const sessions = await listSessions(registry.get(tool), expandHomeRoot(root));
     return { ok: true, tool, sessions };
   } catch (e) {
     return { ok: false, error: `list-sources ${tool} failed: ${messageOf(e)}` };
@@ -283,7 +301,7 @@ export async function preview(tool: string, sessionId: string, root?: string): P
       return { ok: false, error: 'preview requires a session id (see list-sources)' };
     }
     const registry = builtinRegistry();
-    const ir = await readSource(registry, tool, sessionId, root);
+    const ir = await readSource(registry, tool, sessionId, expandHomeRoot(root));
     const text = previewSession(registry.get(tool), ir);
     return { ok: true, tool, sessionId, text };
   } catch (e) {
@@ -337,7 +355,7 @@ export async function importSession(
       return { ok: false, error: 'import requires a source session id (see list-sources)' };
     }
     const registry: AdapterRegistry = builtinRegistry();
-    const ir = await readSource(registry, srcTool, srcSessionId, opts.srcRoot);
+    const ir = await readSource(registry, srcTool, srcSessionId, expandHomeRoot(opts.srcRoot));
     const dsh = registry.get('dsh');
     const target = await writeTarget(dsh, ir, {
       root: opts.root,

@@ -1,25 +1,32 @@
 {
   "name": "@cc-migrate/cli",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "type": "module",
   "engines": {
     "node": ">=22"
   },
   "bin": {
-    "cc-migrate": "./dist/src/index.js"
+    "cc-migrate": "./bundle/index.js"
   },
   "scripts": {
-    "build": "tsc -p tsconfig.json",
+    "build": "tsc -p tsconfig.json && tsdown",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "pnpm run build && node --test --test-isolation=none dist/test/*.test.js",
-    "start": "node dist/src/index.js"
+    "start": "node dist/src/index.js",
+    "pack": "pnpm run build && node scripts/pack.mjs"
   },
   "dependencies": {
     "@cc-migrate/core": "workspace:*"
   },
   "devDependencies": {
     "@types/node": "^24.0.0",
-    "typescript": "^5.6.0"
-  }
+    "typescript": "^5.6.0",
+    "tsdown": "^0.22.0"
+  },
+  "files": [
+    "bundle",
+    "skills",
+    "README.md"
+  ]
 }

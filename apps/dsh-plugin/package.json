@@ -1,17 +1,20 @@
 {
   "name": "@cc-migrate/dsh-plugin",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "cc-migrate DSH plugin: bring any AI coding tool's session into DSH as a resumable native session.",
   "type": "module",
   "main": "lib/index.js",
   "exports": {
     ".": "./lib/index.js",
     "./gui": "./lib/gui.js",
+    "./cli": "./lib/cli.js",
+    "./client": "./lib/client.js",
     "./cordis.patch.yml": "./cordis.patch.yml",
     "./package.json": "./package.json"
   },
   "files": [
     "lib",
+    "skills",
     "cordis.patch.yml",
     "README.md"
   ],
@@ -21,14 +24,21 @@
   "dsh": {
     "bundle": {
       "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "inject": [
+        "@deepseek-ai/dsh-client-runtime",
+        "dsh-better-sidebar"
+      ],
+      "platform": "web"
     }
   },
   "scripts": {
-    "build": "tsc -p tsconfig.json",
+    "build": "tsc -p tsconfig.json && node scripts/sync-universal-skill.mjs",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "bundle": "tsdown",
+    "bundle": "tsdown && node scripts/wrap-client.mjs",
     "pack": "pnpm run build:smoke && pnpm run bundle && node scripts/pack.mjs",
-    "build:smoke": "pnpm run build && node test/smoke.mjs && node test/gui-smoke.mjs",
+    "build:smoke": "pnpm run build && node test/smoke.mjs && node test/gui-smoke.mjs && node test/client-smoke.mjs && node test/cli-smoke.mjs",
     "test": "pnpm run build:smoke"
   },
   "keywords": [
@@ -52,6 +62,9 @@
   },
   "devDependencies": {
     "@types/node": "^24.0.0",
+    "@types/react": "~18.3.31",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
     "tsdown": "^0.22.0",
     "typescript": "^5.6.0"
   }

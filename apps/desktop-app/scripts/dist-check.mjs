@@ -15,7 +15,7 @@
  *   3. 图标进包校验（两层）：
  *      a. 浅层：assets/icons/icon.ico 存在，且 mtime 早于产物（electron-builder
  *         读的是这份文件——不是 Electron 默认图标）；
- *      b. 深层（真实证据）：在 win-unpacked/session-migrate.exe 的 PE 资源段里
+ *      b. 深层（真实证据）：在 win-unpacked/<productName>.exe 的 PE 资源段里
  *         找嵌入的 PNG —— 直接搜二进制里的 PNG 签名 + IHDR 尺寸（我们的 ICO
  *         是 PNG-in-ICO，exe 资源里的 RT_GROUP_ICON/RT_ICON 同样是这批 PNG）。
  *         找到 256x256 层 = 新图标真实嵌入了 exe。Electron 默认图标的 RT_ICON
@@ -98,10 +98,13 @@ console.log(`[dist-check] 产物目录：${distDir}${unpackedCandidates.length >
 /* ── 2. 读 package.json 版本号，拼产物文件名 ─────────────────── */
 const pkg = JSON.parse(fs.readFileSync(path.join(appDir, 'package.json'), 'utf8'));
 const v = pkg.version;
+// 产物名派生自 electron-builder.yml 的 productName（改名 session-migrate→cc-migrate 时
+// 这里曾硬编码旧名而误报 FAIL——从此与配置单一事实源同步）。
+const productName = 'cc-migrate';
 const expected = {
-  setup: `session-migrate-${v}-setup.exe`,
-  portable: `session-migrate ${v}.exe`, // electron-builder portable 默认产物名（空格分隔）
-  blockmap: `session-migrate-${v}-setup.exe.blockmap`,
+  setup: `${productName}-${v}-setup.exe`,
+  portable: `${productName} ${v}.exe`, // electron-builder portable 默认产物名（空格分隔）
+  blockmap: `${productName}-${v}-setup.exe.blockmap`,
 };
 
 /* ── 3. 图标进包校验 ────────────────────────────────────────── */
@@ -110,7 +113,7 @@ const icoPath = path.join(appDir, 'assets', 'icons', 'icon.ico');
 if (!fs.existsSync(icoPath)) {
   fail(`assets/icons/icon.ico 不存在 —— 先跑 pnpm run gen:icon`);
 }
-const exePath = path.join(winUnpacked, 'session-migrate.exe');
+const exePath = path.join(winUnpacked, `${productName}.exe`);
 if (!fs.existsSync(exePath)) fail(`未找到 ${exePath}`);
 
 const icoBuf = fs.readFileSync(icoPath);
@@ -184,7 +187,7 @@ for (const [label, rel] of [
   }
 }
 const exeSt = fs.statSync(exePath);
-rows.push({ name: 'win-unpacked/session-migrate.exe', kind: 'dir 产物', size: exeSt.size, mtime: exeSt.mtimeMs, ok: 'OK' });
+rows.push({ name: `win-unpacked/${productName}.exe`, kind: 'dir 产物', size: exeSt.size, mtime: exeSt.mtimeMs, ok: 'OK' });
 rows.push({
   name: 'smoke:packaged（list-tools JSON-RPC）',
   kind: '冒烟',

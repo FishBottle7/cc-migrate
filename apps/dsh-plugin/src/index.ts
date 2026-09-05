@@ -15,6 +15,9 @@
  * independent of the exact @deepseek-ai/cordis version DSH ships.
  */
 
+import { join, dirname } from 'node:path';
+import { fileURLToPath } from 'node:url';
+
 import {
   importSession,
   listSources,
@@ -22,6 +25,9 @@ import {
   SOURCE_TOOLS,
 } from './commands.js';
 import type { GuiHost } from './gui.js';
+import { registerMigrateRoutes } from './routes.js';
+import { registerSkill } from './skill.js';
+import type { SkillHostContext } from './skill.js';
 
 /**
  * Minimal structural type against the DSH host ctx (same discipline as the
@@ -52,6 +58,20 @@ interface PluginContext {
    * without a GUI keep the commands-only behavior (backward compatible).
    */
   gui?: GuiHost;
+  /**
+   * 宿主 webserver 服务（GUI 双半的数据通道，src/routes.ts）：better-sidebar
+   * 同款 `register({kind, path, handler}) => disposer`。webRuntime 提供 fence
+   * 用的 trustedHosts 活性值。两者都是结构类型——缺任一时 GUI 路由跳过，
+   * 命令层照常（老宿主向后兼容）。
+   */
+  webServer?: import('./routes.js').MigrateWebServer;
+  webRuntime?: import('./routes.js').MigrateWebRuntime;
+  /**
+   * 宿主 skill 注册表（@deepseek-ai/dsh-skill 的 ctx.skills，结构最小面）：
+   * 对话式迁移的 agent skill（src/skill.ts + skills/cc-migrate/SKILL.md）经
+   * register() 挂进宿主。缺服务时 warn 跳过（src/skill.ts 同款向后兼容纪律）。
+   */
+  skills?: import('./skill.js').HostSkillService;
   /** cordis fiber cleanup: the returned disposer runs on plugin unload. */
   effect?(fn: () => () => void): unknown;
 }
@@ -68,7 +88,12 @@ export const name = 'cc-migrate';
 // the llm plugin uses with 'llm'/'credentials'/'settings'). The access in
 // apply() is still defensive: if the service is absent the plugin logs and
 // stays a no-op instead of crashing the host.
-export const inject = ['commands'] as const;
+//
+// 'webServer'/'webRuntime' 是 GUI 双半的 HTTP 通道（better-sidebar 同款）：
+// webServer 挂 /cc-migrate/api fenced 路由，webRuntime 的 trustedHosts 是
+// fence 的信任源（每请求现读）。'skills' 是对话式迁移的 agent skill 注册
+// 面（src/skill.ts）：缺服务时 warn 跳过，不影响命令层。
+export const inject = ['commands', 'webServer', 'webRuntime', 'skills'] as const;
 
 /** A slash-command invocation: argv-style tokens after the command name. */
 interface CommandInvocation {
@@ -225,6 +250,37 @@ export function apply(ctx: PluginContext, config: SessionMigrateConfig = {}): vo
 
   logger.info(`cc-migrate: registered ${COMMAND_NAMES.length} commands (/${COMMAND_NAMES.join(' | /')})`);
 
+  // -- 对话式迁移的 agent skill（src/skill.ts） --
+  // 把 skills/cc-migrate/SKILL.md 注册进宿主 ctx.skills（正文 {{CLI_PATH}}
+  // 替换为本机 lib/cli.js 绝对路径，agent 经 bash 零安装驱动迁移）。try/catch
+  // 探测与 routes/gui 同款：宿主无 skills 服务时 warn 跳过，命令层照常。
+  // ⚠ ctx 是按 inject 门禁的 Proxy——探测必须 try/catch 包裹，不能裸 if。
+  let skillDisposer: (() => void) | undefined;
+  try {
+    const cliPath = join(dirname(fileURLToPath(import.meta.url)), 'cli.js');
+    skillDisposer = registerSkill(ctx as SkillHostContext & typeof ctx, cliPath);
+  } catch (e) {
+    logger.warn(`cc-migrate skill: skipped (${e instanceof Error ? e.message : String(e)})`);
+    skillDisposer = undefined;
+  }
+  if (skillDisposer) {
+    ctx.effect?.(() => skillDisposer as () => void);
+  }
+
+  // -- GUI 双半的宿主侧 HTTP 通道（src/routes.ts） --
+  // better-sidebar 同款：fenced /cc-migrate/api 前缀路由 + 命令层实现。
+  // ⚠ ctx 是按 inject 门禁的 Proxy：老宿主（无 webServer/webRuntime 服务）
+  // 上访问直接抛——try/catch 探测，缺服务时命令层照常（向后兼容）。
+  let routeDisposer: (() => void) | undefined;
+  try {
+    routeDisposer = registerMigrateRoutes(ctx as { webServer?: unknown; webRuntime?: unknown } & typeof ctx, { dstRoot: defaultRoot });
+  } catch {
+    routeDisposer = undefined; // 宿主无对应服务——GUI fetch 会 404，命令层不受影响
+  }
+  if (routeDisposer) {
+    ctx.effect?.(() => routeDisposer as () => void);
+  }
+
   // -- optional GUI wizard: only when the host exposes a gui service --
   // 挂载走动态 import（src/gui.ts 再动态 import ui 组件），老宿主没有
   // gui 服务时这里完全零成本；unmount 也走 ctx.effect，和命令同一套 fiber 清理。
@@ -263,6 +319,8 @@ export function apply(ctx: PluginContext, config: SessionMigrateConfig = {}): vo
 // plugin entry without reaching into internals. The GUI layer stays on its own
 // entry (`./gui`): importing this entry must not drag in the Vue-side module.
 export { importSession, listSources, preview, SOURCE_TOOLS } from './commands.js';
+export { loadSkillMd, parseSkillMd, registerSkill, renderSkillBody, skillDir } from './skill.js';
+export type { ParsedSkillFile, SkillHostContext } from './skill.js';
 export type {
   CommandError,
   ImportOptions,

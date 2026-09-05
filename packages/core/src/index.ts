@@ -6,6 +6,7 @@ export * from './ir.js';
 export * from './content.js';
 export * from './registry.js';
 export * from './migrate.js';
+export * from './summarize.js';
 export * from './demo.js';
 export * from './adapters/dsh/index.js';
 export * from './adapters/claude/index.js';

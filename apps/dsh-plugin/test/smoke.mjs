@@ -148,4 +148,46 @@ for (const d of disposers) {
 }
 console.log(`[6] ${disposers.length} disposers ran clean (no throw)`);
 
-console.log('\nSMOKE OK — 3 flat commands registered under the host-shaped mock, list/preview/import verified in temp roots.');
+// ── 7. agent skill registration（ctx.skills 宿主契约）─────────────────
+// 宿主同形 mock：register(skill) 校验 name/description/content（对齐
+// @deepseek-ai/dsh-skill 的 SkillRegistry.register），返回注销函数。
+// 注意上面的主 mockCtx 没有 skills 服务——apply() 已走过一次「无 skills
+// 降级」路径（section 1 没炸即证明向后兼容），这里再验证有服务的正路径。
+const skillRegistrations = [];
+const skillEffectDisposers = [];
+const skillCtx = {
+  logger: mockCtx.logger,
+  commands: mockCtx.commands,
+  effect(fn) {
+    const d = fn();
+    skillEffectDisposers.push(d);
+    return () => d?.();
+  },
+  skills: {
+    register(skillDef) {
+      if (!/^[a-z][a-z0-9-]*$/.test(skillDef.name)) throw new TypeError(`skill name "${skillDef.name}" not kebab-case`);
+      if (typeof skillDef.description !== 'string' || !skillDef.description.trim()) throw new TypeError('skill description required');
+      if (typeof skillDef.content !== 'string' || !skillDef.content.trim()) throw new TypeError('skill content required');
+      skillRegistrations.push(skillDef);
+      return () => skillRegistrations.pop();
+    },
+  },
+};
+apply(skillCtx, {});
+assert.equal(skillRegistrations.length, 1, 'exactly one runtime skill registered');
+const skillDef = skillRegistrations[0];
+assert.equal(skillDef.name, 'cc-migrate', 'skill name is cc-migrate');
+assert.ok(skillDef.description.length > 0, 'description routes migration intents');
+assert.ok(typeof skillDef.whenToUse === 'string' && skillDef.whenToUse.length > 0, 'whenToUse carried for routing');
+assert.ok(!skillDef.content.includes('{{CLI_PATH}}'), 'CLI_PATH placeholder substituted at registration');
+assert.ok(skillDef.content.includes(join('lib', 'cli.js')), 'skill body embeds the absolute agent CLI path');
+assert.ok(skillDef.content.includes('migrate'), 'skill body teaches the migrate command');
+// effect 收的不止 skill（还有 3 条命令的注销器）——断言 skill 的注销器确实
+// 在其中：全量跑完后宿主侧注册表应为空（skill mock 的注销 = 从注册表移除）。
+assert.ok(skillEffectDisposers.length >= 1, 'skill registration routed through ctx.effect');
+for (const d of skillEffectDisposers) d();
+assert.equal(skillRegistrations.length, 0, 'running the effect disposers unregisters the skill');
+console.log(`[7] skill registered: ${skillDef.name} (content ${skillDef.content.length} chars, cli path embedded)`);
+console.log('[7b] skill disposer ran clean (registration removed)');
+
+console.log('\nSMOKE OK — 3 flat commands + 1 agent skill registered under the host-shaped mock, list/preview/import verified in temp roots.');

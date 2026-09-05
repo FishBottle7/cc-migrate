@@ -31,3 +31,7 @@ Thumbs.db
 # electron-builder 产物（apps/desktop-app/release）
 apps/desktop-app/release/
 *.tgz
+
+# 插件包内的通用 skill 副本 —— build 期由 scripts/sync-universal-skill.mjs
+# 从 packages/cli/skills/cc-migrate/SKILL.md 强制同步（单一事实源在独立 CLI）
+apps/dsh-plugin/skills/universal/

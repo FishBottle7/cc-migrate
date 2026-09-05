@@ -3,25 +3,43 @@
  * cc-migrate CLI.
  *
  * Usage:
- *   cc-migrate list <tool> [--root <dir>]
- *   cc-migrate preview <tool> <sessionId> [--root <dir>]
+ *   cc-migrate tools
+ *   cc-migrate list <tool> [--root <dir>] [--cwd <dir>] [--limit N] [--json]
+ *   cc-migrate preview <tool> <sessionId> [--root <dir>] [--json] [--messages K] [--lines N] [--full]
  *   cc-migrate migrate <srcTool> <srcSessionId> <dstTool>
  *                    [--src-root <dir>] [--dst-root <dir>] [--target-cwd <path>]
- *                    [--keep-runtime-context]
+ *                    [--keep-runtime-context] [--json]
+ *   cc-migrate skill install [--agent <id,id>|--all] [--dir <path>] [--json]
+ *   cc-migrate skill status [--json]
+ *   cc-migrate skill path
  *   cc-migrate wizard [--src-root <dir>] [--dst-root <dir>]  # interactive
  *   cc-migrate reconcile dsh [--root <dir>]  # fix workspace.json registration
  *   cc-migrate verify dsh [--root <dir>] [sessionId]  # validate artifacts
  *   cc-migrate demo      # dsh->dsh self round-trip
  *   cc-migrate demo2     # claude<->dsh round-trip in a temp dir
+ *
+ * Agent-facing surface (the skill at skills/cc-migrate/SKILL.md teaches this):
+ * `--json` everywhere emits machine-readable output; `preview --json` is a
+ * strictly bounded digest (~1-2KB) so an agent can confirm "is this the
+ * session" without pulling a transcript into its context window; `list` caps
+ * at 50 items / 120-char titles unless `--limit 0` lifts the cap; `--cwd`
+ * filters a listing to one project.
  */
 
+import { homedir } from 'node:os';
+import { copyFileSync, existsSync, mkdirSync } from 'node:fs';
+import { dirname, isAbsolute, join, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
+
 import { builtinRegistry } from '@cc-migrate/core';
+import type { AdapterRegistry, SessionMeta } from '@cc-migrate/core';
 import {
   previewSession,
   readSource,
   writeTarget,
   listSessions,
   fallbackIr,
+  summarizeIr,
 } from '@cc-migrate/core';
 
 interface Flags {
@@ -32,9 +50,43 @@ interface Flags {
   flatten?: boolean;
   keepSynthetic?: boolean;
   systemPromptSource?: 'source' | 'target';
+  /** list: 只看这个项目（cwd 归一化后匹配；无 cwd 信息的会话被排除） */
+  cwd?: string;
+  /** list: 最多显示 N 条（createdAt 降序；0 = 不限；缺省 50） */
+  limit?: number;
+  /** list/migrate/preview/skill: 机器可读 JSON 输出 */
+  json?: boolean;
+  /** preview --json: 摘要携带的开头用户消息条数（默认 3，0-20） */
+  messages?: number;
+  /** preview 文本模式的行数上限（默认 120） */
+  lines?: number;
   /** preview: 打印全文（默认仅前 120 行 —— 终端渲染 MB 级文本极慢） */
   full?: boolean;
+  /** skill install: 指定目标框架 id（逗号分隔）或 --all */
+  agent?: string;
+  /** skill install: 自定义安装目录（安装为 <dir>/SKILL.md） */
+  dir?: string;
 }
+
+/** win32/darwin 路径大小写不敏感；posix 保留大小写。 */
+const CASE_INSENSITIVE_PATHS = process.platform === 'win32' || process.platform === 'darwin';
+
+function normPath(p: string): string {
+  const unified = p.replace(/\\/g, '/').replace(/\/+$/, '');
+  return CASE_INSENSITIVE_PATHS ? unified.toLowerCase() : unified;
+}
+
+/** list 输出的标题体量上限：压平空白 + 截断（上下文预算：50 条 × ≤120 字符标题）。 */
+const TITLE_CAP = 120;
+
+function capTitle(title: string | undefined): string | undefined {
+  if (title === undefined) return undefined;
+  const flat = title.replace(/\s+/g, ' ').trim();
+  return flat.length > TITLE_CAP ? `${flat.slice(0, TITLE_CAP - 1)}…` : (flat || undefined);
+}
+
+/** list 的默认条数上限（--limit 0 解除）。 */
+const LIST_DEFAULT_LIMIT = 50;
 
 function parseFlags(argv: string[]): { flags: Flags; positionals: string[] } {
   const f: Flags = {};
@@ -46,6 +98,31 @@ function parseFlags(argv: string[]): { flags: Flags; positionals: string[] } {
     else if (tok === '--src-root') f.srcRoot = value('src-root');
     else if (tok === '--dst-root') f.dstRoot = value('dst-root');
     else if (tok === '--target-cwd') f.targetCwd = value('target-cwd');
+    else if (tok === '--cwd') f.cwd = value('cwd');
+    else if (tok === '--agent') f.agent = value('agent');
+    else if (tok === '--dir') f.dir = value('dir');
+    else if (tok === '--limit') {
+      const n = Number.parseInt(value('limit') ?? '', 10);
+      if (!Number.isFinite(n) || n < 0) {
+        console.error('--limit expects a non-negative integer (0 = unlimited)');
+        process.exit(1);
+      }
+      f.limit = n;
+    } else if (tok === '--messages') {
+      const n = Number.parseInt(value('messages') ?? '', 10);
+      if (!Number.isFinite(n) || n < 0 || n > 20) {
+        console.error('--messages expects an integer in 0..20');
+        process.exit(1);
+      }
+      f.messages = n;
+    } else if (tok === '--lines') {
+      const n = Number.parseInt(value('lines') ?? '', 10);
+      if (!Number.isFinite(n) || n <= 0) {
+        console.error('--lines expects a positive integer');
+        process.exit(1);
+      }
+      f.lines = n;
+    } else if (tok === '--json') f.json = true;
     else if (tok === '--flatten') f.flatten = value('flatten') !== 'false';
     else if (tok === '--no-flatten') f.flatten = false;
     else if (tok === '--keep-runtime-context') f.keepSynthetic = true;
@@ -62,6 +139,144 @@ function parseFlags(argv: string[]): { flags: Flags; positionals: string[] } {
   return { flags: f, positionals };
 }
 
+/* ── skill install：把通用 SKILL.md 装进各 agent 框架的 skill 目录 ────────
+ *
+ * 通用 skill 是跨框架的（Claude Code / ZCode / DSH / pi / codex / opencode
+ * 都读「目录 + SKILL.md + frontmatter」这一约定），差别只在各自的用户级根
+ * 目录。目标表只做「探测 + 安装到我们的 cc-migrate/ 子目录」：绝不碰其他
+ * skill，也绝不删除任何东西（卸载 = 人手动删目录，README 有说明）。
+ */
+interface SkillTarget {
+  id: string;
+  /** 探测框架是否存在的 home 子目录候选（任一存在即视为已装该框架）。 */
+  homeCandidates: string[];
+  /** 该框架用户级 skill 根（相对 home）。 */
+  skillDir: string;
+  note: string;
+}
+
+const SKILL_TARGETS: SkillTarget[] = [
+  { id: 'agents', homeCandidates: ['.agents'], skillDir: '.agents/skills', note: '跨工具共享 skill 根（ZCode/DSH/Claude 等都读）' },
+  { id: 'claude', homeCandidates: ['.claude'], skillDir: '.claude/skills', note: 'Claude Code 用户级 skills' },
+  { id: 'zcode', homeCandidates: ['.zcode'], skillDir: '.zcode/skills', note: 'ZCode 用户级 skills' },
+  { id: 'dsh', homeCandidates: ['.dsh'], skillDir: '.dsh/skills', note: 'DSH 用户级 skills（装了 cc-migrate 插件时其运行时 skill 优先生效）' },
+  { id: 'pi', homeCandidates: ['.pi'], skillDir: '.pi/agent/skills', note: 'pi 用户级 skills' },
+  { id: 'codex', homeCandidates: ['.codex'], skillDir: '.codex/skills', note: 'Codex CLI skills' },
+  { id: 'opencode', homeCandidates: ['.config/opencode', '.opencode'], skillDir: '.config/opencode/skill', note: 'OpenCode 全局 skill（目录名为单数）' },
+];
+
+const SKILL_NAME = 'cc-migrate';
+
+/** 随包分发的通用 SKILL.md。仓库布局（bundle/index.js → ../../skills）与
+ * npm 安装布局（node_modules/@cc-migrate/cli/bundle/index.js → ../skills）
+ * 深度不同 —— 依次探测两个候选。 */
+function bundledSkillPath(): string {
+  const here = import.meta.url;
+  for (const rel of ['../../skills/cc-migrate/SKILL.md', '../skills/cc-migrate/SKILL.md']) {
+    const p = fileURLToPath(new URL(rel, here));
+    if (existsSync(p)) return p;
+  }
+  return fileURLToPath(new URL('../skills/cc-migrate/SKILL.md', here));
+}
+
+function targetSkillDir(t: SkillTarget): string {
+  return join(homedir(), t.skillDir, SKILL_NAME);
+}
+
+interface SkillInstallRow {
+  id: string;
+  action: 'installed' | 'skipped';
+  path?: string;
+  reason?: string;
+}
+
+function runSkillInstall(flags: Flags, subArgs: string[]): void {
+  if (subArgs.length > 0) {
+    console.error('usage: cc-migrate skill install [--agent <id,id>|--all] [--dir <path>] [--json]');
+    process.exit(1);
+  }
+  const src = bundledSkillPath();
+  if (!existsSync(src)) {
+    console.error(`error: bundled SKILL.md missing at ${src} — reinstall the CLI package`);
+    process.exit(1);
+  }
+  const rows: SkillInstallRow[] = [];
+
+  // --dir：自定义目录（用户/agent 明确指定的落点，装为 <dir>/SKILL.md）
+  if (flags.dir) {
+    const dir = isAbsolute(flags.dir) ? flags.dir : resolve(flags.dir);
+    mkdirSync(dir, { recursive: true });
+    const dest = join(dir, 'SKILL.md');
+    copyFileSync(src, dest);
+    rows.push({ id: 'custom', action: 'installed', path: dest });
+  } else {
+    let targets: SkillTarget[];
+    if (flags.agent === 'all' || flags.agent === undefined) {
+      // 默认与 --all 同义：所有「home 已存在」的框架（不为未装的框架凭空建 home）
+      targets = SKILL_TARGETS.filter((t) => t.homeCandidates.some((h) => existsSync(join(homedir(), h))));
+      if (flags.agent === undefined && targets.length === 0) {
+        console.error('error: no supported agent home detected (~/.claude ~/.zcode ~/.agents ~/.dsh ~/.pi ~/.codex ~/.config/opencode) — use --dir <path> or --agent <id>');
+        process.exit(1);
+      }
+    } else {
+      targets = [];
+      for (const id of flags.agent.split(',').map((s) => s.trim()).filter(Boolean)) {
+        const t = SKILL_TARGETS.find((x) => x.id === id);
+        if (!t) {
+          console.error(`unknown agent "${id}" — available: ${SKILL_TARGETS.map((x) => x.id).join(', ')}`);
+          process.exit(1);
+        }
+        targets.push(t);
+      }
+    }
+    for (const t of targets) {
+      const dir = targetSkillDir(t);
+      try {
+        mkdirSync(dir, { recursive: true });
+        copyFileSync(src, join(dir, 'SKILL.md'));
+        rows.push({ id: t.id, action: 'installed', path: join(dir, 'SKILL.md') });
+      } catch (e) {
+        rows.push({ id: t.id, action: 'skipped', reason: e instanceof Error ? e.message : String(e) });
+      }
+    }
+  }
+
+  if (flags.json) {
+    console.log(JSON.stringify({ ok: true, source: src, results: rows }, null, 2));
+    return;
+  }
+  console.log(`source: ${src}`);
+  for (const r of rows) {
+    if (r.action === 'installed') console.log(`installed ${r.id}: ${r.path}`);
+    else console.log(`skipped  ${r.id}: ${r.reason ?? 'unknown reason'}`);
+  }
+}
+
+function runSkillStatus(flags: Flags): void {
+  const src = bundledSkillPath();
+  const rows = SKILL_TARGETS.map((t) => {
+    const homeFound = t.homeCandidates.some((h) => existsSync(join(homedir(), h)));
+    const path = targetSkillDir(t);
+    return {
+      id: t.id,
+      homeFound,
+      installed: existsSync(join(path, 'SKILL.md')),
+      path,
+      note: t.note,
+    };
+  });
+  if (flags.json) {
+    console.log(JSON.stringify({ ok: true, source: existsSync(src) ? src : null, targets: rows }, null, 2));
+    return;
+  }
+  console.log(`source: ${src}${existsSync(src) ? '' : '  (MISSING — reinstall the CLI package)'}`);
+  for (const r of rows) {
+    const state = r.installed ? 'installed' : r.homeFound ? 'not installed' : 'agent not detected';
+    console.log(`${state.padEnd(18)} ${r.id.padEnd(9)} ${r.path}`);
+  }
+  console.log('\ninstall: cc-migrate skill install [--agent <id>|--all] [--dir <path>]');
+}
+
 async function main(argv: string[]) {
   // Separate named flags from positional args FIRST so flags never occupy
   // positional slots (e.g. `list dsh --root X` must keep X out of positionals).
@@ -70,41 +285,104 @@ async function main(argv: string[]) {
   const [a, b, c] = args;
   const registry = builtinRegistry();
 
+  /** registry.get with an agent-friendly unknown-tool error (usage + valid ids). */
+  function resolveAdapter(reg: AdapterRegistry, tool: string) {
+    try {
+      return reg.get(tool as never);
+    } catch {
+      console.error(`unknown tool "${tool}" — available: ${reg.tools().join(', ')}`);
+      process.exit(1);
+    }
+  }
+
   switch (cmd) {
+    case 'tools': {
+      for (const t of registry.tools()) console.log(t);
+      return;
+    }
     case 'list': {
-      const adapter = registry.get(a as never);
-      const metas = await listSessions(adapter, flags.root ?? flags.srcRoot);
-      for (const m of metas) {
+      if (!a) {
+        console.error(`usage: cc-migrate list <tool> [--root <dir>] [--cwd <dir>] [--limit N] [--json]\n  tools: ${registry.tools().join(', ')}`);
+        process.exit(1);
+      }
+      const adapter = resolveAdapter(registry, a);
+      let metas = await listSessions(adapter, flags.root ?? flags.srcRoot);
+      if (flags.cwd) {
+        const needle = normPath(flags.cwd);
+        metas = metas.filter((m) => m.cwd !== undefined && normPath(m.cwd) === needle);
+      }
+      metas = [...metas].sort((x, y) => (y.createdAt ?? 0) - (x.createdAt ?? 0));
+      // 上下文体量预算：默认 50 条封顶（--limit 0 解除），标题统一 ≤120 字符
+      const total = metas.length;
+      const limit = flags.limit === undefined ? LIST_DEFAULT_LIMIT : flags.limit;
+      if (limit > 0) metas = metas.slice(0, limit);
+      const capped = metas.map((m) => ({ ...m, ...(m.title !== undefined ? { title: capTitle(m.title) } : {}) }));
+      if (flags.json) {
+        console.log(JSON.stringify(capped, null, 2));
+        return;
+      }
+      for (const m of capped) {
         const archived = m.archived ? '[archived] ' : '';
         console.log(`${archived}${m.sessionId}\t${m.title ?? ''}\t${m.createdAt ? new Date(m.createdAt).toISOString() : ''}\t${m.sourcePath ?? ''}`);
+      }
+      if (limit > 0 && total > metas.length) {
+        console.error(`[list] 共 ${total} 条，已按默认上限显示 ${metas.length} 条 —— 用 --cwd 缩小范围或 --limit 0 看全部`);
       }
       return;
     }
     case 'preview': {
       if (!a || !b) {
-        console.error('usage: cc-migrate preview <tool> <sessionId> [--full]');
+        console.error('usage: cc-migrate preview <tool> <sessionId> [--json] [--messages K] [--lines N] [--full]');
         process.exit(1);
       }
-      const adapter = registry.get(a as never);
+      const adapter = resolveAdapter(registry, a);
       const ir = await readSource(registry, a, b, flags.root ?? flags.srcRoot);
+      if (flags.json) {
+        // 上下文安全的决策摘要（≈1-2KB）：计数 + ≤200 字摘录，绝不输出全文。
+        const digest = summarizeIr(ir, {
+          ...(flags.messages !== undefined ? { firstUserMessages: flags.messages } : {}),
+        });
+        console.log(JSON.stringify(digest, null, 2));
+        return;
+      }
       const text = previewSession(adapter, ir);
       const lines = text.split('\n');
-      const HEAD = 120;
+      const HEAD = flags.lines ?? 120;
       if (flags.full || lines.length <= HEAD) {
+        if (flags.full && lines.length > HEAD) {
+          console.error(`[preview] --full：共 ${lines.length} 行 / ${text.length} 字符 —— 注意上下文体量`);
+        }
         process.stdout.write(text);
         return;
       }
       for (const l of lines.slice(0, HEAD)) process.stdout.write(l + '\n');
-      console.error(`\n[preview] 共 ${lines.length} 行，已显示前 ${HEAD} 行 —— 加 --full 查看全文（大会话全文写入终端较慢）`);
+      console.error(`\n[preview] 共 ${lines.length} 行，已显示前 ${HEAD} 行 —— agent 请改用 --json 摘要；--lines N 调行数；--full 全文`);
       return;
+    }
+    case 'skill': {
+      const sub = a;
+      if (sub === 'install') {
+        runSkillInstall(flags, args.slice(1));
+        return;
+      }
+      if (sub === 'status') {
+        runSkillStatus(flags);
+        return;
+      }
+      if (sub === 'path') {
+        console.log(bundledSkillPath());
+        return;
+      }
+      console.error('usage: cc-migrate skill <install|status|path> [--agent <id,id>|--all] [--dir <path>] [--json]');
+      process.exit(1);
     }
     case 'migrate': {
       if (!a || !b || !c) {
-        console.error('usage: cc-migrate migrate <srcTool> <srcSessionId> <dstTool>');
+        console.error('usage: cc-migrate migrate <srcTool> <srcSessionId> <dstTool> [--json]');
         process.exit(1);
       }
       const ir = await readSource(registry, a, b, flags.root ?? flags.srcRoot);
-      const adapter = registry.get(c as never);
+      const adapter = resolveAdapter(registry, c);
       const disambiguateTitle = a === 'dsh' && c === 'dsh';
       const res = await writeTarget(adapter, ir, {
         root: flags.dstRoot,
@@ -114,6 +392,10 @@ async function main(argv: string[]) {
         ...(flags.systemPromptSource ? { systemPromptSource: flags.systemPromptSource } : {}),
         ...(disambiguateTitle ? { disambiguateTitle: true } : {}),
       });
+      if (flags.json) {
+        console.log(JSON.stringify(res, null, 2));
+        return;
+      }
       console.log(`migrated ${a}:${b} -> ${c}:${res.sessionId}`);
       for (const p of res.paths) console.log(`  ${p}`);
       return;
@@ -200,7 +482,8 @@ async function main(argv: string[]) {
       return;
     }
     default:
-      console.error('usage: cc-migrate <list|preview|migrate|verify|reconcile|wizard|demo|demo2> [...]');
+      console.error(`usage: cc-migrate <tools|list|preview|migrate|verify|reconcile|wizard|demo|demo2> [...]
+  tools: ${registry.tools().join(', ')}`);
       process.exit(1);
   }
 }

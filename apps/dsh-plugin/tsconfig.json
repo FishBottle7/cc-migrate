@@ -18,7 +18,13 @@
       // （src/ui-stub.d.ts，只声明 GUI 层消费的形状）。运行时动态 import
       // 解析真实包，由宿主构建带 vue 编译；见 src/gui.ts 头注。
       "@cc-migrate/ui": ["./src/ui-stub.d.ts"]
-    }
+    },
+    // client 半（src/client/*.tsx）是 React 源码：JSX/类型由 tsdown 构建管
+    // （rolldown 的 oxc 处理 .tsx），tsc 的 build/typecheck 只覆盖宿主半
+    // ——exclude src/client 是刻意的：把 react JSX runtime 拦在 Node 半
+    // 类型检查之外（tsc 不产 client 产物，lib/client.js 只有 bundle 通道）。
+    "jsx": "react-jsx"
   },
-  "include": ["src/**/*.ts", "src/**/*.d.ts"]
+  "include": ["src/**/*.ts", "src/**/*.tsx", "src/**/*.d.ts"],
+  "exclude": ["src/client"]
 }

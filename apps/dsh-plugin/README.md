@@ -56,18 +56,130 @@ pnpm --filter @cc-migrate/dsh-plugin run test     # 冒烟 ×2：命令层（moc
 /cc-migrate-import claude 84c74b02-5ad2-4226-831d-98dc2a10c2ff --cwd D:\codes\myproj
 ```
 
-## GUI 向导（宿主挂载，design.md Phase 3 §15）
+## Agent skill（对话式迁移）
 
-除三个斜杠命令外，插件还带一条「选会话 → 预览 → 配置 → 写入」的向导入口
-（`@cc-migrate/ui` 的现成 `MigrateWizard` 组件）。GUI 层是**独立入口
-`exports['./gui']`**（`lib/gui.js`）：主入口不静态引它，命令层宿主完全不受
-Vue 运行时影响；DSH 前端挂载 Vue 组件的方式没有实机参考，所以本期交付的
-是「组件 + 数据桥 + 无头测试」，宿主真实挂载点以 `GuiHost` 协议对接。
+斜杠命令是给人点用的；想让用户**直接跟 agent 对话**完成迁移（「把我在 Claude Code
+里昨天调 bug 的那个会话搬过来」），插件把一个 agent skill 注册进宿主的
+`ctx.skills` 注册表（`@deepseek-ai/dsh-skill`，结构面见 `src/skill.ts`）：
 
-### GuiHost 协议（对 DSH 宿主的最小假设，结构类型）
+- **skill 本体**：`skills/cc-migrate/SKILL.md`（frontmatter name/description/
+  whenToUse + 正文）。宿主把 description/whenToUse 用于触发路由；用户也可显式
+  `/cc-migrate` 调用。正文教 agent 三步走：`list`（挑会话）→ `preview`（确认）→
+  `migrate`（写入 DSH），并明确铁律：**读旧写新、绝不删除/覆盖、迁移可安全重复**。
+- **执行通道**：插件自带一个零依赖 agent CLI `lib/cli.js`（`src/cli.ts`，复用命令层）。
+  注册时 skill 正文里的 `{{CLI_PATH}}` 占位符被替换为本机绝对路径——agent 经 bash
+  `node <…>/lib/cli.js <cmd>` 驱动迁移，**无需任何全局安装**。`{{CLI_PATH}}` 未被
+  替换（手工安装 SKILL.md 的场景）时正文自带回退规则：PATH 上的独立 `cc-migrate`
+  （命令语义一致，`migrate` 需显式补 `<dstTool>`=dsh）→ 都没有则提示重装插件。
+- **向后兼容**：宿主没有 skills 服务时（老版本），注册降级为 warn 一条日志，
+  三条斜杠命令与 GUI 完全不受影响（`src/skill.ts` 与 routes/gui 同款 try/catch
+  探测纪律——ctx 是按 inject 门禁的 Proxy，探测必须包 try/catch）。
 
-宿主在 `ctx.gui` 上提供以下服务（可选——没有 `ctx.gui` 时插件只剩命令，
-向后兼容老宿主）：
+agent CLI 的命令面（flag 语义与独立 CLI 一致；`--json` 输出整段合法 JSON——
+标题可能含换行/制表符，程序化解析一律走 `--json`；上下文体量纪律见 skill 正文）：
+
+```
+node lib/cli.js tools
+node lib/cli.js list <tool> [--root <dir>] [--cwd <dir>] [--limit N] [--json]   # 新到旧；默认 50 条封顶 + 标题截 120 字
+node lib/cli.js preview <tool> <sessionId> [--root <dir>] [--json] [--messages K] [--lines N] [--full]
+                                         # --json = ≈1-2KB 决策摘要（计数 + ≤200 字摘录，与 session 体量无关）
+node lib/cli.js migrate <tool> <sessionId> [--src-root <dir>] [--cwd <dir>]
+                        [--root <dstRoot>] [--session-id <id>] [--json]
+node lib/cli.js skill install [--agent <id,id>|--all] [--dir <path>] [--json]   # 把通用 skill 装进本机其他 agent 框架
+node lib/cli.js skill status [--json]
+```
+
+- `list --cwd`：按会话 cwd 过滤（分隔符/尾斜杠归一化，win32/darwin 大小写不敏感；
+  无 cwd 信息的会话被排除）——agent 帮用户找「这个项目里的会话」的主入口。
+- `--flatten` / `--no-flatten` / `--keep-runtime-context`（migrate）：与命令层
+  `importSession` 的 flatten/keepSynthetic 一一对应。
+
+### 通用 skill（跨框架）与 DSH 专属 skill 的关系
+
+- **通用 skill** 的单一事实源在独立 CLI 包（`packages/cli/skills/cc-migrate/SKILL.md`）：
+  框架无关、教 agent 用 `cc-migrate` 全量命令（任意方向迁移），由
+  `cc-migrate skill install` 探测 `~/.claude` `~/.zcode` `~/.agents` `~/.dsh`
+  `~/.pi` `~/.codex` `~/.config/opencode` 并装进各自用户级 skill 根（只写
+  `cc-migrate/` 子目录，绝不删除；卸载由人手动删目录）。
+- **DSH 专属 skill**（本文件 `skills/cc-migrate/SKILL.md`）：插件 apply() 时
+  经 `ctx.skills.register` 注册为运行时 skill，执行器指向插件自带的
+  `lib/cli.js`（`{{CLI_PATH}}` 注册期替换为本机绝对路径），目标钉死 any→dsh。
+  同名通用 skill 与运行时 skill 并存时宿主让运行时优先 —— DSH 用户的体验
+  最短路径，其他框架走通用版。
+- 插件包在 build 期用 `scripts/sync-universal-skill.mjs` 把通用 SKILL.md
+  同步为 `skills/universal/SKILL.md` 副本（单一事实源仍在独立 CLI，副本
+  gitignore），因此 **只装插件的机器** 也能 `node lib/cli.js skill install`
+  把通用 skill 铺到本机其他 agent —— 不必再装独立 CLI。
+
+## GUI 会话迁移向导（dsh-better-sidebar 侧边栏 tab）
+
+插件带一条图形界面：DSH web 右侧边栏的「会话迁移」tab（dsh-better-sidebar
+的扩展服务注册），三步流程「选源工具 → 浏览会话 → 预览 → 导入到 DSH」。
+**前提：profile 里已安装 `dsh-better-sidebar`**（v0.12.0+，提供
+`betterSidebar` 注册表服务与右侧边栏本体）——没装时 client 半不激活，
+命令层不受影响。
+
+### 双半架构
+
+DSH 插件官方双半规范（与 dsh-better-sidebar 自身同构）：
+
+```
+宿主半（Node，lib/index.js）                 client 半（浏览器，lib/client.js）
+  apply(ctx)                                   window.__ModuleLoader__.load({id, factory})
+  ├─ ctx.commands.register（3 斜杠命令）        ├─ exports.inject = ['betterSidebar']
+  └─ ctx.webServer.register                    └─ exports.apply(ctx)
+       prefix /cc-migrate/api                    └─ ctx.get('betterSidebar').registerTab({
+         ├─ POST list-sources                       id: 'cc-migrate', title: '会话迁移',
+         ├─ POST preview        ←──── fetch ────      order: 90, single: true,
+         └─ POST import                                 component: (props) => <React 向导/>
+       （fence: Host 回环/trustedHosts）            })
+```
+
+- **数据通道**：client 半的 React 向导 `fetch('/cc-migrate/api/<method>')`
+  （POST JSON）；宿主半路由转发到命令层纯函数（`lib/commands.js`），结果以
+  `{ok:true,value}` / `{ok:false,error:{code,message}}` 信封回写——实现
+  照抄 dsh-better-sidebar 的 `/sidebar/api` 模式。
+- **浏览器信任围栏**：所有路由过 /api 网关同款 fence（Host 头回环或宿主
+  `webRuntime.trustedHosts`，带 Origin 时须同主机，`sec-fetch-site:
+  cross-site` 拒绝）——防 DNS rebinding / 跨站页打到宿主路由。fence 每请求
+  现读 trustedHosts 活性值，宿主换列表即时生效。
+- **UI 原语**：优先宿主 `@deepseek-ai/dsh-client-ui-primitives`（Button/
+  Input/Tooltip——client 半经宿主 require 拿），字段缺失自动降级为内联
+  React 元素 + 内联样式（暗色侧栏风），不引第三方 UI 库。
+- **构建形态**：client 半由 tsdown 出 rolldown bundle，`scripts/wrap-client.mjs`
+  手工包装成 `window.__ModuleLoader__.load({id, factory})` 工厂壳（与
+  better-sidebar `lib/client.js` 逐字段同形态）；react / react-dom /
+  @deepseek-ai/* 全部 external（宿主模块图运行时 require 提供，绝不打进
+  bundle）。package.json 的 `dsh.client.inject` 声明 client 半注入
+  `["@deepseek-ai/dsh-client-runtime", "dsh-better-sidebar"]`。
+
+### 安装与使用
+
+```bash
+dsh plugin --profile web add ./cc-migrate-dsh-plugin-0.1.0.tgz   # 宿主半 + client 半一起装
+# 重启 dsh web 后：右侧边栏 + 菜单 → 「会话迁移」tab
+```
+
+1. 打开右侧边栏的 + 菜单，选「会话迁移」（单实例 tab）。
+2. 第一步：点工具卡片（DSH/Claude Code/Codex/Pi/OpenCode/ZCode），下方
+   列出该源库的会话（标题/时间/id）；源库地址可手改后「刷新」。
+3. 第二步：点任一会话 → 结构化预览（消息角色/文本/思考/工具调用，前 30 条）。
+4. 第三步：「导入到 DSH」→ 写入全新 DSH session（read-old-write-new），
+   页脚显示新 session id。
+   （截图占位：真机渲染验证后补——见「当前验证状态」。）
+
+为什么不用 `@cc-migrate/ui` 的 MigrateWizard（Vue）：DSH 前端是 React，
+跨框架挂载（Vue-in-React 微前端）复杂且脆，裁定轻量 React 重写；数据形状
+完全复用命令层 DTO（`PreviewPayload` / `SessionMeta`），`src/client/api.ts`
+是 gui.ts `createWizardBackend` 的 fetch 改写（MigrationBackend 同一契约语义）。
+
+### GuiHost 协议（旧 Vue 通道，保留为兼容层）
+
+> 注：这是 **design.md Phase 3 §15 的原始 Vue 通道**（`src/gui.ts` +
+> `lib/gui.js`），在 better-sidebar tab 方案落地后作为兼容层保留：宿主若
+> 自行实现了 `ctx.gui` 服务，向导仍可经它挂 `@cc-migrate/ui` 的
+> `MigrateWizard`。两套 GUI 互不干扰——新宿主用上面的 sidebar tab，老宿主
+> 用这条协议。
 
 | 成员 | 形状 | 说明 |
 |---|---|---|
@@ -105,16 +217,40 @@ GUI 层（`src/gui.ts`）把这些桥接成 ui 组件的 `MigrationBackend` 契�
 
 ### 当前验证状态
 
-- 无头冒烟 `test/gui-smoke.mjs` 覆盖**协议层**：工厂失败路径（ui 未打包 →
-  可读错误）、成功路径（`mount(container, component, { backend })` 契约 +
-  backend 六方法）、三条数据通道真走到命令层（临时 claude 库造数据：list /
-  结构化 preview / import 全新 id 写入 + 目标白名单）、`handle.dispose()`
-  幂等、`apply()` 在有/无 `ctx.gui` 两种宿主下的行为。
+- 无头冒烟 `test/smoke.mjs` 覆盖命令层 + **agent skill 注册（新）**：
+  命令注册（mock ctx 注册 3 命令 + shape 校验）、list/preview/import 全链、
+  import 恒 mint 新 id、无 skills 服务的宿主降级不炸；skills 正路径断言
+  （register 形状校验、name=cc-migrate、{{CLI_PATH}} 已替换为本机 lib/cli.js
+  绝对路径、注销器经 ctx.effect 挂钩且执行后注销生效）。
+- 无头冒烟 `test/cli-smoke.mjs` 覆盖 **插件自带 agent CLI（新）**：子进程真跑
+  `node lib/cli.js`——tools 枚举、`list --json` 信封（ok/tool/count/sessions）、
+  `--cwd` 归一化命中/排除、`--limit`、`preview --json` 有界摘要（<4KB、摘录
+  ≤200 字）、`migrate --json` 写入临时 DSH 根并回报
+  `{source,target:{sessionId,paths}}`（文件落盘非空、二次迁移 mint 新 id）、
+  `skill install --dir`（通用 skill 落盘、无 {{CLI_PATH}} 占位符、status 探测
+  7 框架）、失败路径（未知工具/未知命令/坏 --limit/不存在的会话 → exit 1 +
+  stderr `error: …`）。
+- 无头冒烟 `test/client-smoke.mjs` 覆盖 **better-sidebar GUI 全链**：
+  - bundle 形态（`__ModuleLoader__` 壳逐字段断言、无裸 ESM 语句、react
+    不入 bundle）；工厂执行（mock 宿主 require → `{apply, inject}`）；
+    `apply(ctx)` → `registerTab` 收到形状合法的 TabDescriptor（better-sidebar
+    service.d.ts 契约）；组件树经 `react-dom/server` 无头渲染拉通；
+    dispose 链注销。
+  - 宿主半路由：方法表 3 method、前缀路由注册、fence 违例矩阵（跨站
+    Host/Origin/sec-fetch-site 403、同主机 200、GET 405、未知 404、坏
+    JSON 400、trustedHosts 活性生效）、list/preview/import 全链真数据
+    （临时 claude 库）、read-old-write-new（两次导入两个全新 id）。
+- 无头冒烟 `test/gui-smoke.mjs` 覆盖 **旧 Vue 通道协议层**：工厂失败路径
+  （ui 未打包 → 可读错误）、成功路径（`mount(container, component,
+  { backend })` 契约 + backend 六方法）、三条数据通道真走到命令层、
+  `handle.dispose()` 幂等、`apply()` 在有/无 `ctx.gui` 两种宿主下的行为。
 - 组件渲染正确性由 ui 包自己的 vue-tsc 保证：
   `pnpm --filter @cc-migrate/ui run typecheck`。
-- **真机渲染留宿主联调**（DSH 前端首个 Vue 挂载点）：挂载容器形状、样式
-  主题（ui 的 `theme.css`）、`pickDirectory`/`openPath` 的原生对话框桥、
-  worker 通道的线程边界——见上面「接入步骤」逐项。
+- **真机渲染留主会话联调**：tab 在真实 DSH web 里的呈现（+ 菜单位置/图标/
+  浮窗行为）、宿主原语 Button/Input 的实际视觉、fetch 跨端口 fence 行为
+  （真实 `--trusted-host` 部署）、better-sidebar 版本兼容面。无头冒烟已把
+  契约违例（fence 漏洞、形态漂移、TabDescriptor 字段缺失）全部拦在装进
+  宿主之前。
 
 ## 安全红线
 
@@ -128,5 +264,9 @@ GUI 层（`src/gui.ts`）把这些桥接成 ui 组件的 `MigrationBackend` 契�
 
 ## 状态
 
-Phase 3 第 15 项完成：命令层 + 插件骨架 + GUI 向导挂载层（GuiHost 协议 +
-无头冒烟，宿主真机联调待 DSH 前端首个 Vue 挂载点落地）。
+Phase 3 第 15 项完成 + 对话式迁移入口（v0.2.0）：命令层 + 插件骨架 + GUI 向导
+（better-sidebar 侧边栏 tab 双半形态：fenced HTTP 数据通道 + React 向导
+client 半 + 旧 GuiHost Vue 通道保留为兼容层）+ **agent skill**（`ctx.skills`
+注册的运行时 skill + 插件自带零依赖 agent CLI `lib/cli.js`，SKILL.md 可单独
+拷给其他宿主）。无头冒烟 ×4 全绿（命令层/skill 注册/GUI/client/cli）；真机
+渲染联调见「当前验证状态」。
