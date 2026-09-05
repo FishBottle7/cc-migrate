@@ -224,7 +224,13 @@ async function main(argv: string[]): Promise<void> {
       if (flags.json) {
         // 上下文安全的决策摘要（≈1-2KB）：计数 + ≤200 字摘录，绝不输出全文。
         const registry = builtinRegistry();
-        const ir = await readSource(registry, a, b, flagString(flags, 'root') ?? flagString(flags, 'src-root'));
+        let ir;
+        try {
+          ir = await readSource(registry, a, b, flagString(flags, 'root') ?? flagString(flags, 'src-root'));
+        } catch (e) {
+          // --json 面向 agent：失败也保持一行 error（不吐 stack，省上下文）
+          fail(e instanceof Error ? e.message : String(e));
+        }
         const messagesRaw = flagString(flags, 'messages');
         const firstUser = messagesRaw === undefined ? undefined : Number.parseInt(messagesRaw, 10);
         if (firstUser !== undefined && (!Number.isFinite(firstUser) || firstUser < 0 || firstUser > 20)) {

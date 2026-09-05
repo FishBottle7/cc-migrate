@@ -336,7 +336,14 @@ async function main(argv: string[]) {
         process.exit(1);
       }
       const adapter = resolveAdapter(registry, a);
-      const ir = await readSource(registry, a, b, flags.root ?? flags.srcRoot);
+      let ir;
+      try {
+        ir = await readSource(registry, a, b, flags.root ?? flags.srcRoot);
+      } catch (e) {
+        // --json 面向 agent：失败也保持一行 error（不吐 stack，省上下文）
+        console.error(`error: ${e instanceof Error ? e.message : String(e)}`);
+        process.exit(1);
+      }
       if (flags.json) {
         // 上下文安全的决策摘要（≈1-2KB）：计数 + ≤200 字摘录，绝不输出全文。
         const digest = summarizeIr(ir, {
