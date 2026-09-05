@@ -35,3 +35,6 @@ apps/desktop-app/release/
 # 插件包内的通用 skill 副本 —— build 期由 scripts/sync-universal-skill.mjs
 # 从 packages/cli/skills/cc-migrate/SKILL.md 强制同步（单一事实源在独立 CLI）
 apps/dsh-plugin/skills/universal/
+
+# CLI tsdown bundle（bin 的自包含产物，与 dist/lib 同类 —— 由 pnpm --filter @cc-migrate/cli run build 生成）
+packages/cli/bundle/

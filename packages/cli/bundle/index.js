@@ -11031,7 +11031,13 @@ async function main(argv) {
 				process.exit(1);
 			}
 			const adapter = resolveAdapter(registry, a);
-			const ir = await readSource(registry, a, b, flags.root ?? flags.srcRoot);
+			let ir;
+			try {
+				ir = await readSource(registry, a, b, flags.root ?? flags.srcRoot);
+			} catch (e) {
+				console.error(`error: ${e instanceof Error ? e.message : String(e)}`);
+				process.exit(1);
+			}
 			if (flags.json) {
 				const digest = summarizeIr(ir, { ...flags.messages !== void 0 ? { firstUserMessages: flags.messages } : {} });
 				console.log(JSON.stringify(digest, null, 2));
