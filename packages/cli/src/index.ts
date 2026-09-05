@@ -4,7 +4,7 @@
  *
  * Usage:
  *   cc-migrate tools
- *   cc-migrate list <tool> [--root <dir>] [--cwd <dir>] [--limit N] [--json]
+ *   cc-migrate list <tool> [--root <dir>] [--cwd <dir>] [--search <kw|id>] [--since <7d|ISO>] [--before <...>] [--limit N] [--json]
  *   cc-migrate preview <tool> <sessionId> [--root <dir>] [--json] [--messages K] [--lines N] [--full]
  *   cc-migrate migrate <srcTool> <srcSessionId> <dstTool>
  *                    [--src-root <dir>] [--dst-root <dir>] [--target-cwd <path>]
@@ -12,6 +12,8 @@
  *   cc-migrate skill install [--agent <id,id>|--all] [--dir <path>] [--json]
  *   cc-migrate skill status [--json]
  *   cc-migrate skill path
+ *   cc-migrate log list [--limit N] [--json]
+ *   cc-migrate log check <srcTool> <srcSessionId> [--json]   # 「迁过了吗」（迁移日志）
  *   cc-migrate wizard [--src-root <dir>] [--dst-root <dir>]  # interactive
  *   cc-migrate reconcile dsh [--root <dir>]  # fix workspace.json registration
  *   cc-migrate verify dsh [--root <dir>] [sessionId]  # validate artifacts
@@ -40,7 +42,11 @@ import {
   listSessions,
   fallbackIr,
   summarizeIr,
+  appendMigrationLog,
+  findMigrationsBySource,
+  readMigrationLog,
 } from '@cc-migrate/core';
+import type { MigrationRecord } from '@cc-migrate/core';
 
 interface Flags {
   srcRoot?: string;
@@ -50,8 +56,14 @@ interface Flags {
   flatten?: boolean;
   keepSynthetic?: boolean;
   systemPromptSource?: 'source' | 'target';
-  /** list: 只看这个项目（cwd 归一化后匹配；无 cwd 信息的会话被排除） */
+  /** list: 只看这个项目（「同一项目」= cwd 归一化后相等或互为祖先/后代） */
   cwd?: string;
+  /** list: 标题子串或 sessionId 片段（大小写不敏感）——「找那个调 413 的会话」 */
+  search?: string;
+  /** list: 只看该时间之后的会话（7d/12h/2w 或 ISO 日期） */
+  since?: number;
+  /** list: 只看该时间之前的会话（同 --since 表达式） */
+  before?: number;
   /** list: 最多显示 N 条（createdAt 降序；0 = 不限；缺省 50） */
   limit?: number;
   /** list/migrate/preview/skill: 机器可读 JSON 输出 */
@@ -74,6 +86,40 @@ const CASE_INSENSITIVE_PATHS = process.platform === 'win32' || process.platform 
 function normPath(p: string): string {
   const unified = p.replace(/\\/g, '/').replace(/\/+$/, '');
   return CASE_INSENSITIVE_PATHS ? unified.toLowerCase() : unified;
+}
+
+/**
+ * 「同一项目」判定：归一化后相等，或互为祖先/后代（带路径边界，防
+ * D:\demo 误命中 D:\demoX）。用户在子目录里问，能命中挂在仓库根的会话；
+ * 用户在仓库根问，也能命中跑在子目录里的会话。
+ */
+function sameProject(sessionCwd: string, queryCwd: string): boolean {
+  const a = normPath(sessionCwd);
+  const b = normPath(queryCwd);
+  return a === b || a.startsWith(b + '/') || b.startsWith(a + '/');
+}
+
+/** --search：标题子串或 sessionId 片段（含尾 8 位这类形态），大小写不敏感。 */
+function matchSearch(meta: SessionMeta, query: string): boolean {
+  const q = query.toLowerCase();
+  return (meta.title !== undefined && meta.title.toLowerCase().includes(q)) || meta.sessionId.toLowerCase().includes(q);
+}
+
+/**
+ * --since/--before 时间表达式：相对（12h / 7d / 2w）或 ISO 日期时间
+ * （2026-08-01、完整 ISO 均可）。返回 epoch ms；非法表达式报错退出。
+ */
+function parseTimeExpr(raw: string, flag: string): number {
+  const rel = /^(\d+)(h|d|w)$/i.exec(raw);
+  if (rel) {
+    const n = Number.parseInt(rel[1], 10);
+    const unitMs = { h: 3_600_000, d: 86_400_000, w: 604_800_000 }[rel[2].toLowerCase() as 'h' | 'd' | 'w'];
+    return Date.now() - n * unitMs;
+  }
+  const abs = Date.parse(raw);
+  if (Number.isFinite(abs)) return abs;
+  console.error(`${flag} expects a relative time (12h / 7d / 2w) or an ISO date (2026-08-01), got "${raw}"`);
+  process.exit(1);
 }
 
 /** list 输出的标题体量上限：压平空白 + 截断（上下文预算：50 条 × ≤120 字符标题）。 */
@@ -99,6 +145,9 @@ function parseFlags(argv: string[]): { flags: Flags; positionals: string[] } {
     else if (tok === '--dst-root') f.dstRoot = value('dst-root');
     else if (tok === '--target-cwd') f.targetCwd = value('target-cwd');
     else if (tok === '--cwd') f.cwd = value('cwd');
+    else if (tok === '--search') f.search = value('search');
+    else if (tok === '--since') f.since = parseTimeExpr(value('since') ?? '', '--since');
+    else if (tok === '--before') f.before = parseTimeExpr(value('before') ?? '', '--before');
     else if (tok === '--agent') f.agent = value('agent');
     else if (tok === '--dir') f.dir = value('dir');
     else if (tok === '--limit') {
@@ -307,10 +356,10 @@ async function main(argv: string[]) {
       }
       const adapter = resolveAdapter(registry, a);
       let metas = await listSessions(adapter, flags.root ?? flags.srcRoot);
-      if (flags.cwd) {
-        const needle = normPath(flags.cwd);
-        metas = metas.filter((m) => m.cwd !== undefined && normPath(m.cwd) === needle);
-      }
+      if (flags.search) metas = metas.filter((m) => matchSearch(m, flags.search as string));
+      if (flags.cwd) metas = metas.filter((m) => m.cwd !== undefined && sameProject(m.cwd, flags.cwd as string));
+      if (flags.since !== undefined) metas = metas.filter((m) => (m.createdAt ?? 0) >= flags.since!);
+      if (flags.before !== undefined) metas = metas.filter((m) => (m.createdAt ?? 0) < flags.before!);
       metas = [...metas].sort((x, y) => (y.createdAt ?? 0) - (x.createdAt ?? 0));
       // 上下文体量预算：默认 50 条封顶（--limit 0 解除），标题统一 ≤120 字符
       const total = metas.length;
@@ -318,7 +367,7 @@ async function main(argv: string[]) {
       if (limit > 0) metas = metas.slice(0, limit);
       const capped = metas.map((m) => ({ ...m, ...(m.title !== undefined ? { title: capTitle(m.title) } : {}) }));
       if (flags.json) {
-        console.log(JSON.stringify(capped, null, 2));
+        console.log(JSON.stringify({ ok: true, tool: a, count: capped.length, total, sessions: capped }, null, 2));
         return;
       }
       for (const m of capped) {
@@ -326,7 +375,7 @@ async function main(argv: string[]) {
         console.log(`${archived}${m.sessionId}\t${m.title ?? ''}\t${m.createdAt ? new Date(m.createdAt).toISOString() : ''}\t${m.sourcePath ?? ''}`);
       }
       if (limit > 0 && total > metas.length) {
-        console.error(`[list] 共 ${total} 条，已按默认上限显示 ${metas.length} 条 —— 用 --cwd 缩小范围或 --limit 0 看全部`);
+        console.error(`[list] 共 ${total} 条命中，已按默认上限显示 ${metas.length} 条 —— 收紧 --search/--cwd/--since 或 --limit 0 看全部`);
       }
       return;
     }
@@ -388,6 +437,9 @@ async function main(argv: string[]) {
         console.error('usage: cc-migrate migrate <srcTool> <srcSessionId> <dstTool> [--json]');
         process.exit(1);
       }
+      // 「迁移过了吗」：查迁移日志（不阻止重复迁移 —— 读旧写新、恒 mint 新 id，
+      // 重复是安全的；只把事实摆给 agent/用户）。
+      const alreadyMigrated = await findMigrationsBySource(a, b);
       const ir = await readSource(registry, a, b, flags.root ?? flags.srcRoot);
       const adapter = resolveAdapter(registry, c);
       const disambiguateTitle = a === 'dsh' && c === 'dsh';
@@ -399,13 +451,60 @@ async function main(argv: string[]) {
         ...(flags.systemPromptSource ? { systemPromptSource: flags.systemPromptSource } : {}),
         ...(disambiguateTitle ? { disambiguateTitle: true } : {}),
       });
+      const logged = await appendMigrationLog({
+        ts: Date.now(),
+        via: 'cli',
+        source: { tool: a as never, sessionId: b, ...(ir.title ? { title: ir.title } : {}), ...(ir.cwd ? { cwd: ir.cwd } : {}) },
+        target: { tool: c as never, sessionId: res.sessionId, paths: res.paths },
+      });
+      if (!logged.ok) console.error(`[log] migration log write failed (${logged.error}) — migration itself succeeded`);
       if (flags.json) {
-        console.log(JSON.stringify(res, null, 2));
+        // 信封与命令层/插件 CLI 的 ImportResult 同形：{ok, source, target, alreadyMigrated}
+        console.log(JSON.stringify({ ok: true, source: { tool: a, sessionId: b }, target: res, alreadyMigrated }, null, 2));
         return;
       }
+      if (alreadyMigrated.length > 0) {
+        console.error(`[migrate] 此源会话此前已迁移过 ${alreadyMigrated.length} 次（见下）—— 本次再写一个全新副本（安全，不覆盖）`);
+        for (const r of alreadyMigrated) console.error(`  -> ${r.target.tool}:${r.target.sessionId} @ ${new Date(r.ts).toISOString()} (via ${r.via})`);
+      }
+      if (!logged.ok) console.error('[migrate] 注意：迁移日志写入失败，本次迁移不会出现在 log check 里');
       console.log(`migrated ${a}:${b} -> ${c}:${res.sessionId}`);
       for (const p of res.paths) console.log(`  ${p}`);
       return;
+    }
+    case 'log': {
+      // 迁移日志查询（~/.cc-migrate/migrations.jsonl；CC_MIGRATE_LOG 覆盖/off）
+      if (a === 'list') {
+        const records = await readMigrationLog();
+        records.sort((x, y) => y.ts - x.ts);
+        const limit = flags.limit === undefined ? 20 : flags.limit;
+        const rows = limit > 0 ? records.slice(0, limit) : records;
+        if (flags.json) {
+          console.log(JSON.stringify({ ok: true, count: rows.length, total: records.length, records: rows }, null, 2));
+          return;
+        }
+        for (const r of rows) {
+          console.log(`${new Date(r.ts).toISOString()}\t${r.source.tool}:${r.source.sessionId} -> ${r.target.tool}:${r.target.sessionId}\t(via ${r.via})`);
+        }
+        if (limit > 0 && records.length > rows.length) console.error(`[log] 共 ${records.length} 条，已显示最近 ${rows.length} 条 —— --limit 0 看全部`);
+        return;
+      }
+      if (a === 'check' && b && c) {
+        const records = await findMigrationsBySource(b, c);
+        if (flags.json) {
+          console.log(JSON.stringify({ ok: true, migrated: records.length > 0, source: { tool: b, sessionId: c }, records }, null, 2));
+          return;
+        }
+        if (records.length === 0) {
+          console.log(`not migrated: ${b}:${c}（迁移日志无记录；桌面 App 迁移暂不进日志）`);
+          return;
+        }
+        console.log(`migrated ${records.length} time(s):`);
+        for (const r of records) console.log(`  -> ${r.target.tool}:${r.target.sessionId} @ ${new Date(r.ts).toISOString()} (via ${r.via})`);
+        return;
+      }
+      console.error('usage: cc-migrate log <list|check> [--json]\n  log list [--limit N]                 # 最近迁移记录\n  log check <srcTool> <srcSessionId>   # 「这条迁过了吗」（--json 看 migrated 字段）');
+      process.exit(1);
     }
     case 'reconcile': {
       if (a === 'dsh' || !a) {

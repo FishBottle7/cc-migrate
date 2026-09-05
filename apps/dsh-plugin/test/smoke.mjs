@@ -29,6 +29,11 @@ const plugin = await import('../lib/index.js');
 const core = await import('@cc-migrate/core');
 const { apply, COMMAND_NAMES } = plugin;
 
+// 迁移日志隔离：importSession 成功后向迁移日志追加一行 —— 冒烟指到临时文件，
+// 绝不碰真实 ~/.cc-migrate/migrations.jsonl（migrationLogPath 每次调用现读 env）。
+const migrationLogPath = join(await mkdtemp(join(tmpdir(), 'cc-smoke-log-')), 'migrations.jsonl');
+process.env.CC_MIGRATE_LOG = migrationLogPath;
+
 /** 复刻 dsh-commands 的 normalizeDefinition 校验（宽松 mock 会让真实契约
  *  违例静默漏网——见头注）。 */
 const COMMAND_NAME = /^[a-z][a-z0-9_-]*$/u;
@@ -132,9 +137,21 @@ console.log(`    wrote: ${importedPath}`);
 const importRes2 = await invoke(importCmd, 'claude', srcSessionId, '--src-root', srcRoot, '--cwd', 'D:\\demo\\proj', '--root', dstRoot);
 assert.equal(importRes2.kind, 'success', `second import failed: ${importRes2.text}`);
 assert.notEqual(importRes2.text, importRes.text, 'import always mints a new session id (summary differs)');
+// 二次 import 的 summary 带迁移日志查重提示（alreadyMigrated -> 已迁移过 1 次）
+assert.ok(importRes2.text.includes('已迁移过 1 次'), 'second import summary carries the migration-log dedup note');
 const firstStillThere = await stat(importedPath);
 assert.ok(firstStillThere.size > 0, 'first imported session untouched after second import');
-console.log(`[4b] second import minted a new id; first file intact`);
+console.log(`[4b] second import minted a new id; first file intact; dedup note surfaced`);
+
+// ── 4c. 迁移日志（via=dsh-plugin 命令层路径）──────────────────────────
+const logRaw = await readFile(migrationLogPath, 'utf8');
+const logRows = logRaw.trim().split('\n').map((l) => JSON.parse(l));
+assert.equal(logRows.length, 2, `one append per successful import (got ${logRows.length})`);
+assert.ok(logRows.every((r) => r.via === 'dsh-plugin'), 'command-layer records stamped via=dsh-plugin');
+assert.ok(logRows.every((r) => r.source.tool === 'claude' && r.source.sessionId === srcSessionId), 'records keyed by source');
+assert.ok(logRows.every((r) => r.target.tool === 'dsh' && r.target.paths.length >= 1), 'records carry dsh target + paths');
+assert.ok(logRows.every((r) => typeof r.ts === 'number' && r.ts > 0), 'records timestamped');
+console.log('[4c] migration log: 2 append-only rows, via=dsh-plugin, source/target/ts complete');
 
 // ── 5. structured errors instead of thrown exceptions ────────────────
 const badTool = await invoke(listCmd, 'not-a-tool');

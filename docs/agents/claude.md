@@ -118,6 +118,12 @@ parentUuid → logicalParentUuid? → isSidechain → teamName? → agentName? �
 | `interruptedMessageId` | 打断消息所指向的 assistant message.id |
 | `toolDenialKind` | `"user-rejected"` 等 |
 | `isVisibleInTranscriptOnly` | 只在 transcript 视图显示 |
+
+**agent-authored user 行定性（2026-09-05 真机裁定，迁移读端分类）**：有一类 user 行**不是人话**——
+- **打断标记**：正文为 `[Request interrupted by user]` / `[Request interrupted by user for tool use]`（真机 57 行实测**全部 isMeta 缺失**、`userType` ant/external 皆有——不能靠 isMeta/userType 区分）；常与后续内容**同行混装**（打断标记 + teammate 信封，或打断标记 + 真人新输入，如 `["[Request interrupted by user for tool use]\n", "这个subagent已经完成切片了啊…"]`）。
+- **跨代理消息信封**：`Another Claude session sent a message:\n<teammate-message …>`（队友/子代理之间的对话投递）。
+- **子代理转写（`isSidechain:true`）的全部非 tool_result user 行**：spawn prompt（Task 工具的 prompt 参数，纯文本无任何标记）、teammate-message、system-reminder——真人无法在子代理转写里发言。
+- 迁移定性：这些行/块 → IR `synthetic:true`（模型上下文红线照旧：内容零丢弃、claude 写端映回 isMeta 行重放进上下文）；**混装行按连续同源段拆成多条 IR 消息**（agent run → 注入，human run → 人话），DSH 写端把 agent run 映为 `source:{kind:'plugin'}` 注入行——它们不构成 turn 边界（打断不再把 DSH 会话骨架切碎），spawn prompt 也不再在子代理会话里显示成人话气泡。
 | `isCompactSummary` | **压缩摘要载体标记**（§4） |
 | `summarizeMetadata` | partial compact：`{messagesSummarized, userContext?, direction?}` |
 | `sourceToolUseID` | 少见（实测 3 条） |

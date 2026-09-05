@@ -42,14 +42,22 @@ cc-migrate <command> [args] [flags]
 ## 工作流
 
 1. **确认方向**：源工具 + 目标工具（用户没说就问一句；「搬进 X」= 迁移到 X）。
-2. **找会话**：`cc-migrate list <srcTool> --limit 20 --json [--cwd <用户项目目录>]`。
+2. **找会话**：`cc-migrate list <srcTool> --limit 20 --json` 再按需收紧过滤
+   （`--search <关键词|id片段>` 标题子串/id 片段大小写不敏感；`--since 7d`、
+   `--since 2026-08-01` 时间窗；`--cwd <项目目录>` ——「同一项目」语义：cwd
+   相等或互为祖先/后代，用户在子目录里问也能命中挂在仓库根的会话）。
    每条含 `sessionId / title / createdAt / cwd / sourcePath`（标题是各工具原生
    标题，claude 无标题时回退到最近/第一条用户 prompt；可能缺失或超长）。
-   用户想找「某项目里聊的」就传 `--cwd`（归一化匹配）。
+   多个过滤可叠加：`list claude --search 413 --since 30d --json`。
 3. **确认内容**：`cc-migrate preview <srcTool> <sessionId> --json` —— 用
    `stats`（消息/轮次/工具调用数、textChars 体量）和 `firstUserMessages` 摘录
    判断是不是目标会话；多候选时列摘要让用户挑。
 4. **迁移**：`cc-migrate migrate <srcTool> <sessionId> <dstTool> [--target-cwd <dir>] --json`
+   - migrate 前会自动查**迁移日志**（本机 `~/.cc-migrate/migrations.jsonl`，只追加）：
+     该源会话迁过的话，stderr 会提示此前的目标会话（`--json` 在 `alreadyMigrated`
+     字段）。这只是事实提示，**不阻止**再次迁移（重复迁移安全，恒写新副本）。
+   - 用户问「这条迁过了吗」：`log check <srcTool> <sessionId> --json` 看 `migrated`
+     字段；`log list` 回顾最近迁移（默认 20 条）。
    - `--target-cwd` 是新会话的工作目录，默认沿用源会话 cwd。
    - 成功输出新 session id 与写入文件路径。汇报：源标题 → 新 id，提示到目标工具
      resume（迁移复现对话历史，不重放之前的文件/shell 副作用）。
@@ -59,12 +67,15 @@ cc-migrate <command> [args] [flags]
 
 ```
 tools                                        # 支持的工具 id
-list <tool> [--root <dir>] [--cwd <dir>] [--limit N] [--json]   # 新到旧；N=0 不限
+list <tool> [--root <dir>] [--cwd <dir>] [--search <kw|id>] [--since <7d|ISO>] [--before <...>] [--limit N] [--json]
+                                             # 新到旧；默认 50 条封顶；--search 命中标题或 id 片段
 preview <tool> <sessionId> [--json] [--messages K] [--lines N] [--full]
 migrate <srcTool> <sessionId> <dstTool> [--src-root <dir>] [--dst-root <dir>]
         [--target-cwd <path>] [--flatten|--no-flatten] [--keep-runtime-context] [--json]
 verify dsh [--root <dir>] [sessionId]        # 校验迁移产物（仅 dsh 目标）
 reconcile dsh [--root <dir>]                 # 修复 dsh workspace.json 登记（仅 dsh 目标）
+log check <srcTool> <sessionId> [--json]     # 「这条迁过了吗」——迁移日志查重
+log list [--limit N] [--json]                # 最近迁移记录（默认 20 条，新到旧）
 skill install [--agent <id,id>|--all] [--dir <path>] [--json]   # 把本 skill 装进其他 agent 框架
 skill status [--json]                        # 查看各框架 skill 安装状态
 ```

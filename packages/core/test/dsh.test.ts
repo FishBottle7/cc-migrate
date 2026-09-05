@@ -759,6 +759,15 @@ test('listSessions: title from projcache, log-scan fallback, archived flag, _no-
   // session C: cwd-less (_no-cwd project dir)
   const irC = { schemaVersion: 2 as const, originTool: 'dsh' as const, messages: [{ role: 'user' as const, content: [{ type: 'text' as const, text: 'c' }] }] };
   await adapter.write(irC as never, { root, sessionId: 'sess-c', targetCwd: '' });
+  // session D: no title anywhere; first user row is harness-injected runtime
+  // context (the host stamps it kind:'user' — 真机样本 52be3474), the second is
+  // the real human prompt. The list-side first-prompt fallback must skip the
+  // injected row and surface the real one.
+  const irD = { schemaVersion: 2 as const, originTool: 'dsh' as const, messages: [
+    { role: 'user' as const, content: [{ type: 'text' as const, text: '<permissions instructions> Filesystem sandboxing defines which files can be read or written.' }] },
+    { role: 'user' as const, content: [{ type: 'text' as const, text: '真实的用户提示应该成为展示标题' }] },
+  ] };
+  await adapter.write(irD as never, { root, sessionId: 'sess-d', targetCwd: 'D:\\proj' });
   await fs.writeFile(
     join(storages, 'session_projcache.json'),
     JSON.stringify({ unit: { name: 'session_projcache', version: 3 }, global: null, tables: { sessions: { 'sess-b': { rows: { title: { ver: 1, seq: 1, val: 'Cached Title' } } } } } }),
@@ -777,6 +786,8 @@ test('listSessions: title from projcache, log-scan fallback, archived flag, _no-
   assert.ok(byId.has('sess-c'), '_no-cwd sessions are listed');
   assert.equal(byId.get('sess-c')?.cwd, undefined, '_no-cwd has no cwd hint');
   assert.equal(byId.get('sess-a')?.cwd, 'D:\\proj', 'cwd is the real header value, not the project-key skeleton');
+  assert.equal(byId.get('sess-c')?.title, 'c', 'untitled session falls back to the first human user message');
+  assert.equal(byId.get('sess-d')?.title, '真实的用户提示应该成为展示标题', 'first-prompt fallback skips injected runtime-context rows');
 });
 
 test('readDshAttachment resolves content-addressed bytes (sha256: ref and bare hex)', async () => {
@@ -860,6 +871,168 @@ test('dsh->dsh native turn/start + step/start are not duplicated by the skeleton
   const stepIdx = written.findIndex((e) => e.type === 'step/start');
   const ai = written.findIndex((e) => e.type === 'assistant/message');
   assert.ok(turnIdx < stepIdx && stepIdx < ai, 'native order preserved');
+});
+
+test('foreign IR gets the full turn/step lifecycle (per-prompt turns, per-assistant steps, closed ends)', async () => {
+  // DSH GUI 把同一 (turn,step) 的所有 assistant/message 折叠为一个节点且整块
+  // 替换——「全部钉在 1:1」会让整场会话只剩最后一条 assistant（真机事故：
+  // agent 文本/thinking 全部不可见）。外来 IR 必须合成 native 同款生命周期：
+  // 人话开新 turn、每条 assistant 独占 step、step/end+turn/end 成对闭合。
+  const adapter = new DshAdapter();
+  const root = await tempRoot();
+  const ir = {
+    schemaVersion: 2 as const,
+    originTool: 'claude' as const,
+    createdAt: 1000,
+    messages: [
+      { role: 'user' as const, timestamp: 1000, content: [{ type: 'text' as const, text: 'q1' }] },
+      { role: 'assistant' as const, timestamp: 1001, content: [{ type: 'thinking' as const, thinking: 'hmm' }, { type: 'text' as const, text: 'a1' }] },
+      // 同一 turn 内的第二条 assistant：必须拿到自己的 step（否则客户端整块替换）
+      { role: 'assistant' as const, timestamp: 1002, content: [{ type: 'text' as const, text: 'a1-followup' }] },
+      { role: 'user' as const, timestamp: 1003, content: [{ type: 'text' as const, text: 'q2' }] },
+      { role: 'assistant' as const, timestamp: 1004, content: [{ type: 'text' as const, text: 'a2' }] },
+    ],
+  };
+  const res = await adapter.write(ir as never, { root, sessionId: 'skel-life', targetCwd: 'D:\\proj' });
+  const rows = decompressSessionBuffer(await fs.readFile(res.paths[0]!)).split('\n').filter((l) => l.trim()).slice(1).map((l) => JSON.parse(l)) as Array<{ type: string; data: Record<string, unknown> }>;
+  const seqOf = (pred: (r: { type: string; data: Record<string, unknown> }) => boolean) => rows.findIndex(pred);
+  const turnStarts = rows.filter((r) => r.type === 'turn/start');
+  const stepStarts = rows.filter((r) => r.type === 'step/start');
+  const stepEnds = rows.filter((r) => r.type === 'step/end');
+  const turnEnds = rows.filter((r) => r.type === 'turn/end');
+  assert.deepEqual(turnStarts.map((r) => r.data.turn), [1, 2], 'two turns open, one per human prompt');
+  // turn 1: assistant#1 in step 1, assistant#2 in step 2; turn 2: assistant#3 in step 1
+  assert.deepEqual(stepStarts.map((r) => `${r.data.turn}:${r.data.step}`), ['1:1', '1:2', '2:1']);
+  assert.deepEqual(stepEnds.map((r) => `${r.data.turn}:${r.data.step}`), ['1:1', '1:2', '2:1'], 'every step closes');
+  assert.deepEqual(turnEnds.map((r) => r.data.turn), [1, 2], 'every turn closes');
+  assert.deepEqual(turnEnds.map((r) => (r.data.reason as { kind: string }).kind), ['completed', 'completed']);
+  // ordering: turn/end(1) then turn/start(2) then the second human message
+  const t1end = seqOf((r) => r.type === 'turn/end' && r.data.turn === 1);
+  const t2start = seqOf((r) => r.type === 'turn/start' && r.data.turn === 2);
+  const q2 = seqOf((r) => r.type === 'user/message' && (r.data.content as Array<{ text?: string }>)[0]?.text === 'q2');
+  assert.ok(t1end < t2start && t2start < q2, 'turn 1 closes before turn 2 opens before its prompt');
+  // every assistant/message carries explicit matching turn/step
+  const assts = rows.filter((r) => r.type === 'assistant/message');
+  assert.equal(assts.length, 3);
+  assert.deepEqual(assts.map((r) => `${r.data.turn}:${r.data.step}`), ['1:1', '1:2', '2:1']);
+  // tool/call rows must also carry the coordinates (skeleton pass restamps them)
+  rows.forEach((r) => { if (r.type === 'tool/call') assert.ok(typeof r.data.turn === 'number' && typeof r.data.step === 'number'); });
+  // 物理契约仍要全绿
+  const verdict = verifySessionLog(decompressSessionBuffer(await fs.readFile(res.paths[0]!)), 'skel-life', res.paths[0]!);
+  assert.ok(verdict.ok, `written lifecycle passes verifySessionLog: ${JSON.stringify(verdict.issues).slice(0, 300)}`);
+});
+
+test('harness injections (interrupt markers / teammate chatter) never close a turn', async () => {
+  // 2026-09-05 裁定：claude 打断标记、teammate 消息、子代理 spawn prompt 都是
+  // agent-authored 注入（parse 端 synthetic），不是人话——不构成 turn 边界。
+  // 写端按 source.kind 分流：注入行落 plugin source、留在当前 turn。
+  const adapter = new DshAdapter();
+  const root = await tempRoot();
+  const ir = {
+    schemaVersion: 2 as const,
+    originTool: 'claude' as const,
+    createdAt: 1000,
+    messages: [
+      { role: 'user' as const, timestamp: 1000, content: [{ type: 'text' as const, text: 'q1' }] },
+      { role: 'assistant' as const, timestamp: 1001, content: [{ type: 'text' as const, text: 'working' }] },
+      { role: 'user' as const, synthetic: true, timestamp: 1002, content: [{ type: 'text' as const, text: '[Request interrupted by user]' }] },
+      { role: 'assistant' as const, timestamp: 1003, content: [{ type: 'text' as const, text: 'resuming' }] },
+    ],
+  };
+  const res = await adapter.write(ir as never, { root, sessionId: 'skel-interrupt', targetCwd: 'D:\\proj' });
+  const rows = decompressSessionBuffer(await fs.readFile(res.paths[0]!)).split('\n').filter((l) => l.trim()).slice(1).map((l) => JSON.parse(l)) as Array<{ type: string; data: Record<string, unknown> }>;
+  const turns = rows.filter((r) => r.type === 'turn/start');
+  assert.equal(turns.length, 1, 'interrupt injection does not split the turn');
+  const interruptRow = rows.find((r) => r.type === 'user/message' && (r.data.content as Array<{ text?: string }>)[0]?.text === '[Request interrupted by user]');
+  assert.deepEqual((interruptRow?.data.source as Record<string, unknown>).plugin, 'external-harness', 'interrupt rides a plugin-source injection row');
+  const assts = rows.filter((r) => r.type === 'assistant/message');
+  assert.deepEqual(assts.map((r) => `${r.data.turn}:${r.data.step}`), ['1:1', '1:2'], 'both assistant bursts live in turn 1, own steps');
+});
+
+test('consecutive claude assistant records of one response merge into a single assistant/message', async () => {
+  // claude 流式转写把一次响应拆成共享 message.id 的多条记录；DSH 的 per-step
+  // 折叠语义要求一次响应 = 一条 assistant/message（否则同 step 内整块替换）。
+  const adapter = new DshAdapter();
+  const root = await tempRoot();
+  const claudeMeta = (id: string) => ({ claude: { message: { id, model: 'claude-sonnet-4-5' } } });
+  const ir = {
+    schemaVersion: 2 as const,
+    originTool: 'claude' as const,
+    createdAt: 1000,
+    messages: [
+      { role: 'user' as const, timestamp: 1000, content: [{ type: 'text' as const, text: 'run it' }] },
+      { role: 'assistant' as const, timestamp: 1001, meta: claudeMeta('resp-X'), content: [{ type: 'thinking' as const, thinking: 'let me check' }] },
+      { role: 'assistant' as const, timestamp: 1002, meta: claudeMeta('resp-X'), content: [{ type: 'text' as const, text: 'running now' }] },
+      { role: 'assistant' as const, timestamp: 1003, meta: claudeMeta('resp-X'), content: [{ type: 'tool_use' as const, id: 'toolu-1', name: 'Bash', input: { command: 'ls' } }] },
+      { role: 'user' as const, timestamp: 1004, content: [{ type: 'tool_result' as const, toolUseId: 'toolu-1', content: 'file.ts', isError: false }] },
+      // 不同响应 id：不合并，落在自己的 step
+      { role: 'assistant' as const, timestamp: 1005, meta: claudeMeta('resp-Y'), content: [{ type: 'text' as const, text: 'done' }] },
+    ],
+  };
+  const res = await adapter.write(ir as never, { root, sessionId: 'skel-merge', targetCwd: 'D:\\proj' });
+  const rows = decompressSessionBuffer(await fs.readFile(res.paths[0]!)).split('\n').filter((l) => l.trim()).slice(1).map((l) => JSON.parse(l)) as Array<{ type: string; data: Record<string, unknown> }>;
+  const assts = rows.filter((r) => r.type === 'assistant/message');
+  assert.equal(assts.length, 2, 'one assistant/message per response id (X merged, Y separate)');
+  const msg0 = assts[0].data.message as Record<string, unknown>;
+  const merged = msg0.content as Array<Record<string, unknown>>;
+  assert.deepEqual(merged.map((b) => b.type), ['reasoning', 'text', 'tool-call'], 'X blocks ride together in source order');
+  const src0 = msg0.source as Record<string, unknown>;
+  assert.equal(src0.model, 'claude-sonnet-4-5', 'real claude model lifted into source');
+  assert.equal(src0.provider, 'claude');
+  // X 一步发完，Y 在下一个 step；tool/call 与 result 配对仍在 X 的 step 内
+  const calls = rows.filter((r) => r.type === 'tool/call');
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].data.turn, assts[0].data.turn);
+  assert.equal(calls[0].data.step, assts[0].data.step, 'tool/call rides the merged message step');
+  assert.equal(assts[1].data.step, (assts[0].data.step as number) + 1, 'separate response id gets the next step');
+  const results = rows.filter((r) => r.type === 'tool/result');
+  assert.equal(results.length, 1);
+  assert.equal(results[0].data.step, assts[0].data.step, 'tool/result pairs inside the same step');
+});
+
+test('foreign sidechain child log opens with a valid subagent/descriptor (DSH listing corrupt gate)', async () => {
+  // DSH 子代理列表对折叠不出 identity 的子日志返回 reason "corrupt"
+  // （「会话记录损坏」）；identity 只能由 subagent/descriptor 事件建立，
+  // 外来子会话必须自带一条合法身份行（v2 / one-shot / provider / label）。
+  const adapter = new DshAdapter();
+  const root = await tempRoot();
+  const ir = {
+    schemaVersion: 2 as const,
+    originTool: 'claude' as const,
+    createdAt: 1000,
+    messages: [{ role: 'user' as const, timestamp: 1000, content: [{ type: 'text' as const, text: 'main' }] }],
+    sidechains: [{
+      agentId: 'agent-abc',
+      kind: 'subagent' as const,
+      agentType: 'general-purpose',
+      title: 'research subtask',
+      messages: [
+        { role: 'user' as const, timestamp: 1001, content: [{ type: 'text' as const, text: 'child prompt' }] },
+        { role: 'assistant' as const, timestamp: 1002, content: [{ type: 'text' as const, text: 'child answer' }] },
+      ],
+    }],
+  };
+  const res = await adapter.write(ir as never, { root, sessionId: 'desc-parent', targetCwd: 'D:\\proj' });
+  assert.equal(res.paths.length, 2, 'main + child');
+  const plain = decompressSessionBuffer(await fs.readFile(res.paths[1]!));
+  const rows = plain.split('\n').filter((l) => l.trim()).slice(1).map((l) => JSON.parse(l)) as Array<{ type: string; seq: number; data: Record<string, unknown> }>;
+  const desc = rows.find((r) => r.type === 'subagent/descriptor');
+  assert.ok(desc, 'descriptor event present');
+  assert.equal(desc!.seq, 0, 'descriptor is the first event of the child log');
+  assert.deepEqual(desc!.data, { version: 2, mode: 'one-shot', provider: 'migrated', label: 'research subtask' });
+  // 身份行可被 DSH 的 identity 契约折叠出非 null（mode/label 合法）
+  assert.equal((desc!.data as { mode?: string }).mode, 'one-shot');
+  assert.equal(typeof (desc!.data as { label?: string }).label, 'string');
+  // 子日志其余契约不破
+  const verdict = verifySessionLog(plain, 'agent-abc', res.paths[1]!);
+  assert.ok(verdict.ok, `child log passes verifySessionLog: ${JSON.stringify(verdict.issues).slice(0, 300)}`);
+  // dsh→dsh 子会话自带 descriptor：重写绝不追加第二条
+  const back = await adapter.parse('desc-parent', root);
+  assert.equal(back.sidechains?.length, 1);
+  const res2 = await adapter.write(back, { root, sessionId: 'desc-parent-2', targetCwd: 'D:\\proj' });
+  const child2 = res2.paths[1]!;
+  const rows2 = decompressSessionBuffer(await fs.readFile(child2)).split('\n').filter((l) => l.trim()).slice(1).map((l) => JSON.parse(l)) as Array<{ type: string }>;
+  assert.equal(rows2.filter((r) => r.type === 'subagent/descriptor').length, 1, 'exactly one descriptor survives a dsh->dsh child rewrite');
 });
 
 test('write drops foreign unmapped events (unknown types make DSH refuse the whole log)', async () => {

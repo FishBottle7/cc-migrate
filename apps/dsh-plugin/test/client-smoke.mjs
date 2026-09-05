@@ -316,6 +316,11 @@ console.log('[A9] auto-jump: open-with-retry rides the list refresh, exhausts to
 
 /* ══════════════ B. 宿主半 fenced 路由（src/routes.ts） ══════════════ */
 
+
+// 迁移日志隔离：命令层数据通道会写 ~/.cc-migrate/migrations.jsonl —— 冒烟指到
+// 临时文件，绝不碰真实日志（migrationLogPath 每次调用现读 env，晚设也生效）。
+process.env.CC_MIGRATE_LOG = join(await mkdtemp(join(tmpdir(), 'cc-log-iso-')), 'migrations.jsonl');
+
 const routes = await import('../lib/routes.js');
 const core = await import('@cc-migrate/core');
 

@@ -29,6 +29,11 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 
 // lib 构建（test script 先跑过 build）。
+
+// 迁移日志隔离：命令层数据通道会写 ~/.cc-migrate/migrations.jsonl —— 冒烟指到
+// 临时文件，绝不碰真实日志（migrationLogPath 每次调用现读 env，晚设也生效）。
+process.env.CC_MIGRATE_LOG = join(await mkdtemp(join(tmpdir(), 'cc-log-iso-')), 'migrations.jsonl');
+
 const gui = await import('../lib/gui.js');
 const { createSessionMigrateWizard, GUI_SOURCE_TOOLS } = gui;
 const core = await import('@cc-migrate/core');
@@ -44,6 +49,7 @@ console.log('[1] lib/index.js imports clean (GUI layer lazily isolated, commands
 // ── 临时库：core 自己的写入管线造 claude 会话（复用 smoke.mjs 姿势） ──
 const srcRoot = await mkdtemp(join(tmpdir(), 'sm-gui-src-'));   // claude side
 const dstRoot = await mkdtemp(join(tmpdir(), 'sm-gui-dst-'));   // dsh side
+const fakeHome = await mkdtemp(join(tmpdir(), 'sm-gui-home-'));  // ~ 展开回归用（5b）
 const registry = core.builtinRegistry();
 const ir = core.fallbackIr();
 const claude = registry.get('claude');
@@ -136,6 +142,31 @@ console.log(`[5] backend.preview -> structured payload: ${payload.messages.lengt
 
 // preview 错误：坏 session id → 抛错（组件渲染 error 行）
 await assert.rejects(backend.preview('claude', 'no-such-session', srcRoot), /preview claude:no-such-session failed/);
+
+// ── 5b. backend.preview 的 ~ 展开（真机 GUI 踩过的坑，回归断言）────────
+// 向导 root 框的 defaultRoot 是 `~/.claude/projects` 形态，用户不改输入框时
+// 原样传到 previewPayload——漏展开会把 `~` 当字面目录（相对宿主 CWD），列表
+// 能出、预览必挂。这里把 HOME/USERPROFILE 重定向到临时目录造库（node 的
+// os.homedir() 每次现读 env，恢复原值在 finally 里），绝不碰真实 ~/.claude。
+const prevHome = { HOME: process.env.HOME, USERPROFILE: process.env.USERPROFILE };
+try {
+  process.env.HOME = fakeHome;
+  process.env.USERPROFILE = fakeHome;
+  const tildeRoot = join(fakeHome, '.claude', 'projects');
+  const tildeWritten = await core.writeTarget(claude, core.fallbackIr(), { root: tildeRoot, targetCwd: 'D:\\demo\\proj' });
+  // 对照：listSources 一直有展开，~ 形态应能列出
+  const tildeList = await backend.listSessions('claude', '~/.claude/projects');
+  assert.ok(tildeList.some((s) => s.sessionId === tildeWritten.sessionId), 'listSessions finds the seeded session via ~ root');
+  // 回归主体：preview 走同一展开（修复前这里 reject「preview ... failed」）
+  const tildePayload = await backend.preview('claude', tildeWritten.sessionId, '~/.claude/projects');
+  assert.equal(tildePayload.sessionId, tildeWritten.sessionId, 'preview resolves the session via the ~ root');
+  console.log('[5b] backend.preview with "~/.claude/projects" root -> payload (tilde expansion aligned with listSessions)');
+} finally {
+  for (const [k, v] of Object.entries(prevHome)) {
+    if (v === undefined) delete process.env[k];
+    else process.env[k] = v;
+  }
+}
 
 // ── 6. backend.migrate —— 写入临时 DSH root，全新 id，目标白名单 ────
 const outcome = await backend.migrate({

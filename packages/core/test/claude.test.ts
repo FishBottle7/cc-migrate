@@ -11,7 +11,8 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { randomUUID } from 'node:crypto';
 import { ClaudeAdapter } from '../src/adapters/claude/index.js';
-import { parseClaudeLines, buildConversationChain } from '../src/adapters/claude/parse.js';
+import { parseClaudeLines, buildConversationChain, projectChain } from '../src/adapters/claude/parse.js';
+import type { ClaudeRawRecord } from '../src/adapters/claude/parse.js';
 import { buildMainRecords } from '../src/adapters/claude/write.js';
 import { claudeProjectDirName, MAX_SANITIZED_LENGTH } from '../src/adapters/claude/path.js';
 import type { ContentBlock, MigratedSession } from '../src/ir.js';
@@ -145,7 +146,55 @@ test('parse: transcript + metadata rows + system rows + isMeta + local_command',
   assert.ok(ir.sessionEvents?.some((e) => e.type === 'turn_duration'), '非对话 system 行 → sessionEvents');
 });
 
+/* ---------------- agent-authored user rows（2026-09-05 真机裁定） ---------------- */
+
+test('agent-authored user rows: 打断标记/teammate 信封/侧链 prompt → synthetic；混装行按 run 拆分', () => {
+  // 真机样本：打断行全部 isMeta 缺失（57 行实测），是 harness 行不是人话；
+  // 打断标记可与真人新输入同行混装（["[Request interrupted by user for tool
+  // use]\n", "这个subagent已经完成切片了啊…"]），必须拆开分别定性；
+  // 子代理转写（isSidechain）的 user 行全部是 spawn prompt / teammate 消息。
+  const records: ClaudeRawRecord[] = [
+    userRec('u1', null, '正常人类提问') as ClaudeRawRecord,
+    userRec('u2', 'a1', '[Request interrupted by user]') as ClaudeRawRecord,
+    userRec('u3', 'u2', [
+      { type: 'text', text: '[Request interrupted by user for tool use]\n' },
+      { type: 'text', text: '这个subagent已经完成切片了啊，要不你去看看？' },
+    ]) as ClaudeRawRecord,
+    userRec('u4', 'u3', 'Another Claude session sent a message:\n<teammate-message teammate_id="P2a" color="blue">\n{"type":"idle_notification"}\n</teammate-message>\n\nThis came from another Claude session — not typed by your user.') as ClaudeRawRecord,
+    userRec('u5', 'u4', '研读源码，确认 session.jsonl.zstd 存储格式（子代理 spawn prompt，纯文本无标记）', { isSidechain: true }) as ClaudeRawRecord,
+  ];
+  const chain = records.map((rec, line) => ({ rec, line }));
+  const { messages } = projectChain(chain, { legacySummaries: [], contentReplacements: [], rows: [] });
+
+  const byText = (needle: string) => messages.filter((m) => m.content.some((b) => b.type === 'text' && (b as { text: string }).text.includes(needle)));
+  assert.equal(byText('正常人类提问').length, 1);
+  assert.equal(byText('正常人类提问')[0].synthetic, undefined, '纯人话行零回归');
+
+  const interrupt = byText('[Request interrupted by user]')[0];
+  assert.ok(interrupt, '打断行保留（模型上下文红线）');
+  assert.equal(interrupt.synthetic, true, '纯打断行 → agent-authored 注入');
+  assert.equal(interrupt.content.length, 1, '内容零丢弃');
+
+  const mixed = messages.filter((m) => (m.meta?.claude as { uuid?: string } | undefined)?.uuid === 'u3');
+  assert.equal(mixed.length, 2, '混装行拆成两条 IR 消息');
+  assert.equal(mixed[0].synthetic, true, '打断标记 run → 注入');
+  assert.equal((mixed[0].content[0] as { text: string }).text, '[Request interrupted by user for tool use]\n');
+  assert.equal(mixed[1].synthetic, undefined, '真人新输入 run → 人话');
+  assert.equal((mixed[1].content[0] as { text: string }).text, '这个subagent已经完成切片了啊，要不你去看看？');
+
+  const teammate = byText('<teammate-message')[0];
+  assert.ok(teammate, 'teammate 信封行保留');
+  assert.equal(teammate.synthetic, true, '跨代理消息 → 注入（子代理之间的对话不是用户信息）');
+
+  const spawn = byText('研读源码')[0];
+  assert.equal(spawn.synthetic, true, '侧链 spawn prompt（纯文本无标记）→ 注入');
+
+  // 打断标记/teammate 行的 toolUseResult 侧载荷不丢（interrupt-for-tool-use 行携带）
+  assert.ok(byText('[Request interrupted by user]')[0].meta?.claude, 'envelope meta 随行保留');
+});
+
 /* ---------------- compaction ---------------- */
+
 
 test('compaction: boundary + isCompactSummary → compaction[] anchored; 活跃链进 messages，折叠段靠 recordsRaw 无损', async () => {
   const root = await tempRoot();

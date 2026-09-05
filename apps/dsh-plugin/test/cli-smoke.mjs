@@ -25,6 +25,11 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+// 迁移日志隔离：所有 migrate/log 都写到本次冒烟的临时日志（子进程继承本进程 env），
+// 绝不碰真实 ~/.cc-migrate/migrations.jsonl。
+const migrationLog = join(await mkdtemp(join(tmpdir(), 'cc-cli-log-')), 'migrations.jsonl');
+process.env.CC_MIGRATE_LOG = migrationLog;
+
 const here = dirname(fileURLToPath(import.meta.url));
 const cliPath = join(here, '..', 'lib', 'cli.js');
 const core = await import('@cc-migrate/core');
@@ -74,6 +79,26 @@ const miss = JSON.parse(run(['list', 'claude', '--root', srcRoot, '--cwd', 'D:\\
 assert.equal(miss.count, 0, 'cwd filter excludes other projects');
 console.log(`[3] --cwd hit=${hit.count} miss=${miss.count}`);
 
+// ── 3b. same-project cwd semantics + --search + --since/--before ──────
+// 「同一项目」= cwd 相等或互为祖先/后代（带路径边界）：用户在子目录里问
+// 能命中挂在仓库根的会话，反之亦然；--search 命中标题或 id 片段（含尾 8 位）。
+const anc = JSON.parse(run(['list', 'claude', '--root', srcRoot, '--cwd', 'D:\\demo\\proj\\sub\\deep', '--json']).stdout);
+assert.equal(anc.count, 1, 'query from a subdir matches the session at the repo root (ancestor)');
+const desc = JSON.parse(run(['list', 'claude', '--root', srcRoot, '--cwd', 'D:\\demo', '--json']).stdout);
+assert.equal(desc.count, 1, 'query at a parent dir matches the session in a subdir (descendant)');
+const boundary = JSON.parse(run(['list', 'claude', '--root', srcRoot, '--cwd', 'D:\\demoX', '--json']).stdout);
+assert.equal(boundary.count, 0, 'path boundary respected (D:\\demo does not match D:\\demoX)');
+const idFrag = JSON.parse(run(['list', 'claude', '--root', srcRoot, '--search', srcSessionId.slice(-8), '--json']).stdout);
+assert.equal(idFrag.count, 1, '--search matches a session-id fragment (last 8 chars)');
+const kwMiss = JSON.parse(run(['list', 'claude', '--root', srcRoot, '--search', 'zzz-no-such', '--json']).stdout);
+assert.equal(kwMiss.count, 0, '--search misses cleanly');
+const since = JSON.parse(run(['list', 'claude', '--root', srcRoot, '--since', '1h', '--json']).stdout);
+assert.equal(since.count, 1, 'seeded session is newer than 1h');
+const before = JSON.parse(run(['list', 'claude', '--root', srcRoot, '--before', '1h', '--json']).stdout);
+assert.equal(before.count, 0, 'no session older than 1h');
+assert.equal(run(['list', 'claude', '--root', srcRoot, '--since', 'bogus']).status, 1, 'bad time expr -> exit 1');
+console.log('[3b] same-project cwd (ancestor/descendant/boundary) + --search (id/title/miss) + --since/--before ok');
+
 // ── 4. migrate --json into a temp DSH root ────────────────────────────
 const mig = run(['migrate', 'claude', srcSessionId, '--src-root', srcRoot, '--cwd', 'D:\\demo\\proj', '--root', dstRoot, '--json']);
 assert.equal(mig.status, 0, `migrate exited ${mig.status}: ${mig.stderr}`);
@@ -94,6 +119,35 @@ const mig2 = run(['migrate', 'claude', srcSessionId, '--src-root', srcRoot, '--r
 assert.equal(mig2.status, 0);
 assert.ok(mig2.stdout.includes(`-> dsh:`), 'plain migrate prints the migrated line');
 assert.notEqual(mig2.stdout.match(/dsh:(\S+)/)?.[1], migration.target.sessionId, 'second migrate mints another new id');
+
+// ── 4a. migration log（「迁移过了吗」）────────────────────────────────
+// 每次成功 migrate 追加一行到 CC_MIGRATE_LOG（临时文件）；二次迁移的
+// --json 带 alreadyMigrated（查重提示，不阻止）；log check / log list 可查询。
+const mig2Json = run(['migrate', 'claude', srcSessionId, '--src-root', srcRoot, '--root', dstRoot, '--json']);
+assert.equal(mig2Json.status, 0, `third migrate exited ${mig2Json.status}: ${mig2Json.stderr}`);
+const mig2Parsed = JSON.parse(mig2Json.stdout);
+assert.equal(mig2Parsed.alreadyMigrated?.length, 2, `alreadyMigrated carries the two prior records (got ${mig2Parsed.alreadyMigrated?.length})`);
+// 插件 CLI 的 migrate 走命令层（importSession）→ via 恒为 dsh-plugin；
+// 独立 CLI 的 migrate 自带写入口 → via=cli（migrationLogPath 同一份日志文件）。
+assert.equal(mig2Parsed.alreadyMigrated[0].via, 'dsh-plugin', 'records stamped with via=dsh-plugin (plugin command layer)');
+assert.equal(mig2Parsed.alreadyMigrated[0].source.sessionId, srcSessionId, 'records keyed by source session');
+
+const check = run(['log', 'check', 'claude', srcSessionId, '--json']);
+assert.equal(check.status, 0, `log check exited ${check.status}: ${check.stderr}`);
+const checkJson = JSON.parse(check.stdout);
+assert.equal(checkJson.migrated, true, 'log check reports migrated=true');
+assert.equal(checkJson.records.length, 3, 'three migrations on record');
+assert.ok(checkJson.records.every((r) => r.target.tool === 'dsh'), 'plugin target tool recorded as dsh');
+
+const checkMiss = JSON.parse(run(['log', 'check', 'claude', 'never-migrated-id', '--json']).stdout);
+assert.equal(checkMiss.migrated, false, 'log check reports migrated=false for unknown source');
+assert.equal(run(['log', 'check', 'claude', 'never-migrated-id']).status, 0, 'a well-formed check exits 0 even when not migrated');
+
+const logList = JSON.parse(run(['log', 'list', '--json']).stdout);
+assert.equal(logList.count, 3, 'log list shows all records');
+assert.ok(logList.records[0].ts >= logList.records[1].ts, 'log list is newest-first');
+assert.ok(mig2Parsed.alreadyMigrated.every((r) => r.target.paths.length >= 1), 'records carry target paths');
+console.log('[4a] migration log: append on migrate, alreadyMigrated dedup hint, log check/list query ok');
 
 // ── 4b. preview --json: the bounded decision digest ───────────────────
 // 契约（skill 的上下文体量纪律依赖它）：整段 stdout 有界（约 1-2KB），

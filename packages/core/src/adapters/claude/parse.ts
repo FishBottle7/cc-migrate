@@ -820,6 +820,41 @@ function safeJson(v: unknown): string {
 }
 
 /**
+ * Agent-authored user text — never the human's words（2026-09-05 真机裁定）：
+ *  - 打断标记：`[Request interrupted by user]` / `[Request interrupted by user
+ *    for tool use]`（真机 57 行实测全部 isMeta 缺失，是 harness 行不是人话）；
+ *  - 跨代理消息：`Another Claude session sent a message:\n<teammate-message …>`
+ *    （队友/子代理之间对话的投递信封）。
+ */
+function isAgentAuthoredText(t: string): boolean {
+  return (
+    /^\s*\[Request interrupted by user(?: for tool use)?\]\s*$/.test(t) ||
+    t.includes('<teammate-message') ||
+    t.startsWith('Another Claude session sent a message:')
+  );
+}
+
+interface AgentRun {
+  agent: boolean;
+  blocks: ContentBlock[];
+}
+
+/** 把 user 行内容按「连续同源段」切成 agent/human run——同一行可以混装
+ * 打断标记与真人新输入（真机样本：["[Request interrupted by user for tool
+ * use]\n", "这个subagent已经完成切片了啊…"]），必须拆开分别定性。非文本块
+ * 归入当前 run（无开放 run 时视为 human）。 */
+function agentRunSplit(blocks: ContentBlock[]): AgentRun[] {
+  const runs: AgentRun[] = [];
+  for (const b of blocks) {
+    const agent = b.type === 'text' && isAgentAuthoredText(b.text);
+    const last = runs[runs.length - 1];
+    if (last && last.agent === agent) last.blocks.push(b);
+    else runs.push({ agent, blocks: [b] });
+  }
+  return runs;
+}
+
+/**
  * Project one reconstructed chain into IR messages + compaction + sessionEvents.
  */
 export function projectChain(
@@ -852,6 +887,44 @@ export function projectChain(
       }
       // synthetic API error messages are stripped (claude drops them at replay too)
       if (rec.type === 'assistant' && rec.isApiErrorMessage === true) continue;
+
+      // —— agent-authored 行定性（2026-09-05 真机裁定）——
+      // 子代理转写（isSidechain）里的 user 行全部是 harness/跨代理生成的
+      // （spawn prompt、teammate-message、system-reminder），真人无法在子代理
+      // 转写里发言；主转写里整行/分块为打断标记或 teammate 信封的行同理。
+      // 混装行（打断标记 + 真人新输入在同一行）按连续同源段拆成多条 IR 消息：
+      // agent run → synthetic（dsh 写端映为 plugin 注入、不切 turn；claude 写端
+      // 映回 isMeta，模型上下文照旧保留），human run → 普通人话。
+      // isMeta / isCompactSummary / tool_result 载体行不走此路（原有定性已对）。
+      if (
+        rec.type === 'user' &&
+        rec.isMeta !== true &&
+        rec.isCompactSummary !== true &&
+        !blocks.some((b) => b.type === 'tool_result')
+      ) {
+        const runs = rec.isSidechain === true
+          ? [{ agent: true, blocks }]
+          : agentRunSplit(blocks);
+        if (runs.length > 1 || runs[0]!.agent) {
+          const anchor = messages.length;
+          for (const run of runs) {
+            const runMsg: MigratedMessage = {
+              role: 'user',
+              content: run.blocks,
+              timestamp: ts,
+              ...(run.agent ? { synthetic: true as const } : {}),
+            };
+            const rm = envelopeMeta(rec);
+            if (rec.message) rm.message = rec.message;
+            if (rec.toolUseResult !== undefined && run.agent) rm.toolUseResult = rec.toolUseResult;
+            if (Object.keys(rm).length) runMsg.meta = { claude: rm };
+            messages.push(runMsg);
+          }
+          uuidToIndex.set(rec.uuid!, anchor);
+          continue;
+        }
+        // 纯人话行 → 落入下方通用构造（零回归）
+      }
 
       const msg: MigratedMessage = {
         role: rec.type === 'assistant' ? 'assistant' : 'user',

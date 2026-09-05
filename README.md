@@ -40,6 +40,9 @@ cc-migrate skill install                                   # 把 skill 装进本
 
 Agent 通过 skill 里的「上下文体量纪律」驱动 CLI：`list --limit N --json`、
 `preview --json`（≈1-2KB 决策摘要，绝不把聊天记录灌进上下文）、`migrate --json`。
+每次成功迁移向 `~/.cc-migrate/migrations.jsonl` 追加一行（append-only，`CC_MIGRATE_LOG`
+可改道/`off` 关闭）；`migrate` 前自动查重提示、`log check`/`log list` 主动查询
+（「这条迁过了吗」；桌面 App 迁移暂不进日志）。
 
 ## 设计核心
 

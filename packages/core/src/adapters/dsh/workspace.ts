@@ -20,6 +20,7 @@ import { promises as fs } from 'node:fs';
 import { join, dirname, basename } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { realpath } from 'node:fs/promises';
+import { expandHomeRoot } from '../../migrate.js';
 
 /** Resolve the workspace.json path from a sessions root like `~/.dsh/sessions`. */
 function workspaceJsonPath(sessionsRoot: string): string | null {
@@ -165,6 +166,7 @@ export async function ensureWorkspaceRegistration(
 export async function reconcileWorkspaces(
   sessionsRoot: string,
 ): Promise<{ scanned: number; registered: number; pruned: number; errors: string[] }> {
+  sessionsRoot = expandHomeRoot(sessionsRoot) ?? sessionsRoot;
   const { readdir, readFile } = await import('node:fs/promises');
   const { join: joinPath } = await import('node:path');
   const { decompressSessionBuffer } = await import('./format.js');

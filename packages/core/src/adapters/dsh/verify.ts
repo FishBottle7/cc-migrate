@@ -31,6 +31,7 @@
 import { readdir, readFile, stat } from 'node:fs/promises';
 import { join } from 'node:path';
 import { decompressSessionBuffer, defaultDshRoot } from './format.js';
+import { expandHomeRoot } from '../../migrate.js';
 import { DSH_KNOWN_EVENT_TYPES } from './index.js';
 
 export const SURFACE_ELIGIBLE_TYPES = new Set(['user/message', 'assistant/message', 'tool/result']);

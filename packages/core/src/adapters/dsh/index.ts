@@ -30,6 +30,12 @@
  *     kind round-trips via the child header's `agentPreset` marker (2026-09-03
  *     调查结论：team/* 在安装产物里只有 catalog 条目、无 payload 契约，伪造
  *     team/message 行属瞎猜，故承载形态=独立子会话，见 docs/agents/dsh.md).
+ *  8. foreign write-side conversation skeleton (2026-09-05 真机调查)：DSH GUI
+ *     把同一 (turn,step) 的所有 assistant/message 折叠为一个节点且整块替换，
+ *     子代理列表对无 subagent/descriptor 的子日志判「会话记录损坏」——故外来
+ *     IR 落盘时合成完整 turn/step 生命周期（每人话一 turn、每 assistant 一
+ *     step、step/end+turn/end 成对闭合）、claude 同响应相邻记录合并为一条
+ *     assistant/message、子会话补 one-shot descriptor 身份行。
  */
 
 /**
@@ -647,7 +653,18 @@ export class DshAdapter implements Adapter {
             ? { title: sc.title }
             : {}),
       };
-      const childEvents = irToEvents(childIr, childCreatedAt);
+      // 子会话身份行：没有 subagent/descriptor 事件的子日志，DSH 子代理列表
+      // 的 identity 折叠得 null，整行被判「会话记录损坏」。外来子会话源里没有
+      // 这种事件，这里按 descriptor 契约（v2 / one-shot / provider+label）补
+      // 权威身份行——one-shot 即「归档记录、不支持续发」，与迁移产物的实际
+      // 生命周期一致（GUI 明确支持查看 one-shot 执行记录）。dsh→dsh 子会话已
+      // 自带 descriptor（unmappedEvents 原样保留），绝不追加第二条——
+      // establish 语义是「恰好一条」，重复行会让两次折叠结果取决于先后。
+      const childLabel = (sc.title ?? sc.agentType ?? sc.agentId ?? childId).slice(0, 120);
+      const hasNativeDescriptor = (sc.unmappedEvents ?? []).some((ev) => ev.type === 'subagent/descriptor');
+      const childEvents = irToEvents(childIr, childCreatedAt, hasNativeDescriptor ? undefined : {
+        subagentDescriptor: { version: 2, mode: 'one-shot', provider: 'migrated', label: childLabel },
+      });
       const cFrame1 = buildSessionFrame(childHeader);
       const cFrame2 = buildEventsFrame(childEvents);
       // 子会话目录布局按「子自己的 cwd」落 project dir（与 header.cwd 同源，
@@ -1271,8 +1288,15 @@ function isSafeSeq(v: unknown): v is number {
  * the original wall-clock ordering survives. `session/title` is synthesized
  * from `ir.title` when no matching unmapped event already carries it.
  */
-export function irToEvents(ir: MigratedSession, baseTime: number): DshEvent[] {
-  type Raw = { time: number; type: string; data: DshEvent['data']; surfaceOp?: string; sourceEventSeqs?: number[]; _msg?: MigratedMessage; _seq?: number };
+export interface IrToEventsOptions {
+  /** 子会话身份行 payload（subagent/descriptor 的 data）。DSH 的子代理列表把
+   * `values.subagent` 为 null 的子日志直接判「会话记录损坏」（identity 只能由
+   * 合法 descriptor 事件建立），外来子会话必须补一条。 */
+  subagentDescriptor?: Record<string, unknown>;
+}
+
+export function irToEvents(ir: MigratedSession, baseTime: number, opts?: IrToEventsOptions): DshEvent[] {
+  type Raw = { time: number; type: string; data: DshEvent['data']; surfaceOp?: string; sourceEventSeqs?: number[]; _msg?: MigratedMessage; _seq?: number; _blockCall?: boolean };
   const raw: Raw[] = [];
   // Foreign-origin IRs (claude/codex/...) carry no per-message seq; park them
   // after every real source seq so ties keep insertion order without stealing
@@ -1357,7 +1381,63 @@ export function irToEvents(ir: MigratedSession, baseTime: number): DshEvent[] {
       else blockSeatQueues.set(b.id, [seat]);
     }
   }
-  for (const msg of ir.messages) {
+  // —— 外来 assistant 记录按「同一次模型响应」分组合并 ——
+  // claude 的流式转写把一次 LLM 响应拆成多条 assistant 记录（reasoning/文本/
+  // tool_use 各一条，共享 message.id）。DSH 的会话骨架是「一个 step 恰好一条
+  // assistant/message」：同 step 内第二条 assistant/message 在客户端按整块替换
+  // 语义覆盖第一条（update/fallbackState 都是全量替换 blocks），不合并的话
+  // reasoning/文本在 GUI 上只剩同组最后一条。仅在「无 meta.dsh（非 dsh 原生）
+  // + 相邻 + meta.claude.message.id 相同」时合并；dsh→dsh 与无 id 的外来消息
+  // 一律保持原样，各自落到独立 step（骨架 pass 保证可见）。
+  const claudeResponseIdOf = (msg: MigratedMessage): string | undefined => {
+    const native = nativeOf(msg);
+    if (native.id !== undefined || native.source !== undefined) return undefined;
+    const id = (msg.meta as { claude?: { message?: { id?: unknown } } } | undefined)?.claude?.message?.id;
+    return typeof id === 'string' && id ? id : undefined;
+  };
+  const displayMessages: MigratedMessage[] = [];
+  {
+    let group: { rid: string; msgs: MigratedMessage[] } | null = null;
+    const flushGroup = (): void => {
+      if (!group) return;
+      const msgs = group.msgs;
+      if (msgs.length === 1) {
+        displayMessages.push(msgs[0]);
+      } else {
+        const [first] = msgs;
+        const usage = [...msgs].reverse().map((m) => nativeOf(m).usage).find((u) => u !== undefined);
+        const interrupted = msgs.some((m) => nativeOf(m).interrupted === true);
+        displayMessages.push({
+          ...first,
+          content: msgs.flatMap((m) => m.content),
+          meta: {
+            ...(first.meta ?? {}),
+            dsh: {
+              ...nativeOf(first),
+              ...(usage !== undefined ? { usage } : {}),
+              ...(interrupted ? { interrupted: true as const } : {}),
+            },
+          },
+        });
+      }
+      group = null;
+    };
+    for (const msg of ir.messages) {
+      const rid = claudeResponseIdOf(msg);
+      if (rid !== undefined) {
+        if (group && group.rid === rid) group.msgs.push(msg);
+        else {
+          flushGroup();
+          group = { rid, msgs: [msg] };
+        }
+        continue;
+      }
+      flushGroup();
+      displayMessages.push(msg);
+    }
+    flushGroup();
+  }
+  for (const msg of displayMessages) {
     const t = msg.timestamp;
     const time = typeof t === 'number' && Number.isFinite(t) ? t : msgFallback++;
     const seq = typeof msg.seq === 'number' && Number.isSafeInteger(msg.seq) ? msg.seq : FALLBACK_SEQ_BASE + fallbackIdx++;
@@ -1459,8 +1539,12 @@ export function irToEvents(ir: MigratedSession, baseTime: number): DshEvent[] {
       // DSH validates assistant/message data as {turn,step,message:{id, role:"assistant", source:{kind:"model",provider,model}, content:[]}}
       // source identity: per-message provider/model first (foreign harnesses
       // carry it on the message), then session-level, then legacy defaults.
-      const provider = (msg.provider as string) ?? (ir.model?.provider as string) ?? 'abrdns';
-      const model = (msg.model as string) ?? (ir.model?.id as string) ?? 'GLM-5.3-Flash';
+      // claude 源会话的真实模型名住在 meta.claude.message.model —— 显示身份按
+      // 真值提升为 provider 'claude'；其余维持 legacy 默认。
+      const claudeModel = (msg.meta as { claude?: { message?: { model?: unknown } } } | undefined)?.claude?.message?.model;
+      const claudeModelStr = typeof claudeModel === 'string' && claudeModel ? claudeModel : undefined;
+      const provider = (msg.provider as string) ?? (ir.model?.provider as string) ?? (claudeModelStr ? 'claude' : 'abrdns');
+      const model = (msg.model as string) ?? (ir.model?.id as string) ?? claudeModelStr ?? 'GLM-5.3-Flash';
       const nativeSource = native.source as Record<string, unknown> | undefined;
       const data = {
         ...(native.turn !== undefined || native.step !== undefined
@@ -1499,6 +1583,9 @@ export function irToEvents(ir: MigratedSession, baseTime: number): DshEvent[] {
           type: 'tool/call',
           data: { turn: 1, step: 1, callId: writtenId, name: b.name ?? 'tool', arguments: args } as unknown as DshEvent['data'],
           _seq: seq,
+          // 块派生调用行的标记：turn/step 是占位值，骨架 pass 按游标 restamp；
+          // toolCalls 桶重发行的行带保留原生坐标，绝不 restamp。
+          _blockCall: true,
         });
       }
     }
@@ -1588,6 +1675,16 @@ export function irToEvents(ir: MigratedSession, baseTime: number): DshEvent[] {
       ...(ev.sourceEventSeqs ? { sourceEventSeqs: ev.sourceEventSeqs } : {}),
       _seq: ev.seq,
     });
+  }
+
+  // 子会话身份行：DSH 的 subagent 列表对折叠不出 identity 的子日志返回
+  // diagnostic reason "corrupt"（dsh-subagent resolveColdIdentity → GUI 显示
+  // 「会话记录损坏」）。native 语义：establishing provider 恰好追加一条，且是
+  // 子日志的第一行。排在整条流最前：时间取全流最小值减一、_seq=-3 压过
+  // session/title 合成行的 -1。
+  if (opts?.subagentDescriptor) {
+    const minTime = raw.length ? Math.min(baseTime, ...raw.map((r) => r.time)) : baseTime;
+    raw.push({ time: minTime - 1, type: 'subagent/descriptor', data: opts.subagentDescriptor as unknown as DshEvent['data'], _seq: -3 });
   }
 
   // ir.title: if caller set a title and no session/title event already
@@ -1702,69 +1799,155 @@ export function irToEvents(ir: MigratedSession, baseTime: number): DshEvent[] {
   // event before its turn/start aborts history load with "received an
   // update before its start Match").
   //
-  // Foreign-origin IRs (claude/codex/opencode/zcode) carry no turn/step
-  // lifecycle events, so synthesize the skeleton on the fly: `turn/start
-  // {turn}` before the first event of each turn, `step/start {turn,step}`
-  // before the first event of each (turn, step). Sources that already carry
-  // native starts (dsh→dsh) mark their turns/steps as seen and get no
-  // duplicates — a second start match on one context is itself a hard load
-  // error ("received more than one start Match").
-  let curTurn = 1;
-  let curStep = 1;
-  const startedTurns = new Set<number>();
-  const startedSteps = new Set<string>();
+  // Two regimes:
+  //  - Native (dsh→dsh, log carries turn/start rows): mark seen coordinates
+  //    and never synthesize duplicates — a second start match on one context
+  //    is itself a hard load error ("received more than one start Match").
+  //  - Foreign (claude/codex/opencode/zcode): synthesize the FULL lifecycle
+  //    DSH itself would have written. The client folds every assistant/message
+  //    of one (turn,step) into a single assistant node with whole-replace
+  //    semantics, so the naive "everything is turn 1 step 1" shape collapses
+  //    an entire migrated conversation into ONE node showing only the last
+  //    message (typically a bare tool-call card) — agent text/thinking vanish.
+  //    Native shape to reproduce: turn 1 opens before the first surface row;
+  //    every human prompt closes the open turn and opens the next; every
+  //    assistant/message gets its OWN step (native logs have exactly one
+  //    assistant/message per step); open steps/turns close with step/end /
+  //    turn/end {turn, reason:{kind:'completed'}} like native logs do.
+  const hasNativeTurns = merged.some((e) => !((e as { __packed?: boolean }).__packed) && (e as Raw).type === 'turn/start');
   const withSkeleton: typeof merged = [];
-  for (const entry of merged) {
-    if ((entry as { __packed?: boolean }).__packed) {
-      // packed chunk rows only exist in dsh→dsh logs (native steps already
-      // started); pass through untouched.
-      withSkeleton.push(entry);
-      continue;
-    }
-    const r = entry as Raw;
-    const d = r.data as Record<string, unknown> | undefined;
-    if (r.type === 'turn/start') {
-      if (typeof d?.turn === 'number') {
-        curTurn = d.turn;
-        curStep = 1;
-        startedTurns.add(curTurn);
+  if (!hasNativeTurns) {
+    let turnCounter = 0;
+    let curTurn = 0;
+    let curStep = 0;
+    let turnHasAssistant = false;
+    let stepHasAssistant = false;
+    let lastTime = baseTime;
+    const openTurn = (time: number): void => {
+      turnCounter += 1;
+      curTurn = turnCounter;
+      curStep = 1;
+      turnHasAssistant = false;
+      stepHasAssistant = false;
+      withSkeleton.push({ time, type: 'turn/start', data: { turn: curTurn } } as unknown as Raw);
+      withSkeleton.push({ time, type: 'step/start', data: { turn: curTurn, step: curStep } } as unknown as Raw);
+    };
+    const closeStep = (time: number): void => {
+      if (curStep === 0) return;
+      withSkeleton.push({ time, type: 'step/end', data: { turn: curTurn, step: curStep } } as unknown as Raw);
+      stepHasAssistant = false;
+      curStep = 0;
+    };
+    const closeTurn = (time: number): void => {
+      if (curTurn === 0) return;
+      closeStep(time);
+      withSkeleton.push({ time, type: 'turn/end', data: { turn: curTurn, reason: { kind: 'completed' } } } as unknown as Raw);
+      curTurn = 0;
+      turnHasAssistant = false;
+    };
+    for (const entry of merged) {
+      if ((entry as { __packed?: boolean }).__packed) {
+        // packed chunk rows only exist in dsh→dsh logs; foreign streams have none.
+        withSkeleton.push(entry);
+        continue;
+      }
+      const r = entry as Raw;
+      const d = r.data as Record<string, unknown> | undefined;
+      lastTime = r.time;
+      if (r.type === 'user/message') {
+        // A human prompt (source.kind 'user') begins a new turn — unless the
+        // current turn has no assistant content yet, so session-start
+        // injections and the first prompt share turn 1 like native logs.
+        if (turnHasAssistant && (d?.source as Record<string, unknown> | undefined)?.kind === 'user') closeTurn(r.time);
+        if (curTurn === 0) openTurn(r.time);
+        withSkeleton.push(entry);
+        continue;
+      }
+      if (r.type === 'assistant/message' || r.type === 'tool/result' || r.type === 'tool/call') {
+        if (curTurn === 0) openTurn(r.time);
+        else if (curStep === 0) {
+          curStep = 1;
+          withSkeleton.push({ time: r.time, type: 'step/start', data: { turn: curTurn, step: curStep } } as unknown as Raw);
+        }
+        if (r.type === 'assistant/message' && stepHasAssistant) {
+          // one assistant/message per step: close the spent step, open the next
+          const spent = curStep;
+          closeStep(r.time);
+          curStep = spent + 1;
+          withSkeleton.push({ time: r.time, type: 'step/start', data: { turn: curTurn, step: curStep } } as unknown as Raw);
+        }
+        const restamp = r.type === 'assistant/message' || r.type === 'tool/result' || r._blockCall === true;
+        if (restamp) {
+          (r.data as Record<string, unknown>).turn = curTurn;
+          (r.data as Record<string, unknown>).step = curStep;
+        }
+        if (r.type === 'assistant/message') {
+          turnHasAssistant = true;
+          stepHasAssistant = true;
+        }
+        withSkeleton.push(entry);
+        continue;
       }
       withSkeleton.push(entry);
-      continue;
     }
-    if (r.type === 'step/start') {
-      if (typeof d?.turn === 'number') curTurn = d.turn;
-      if (typeof d?.step === 'number') curStep = d.step;
-      startedTurns.add(curTurn);
-      startedSteps.add(`${curTurn}:${curStep}`);
+    closeTurn(lastTime);
+  } else {
+    let curTurn = 1;
+    let curStep = 1;
+    const startedTurns = new Set<number>();
+    const startedSteps = new Set<string>();
+    for (const entry of merged) {
+      if ((entry as { __packed?: boolean }).__packed) {
+        // packed chunk rows only exist in dsh→dsh logs (native steps already
+        // started); pass through untouched.
+        withSkeleton.push(entry);
+        continue;
+      }
+      const r = entry as Raw;
+      const d = r.data as Record<string, unknown> | undefined;
+      if (r.type === 'turn/start') {
+        if (typeof d?.turn === 'number') {
+          curTurn = d.turn;
+          curStep = 1;
+          startedTurns.add(curTurn);
+        }
+        withSkeleton.push(entry);
+        continue;
+      }
+      if (r.type === 'step/start') {
+        if (typeof d?.turn === 'number') curTurn = d.turn;
+        if (typeof d?.step === 'number') curStep = d.step;
+        startedTurns.add(curTurn);
+        startedSteps.add(`${curTurn}:${curStep}`);
+        withSkeleton.push(entry);
+        continue;
+      }
+      // Effective coordinates of this event: tool/call rows carry explicit
+      // turn/step in data; assistant/message + tool/result take the running
+      // cursor (stamped below).
+      let evTurn: number | undefined;
+      let evStep: number | undefined;
+      if (r.type === 'tool/call') {
+        if (typeof d?.turn === 'number') evTurn = d.turn;
+        if (typeof d?.step === 'number') evStep = d.step;
+      } else if (r.type === 'assistant/message' || r.type === 'tool/result') {
+        evTurn = curTurn;
+        evStep = curStep;
+      }
+      if (evTurn !== undefined && !startedTurns.has(evTurn)) {
+        startedTurns.add(evTurn);
+        withSkeleton.push({ time: r.time, type: 'turn/start', data: { turn: evTurn } } as unknown as Raw);
+      }
+      if (evTurn !== undefined && evStep !== undefined && !startedSteps.has(`${evTurn}:${evStep}`)) {
+        startedSteps.add(`${evTurn}:${evStep}`);
+        withSkeleton.push({ time: r.time, type: 'step/start', data: { turn: evTurn, step: evStep } } as unknown as Raw);
+      }
+      if (r.type === 'assistant/message' || r.type === 'tool/result') {
+        (r.data as Record<string, unknown>).turn = curTurn;
+        (r.data as Record<string, unknown>).step = curStep;
+      }
       withSkeleton.push(entry);
-      continue;
     }
-    // Effective coordinates of this event: tool/call rows carry explicit
-    // turn/step in data; assistant/message + tool/result take the running
-    // cursor (stamped below).
-    let evTurn: number | undefined;
-    let evStep: number | undefined;
-    if (r.type === 'tool/call') {
-      if (typeof d?.turn === 'number') evTurn = d.turn;
-      if (typeof d?.step === 'number') evStep = d.step;
-    } else if (r.type === 'assistant/message' || r.type === 'tool/result') {
-      evTurn = curTurn;
-      evStep = curStep;
-    }
-    if (evTurn !== undefined && !startedTurns.has(evTurn)) {
-      startedTurns.add(evTurn);
-      withSkeleton.push({ time: r.time, type: 'turn/start', data: { turn: evTurn } } as unknown as Raw);
-    }
-    if (evTurn !== undefined && evStep !== undefined && !startedSteps.has(`${evTurn}:${evStep}`)) {
-      startedSteps.add(`${evTurn}:${evStep}`);
-      withSkeleton.push({ time: r.time, type: 'step/start', data: { turn: evTurn, step: evStep } } as unknown as Raw);
-    }
-    if (r.type === 'assistant/message' || r.type === 'tool/result') {
-      (r.data as Record<string, unknown>).turn = curTurn;
-      (r.data as Record<string, unknown>).step = curStep;
-    }
-    withSkeleton.push(entry);
   }
   merged.length = 0;
   merged.push(...withSkeleton);
@@ -1954,24 +2137,80 @@ async function readArchivedSessionIds(sessionsRoot: string): Promise<Set<string>
 }
 
 /** Title of the LAST `session/title` event in a decompressed log — renames
- * override earlier titles, so the last one wins. Substring-prefilters lines
- * so only title-ish rows pay a JSON.parse. */
+ * override earlier titles, so the last one wins. When the log carries no
+ * title event at all (the host generates titles lazily; fresh/short sessions
+ * never get one), fall back to the FIRST HUMAN user message text — the same
+ * 「有标题显标题，无标题显 first prompt」contract claude/codex listings follow.
+ * Human turns are always stamped `source.kind === 'user'` (真机验证锚定，见
+ * parse() 的 user/message 注入分类) — stricter here than parse's
+ * unknown-kind-stays-non-synthetic rule on purpose: an unclassified injected
+ * row must never become a display title. Substring-prefilters lines so only
+ * title/user-ish rows pay a JSON.parse. */
 function scanTitleFromLog(buf: Buffer): string | undefined {
   let title: string | undefined;
+  let firstUserText: string | undefined;
   try {
     for (const line of decompressSessionBuffer(buf).split('\n')) {
-      if (!line.includes('"session/title"')) continue;
-      let ev: DshEvent;
-      try {
-        ev = JSON.parse(line) as DshEvent;
-      } catch {
-        continue;
+      if (title === undefined && line.includes('"session/title"')) {
+        let ev: DshEvent;
+        try {
+          ev = JSON.parse(line) as DshEvent;
+        } catch {
+          continue;
+        }
+        const t = (ev.data as Record<string, unknown> | undefined)?.title;
+        if (ev.type === 'session/title' && typeof t === 'string' && t) title = t;
       }
-      const t = (ev.data as Record<string, unknown> | undefined)?.title;
-      if (ev.type === 'session/title' && typeof t === 'string' && t) title = t;
+      if (firstUserText === undefined && line.includes('"user/message"')) {
+        firstUserText = scanFirstHumanUserText(line);
+      }
     }
   } catch {
     return undefined;
   }
-  return title;
+  return title ?? firstUserText;
+}
+
+/** First human-turn text from one `user/message` log line, whitespace
+ * flattened and excerpted (display-title budget, same 120 cap the CLI list
+ * applies). Returns undefined for anything not unmistakably a human turn —
+ * notably the harness's own runtime-context rows: DSH stamps permissions /
+ * team-preamble / AGENTS.md injections as ordinary `kind:"user"` messages
+ * (真机样本 52be3474 锚定), and migrated sessions land SOURCE-injected rows
+ * the same way, so kind alone cannot separate them. The marker list is a
+ * DISPLAY-fallback heuristic only — parse()/write-side contracts untouched. */
+const TITLE_FALLBACK_INJECTED_PREFIXES = [
+  '<permissions instructions>',
+  '<environment_context>',
+  '<user_instructions>',
+  '<multi_agent_mode>',
+  '<system-reminder',
+  '<turn-aborted>',
+  '# AGENTS.md instructions',
+  'You are `', // agent-teams preamble ("You are `/root`, the primary agent…")
+];
+
+function scanFirstHumanUserText(line: string): string | undefined {
+  let ev: DshEvent;
+  try {
+    ev = JSON.parse(line) as DshEvent;
+  } catch {
+    return undefined;
+  }
+  if (ev.type !== 'user/message') return undefined;
+  const data = ev.data as Record<string, unknown> | undefined;
+  const source = data?.source as Record<string, unknown> | undefined;
+  if (source?.kind !== 'user') return undefined;
+  const content = data?.content;
+  if (!Array.isArray(content)) return undefined;
+  const text = content
+    .map((b) => (typeof b === 'object' && b !== null ? (b as Record<string, unknown>) : undefined))
+    .filter((b): b is Record<string, unknown> => b?.type === 'text' && typeof b.text === 'string')
+    .map((b) => b.text as string)
+    .join('\n')
+    .trim();
+  if (!text) return undefined;
+  if (TITLE_FALLBACK_INJECTED_PREFIXES.some((p) => text.startsWith(p))) return undefined;
+  const flat = text.replace(/\s+/g, ' ');
+  return flat.length > 120 ? `${flat.slice(0, 119)}…` : flat;
 }

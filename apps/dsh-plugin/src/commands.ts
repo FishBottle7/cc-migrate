@@ -19,20 +19,20 @@
  * `{ ok: false, error }` instead of blowing up the host process.
  */
 
-import { homedir } from 'node:os';
-import { join } from 'node:path';
-
 import {
   builtinRegistry,
   listSessions,
   previewSession,
   readSource,
   writeTarget,
+  appendMigrationLog,
+  findMigrationsBySource,
 } from '@cc-migrate/core';
 import type {
   AdapterRegistry,
   MigratedMessage,
   MigratedSidechain,
+  MigrationRecord,
   SessionMeta,
   ToolId,
   WriteResult,
@@ -41,7 +41,7 @@ import type {
 /** Tools this plugin can import FROM (target is always DSH). */
 export const SOURCE_TOOLS: ToolId[] = ['dsh', 'claude', 'codex', 'opencode', 'pi', 'zcode'];
 
-export type { SessionMeta, ToolId, WriteResult };
+export type { SessionMeta, ToolId, WriteResult, MigrationRecord };
 
 /** Structured failure — commands never let exceptions escape to the host. */
 export interface CommandError {
@@ -67,6 +67,10 @@ export interface ImportResult {
   ok: true;
   source: { tool: ToolId; sessionId: string };
   target: WriteResult;
+  /** 该源会话此前的迁移记录（迁移日志查重；只提示不阻止 —— 重复迁移安全）。 */
+  alreadyMigrated?: MigrationRecord[];
+  /** 迁移成功但日志写入失败时的告警（迁移本身有效，只是不会出现在 log check 里）。 */
+  logWarning?: string;
 }
 
 export type ListSourcesOutcome = ListSourcesResult | CommandError;
@@ -248,20 +252,12 @@ function messageOf(e: unknown): string {
   return e instanceof Error ? e.message : String(e);
 }
 
-/**
- * 展开 root/srcRoot 里的 `~` 前缀（真机 GUI 验证踩过的坑：向导工具卡的
- * defaultRoot 是给人看的常识性路径 `~/.dsh/sessions`，用户不改输入框时它
- * 原样传到这里——文件系统把 `~` 当字面目录名，扫出一个不存在的路径，
- * GUI 渲染「该目录下没有找到会话」；不带 root 的裸调用反而正常）。命令
- * 层是所有路径入参的收口，展开放这里比 GUI 层各自处理更不会再漏。仅处
- * 理 `~` 与 `~/` 两种形态（`~user` 语义靠边站，那是 shell 的能力）。
- */
-function expandHomeRoot(p: string | undefined): string | undefined {
-  if (p === undefined || p === '') return undefined;
-  if (p === '~') return homedir();
-  if (p.startsWith('~/') || p.startsWith('~\\')) return join(homedir(), p.slice(2));
-  return p;
-}
+/* `~` 前缀展开已收口到 core 的编排层（readSource/writeTarget/listSessions，
+ * packages/core/src/migrate.ts 的 expandHomeRoot）——命令层与所有其他前端
+ * （独立 CLI / 桌面 App）共享同一处展开，不在各自入口复制粘贴。历史教训见
+ * core root-tilde.test.ts 头注：GUI root 框的 defaultRoot 是 `~/.claude/projects`
+ * 形态，哪层漏展开，`~` 就被文件系统当字面目录（相对进程 CWD），列表能出、
+ * preview/import 必挂。 */
 
 function isSourceTool(tool: string): tool is ToolId {
   return SOURCE_TOOLS.includes(tool as ToolId);
@@ -279,7 +275,7 @@ export async function listSources(tool: string, root?: string): Promise<ListSour
       return { ok: false, error: `unknown tool "${tool}" — supported: ${SOURCE_TOOLS.join(', ')}` };
     }
     const registry = builtinRegistry();
-    const sessions = await listSessions(registry.get(tool), expandHomeRoot(root));
+    const sessions = await listSessions(registry.get(tool), root);
     return { ok: true, tool, sessions };
   } catch (e) {
     return { ok: false, error: `list-sources ${tool} failed: ${messageOf(e)}` };
@@ -301,7 +297,7 @@ export async function preview(tool: string, sessionId: string, root?: string): P
       return { ok: false, error: 'preview requires a session id (see list-sources)' };
     }
     const registry = builtinRegistry();
-    const ir = await readSource(registry, tool, sessionId, expandHomeRoot(root));
+    const ir = await readSource(registry, tool, sessionId, root);
     const text = previewSession(registry.get(tool), ir);
     return { ok: true, tool, sessionId, text };
   } catch (e) {
@@ -355,7 +351,9 @@ export async function importSession(
       return { ok: false, error: 'import requires a source session id (see list-sources)' };
     }
     const registry: AdapterRegistry = builtinRegistry();
-    const ir = await readSource(registry, srcTool, srcSessionId, expandHomeRoot(opts.srcRoot));
+    // 「迁移过了吗」：查迁移日志（只提示不阻止 —— 读旧写新恒 mint 新 id，重复安全）。
+    const alreadyMigrated = await findMigrationsBySource(srcTool, srcSessionId);
+    const ir = await readSource(registry, srcTool, srcSessionId, opts.srcRoot);
     const dsh = registry.get('dsh');
     const target = await writeTarget(dsh, ir, {
       root: opts.root,
@@ -364,7 +362,26 @@ export async function importSession(
       flatten: opts.flatten,
       keepSynthetic: opts.keepSynthetic,
     });
-    return { ok: true, source: { tool: srcTool, sessionId: srcSessionId }, target };
+    // 迁移日志追加（~/.cc-migrate/migrations.jsonl；CC_MIGRATE_LOG 覆盖/off）。
+    // 日志失败不影响迁移本身 —— 结构化吞掉，Host 可从返回值外的 warn 观察。
+    const logged = await appendMigrationLog({
+      ts: Date.now(),
+      via: 'dsh-plugin',
+      source: {
+        tool: srcTool as ToolId,
+        sessionId: srcSessionId,
+        ...(ir.title ? { title: ir.title } : {}),
+        ...(ir.cwd ? { cwd: ir.cwd } : {}),
+      },
+      target: { tool: 'dsh', sessionId: target.sessionId, paths: target.paths },
+    });
+    return {
+      ok: true,
+      source: { tool: srcTool, sessionId: srcSessionId },
+      target,
+      ...(alreadyMigrated.length > 0 ? { alreadyMigrated } : {}),
+      ...(!logged.ok ? { logWarning: `migration log write failed: ${logged.error}` } : {}),
+    };
   } catch (e) {
     return { ok: false, error: `import ${srcTool}:${srcSessionId} failed: ${messageOf(e)}` };
   }

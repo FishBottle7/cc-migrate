@@ -45,17 +45,24 @@ node "{{CLI_PATH}}" <command> [args] [flags]
 
 1. **确认源工具**。用户没说就用 `list` 逐个试，或直接问一句。工具 id：
    `claude` `codex` `opencode` `pi` `zcode` `dsh`（dsh→dsh 是同工具搬家/备份）。
-2. **找目标会话**：`list <tool> --json --limit 20 [--cwd <用户项目目录>]`。
+2. **找目标会话**：`list <tool> --json --limit 20`，再按需收紧过滤：
+   `--search <关键词|id片段>`（标题子串/id 片段，大小写不敏感 —— 用户说
+   「调 413 的那个会话」直接 `--search 413`）；`--since 7d`、`--since 2026-08-01`
+   时间窗；`--cwd <项目目录>`（「同一项目」= cwd 相等或互为祖先/后代，用户在
+   子目录里问也能命中挂在仓库根的会话）。
    每条含 `sessionId / title / createdAt / cwd / sourcePath`。`title` 是源工具的
    原生标题（通常 LLM 生成；claude 无标题时回退到最近/第一条用户 prompt），
    可能缺失或很长 —— 拿不准就用 `preview` 看内容再让用户确认。
-   用户在某个项目里聊过的会话，优先传 `--cwd` 过滤（归一化后精确匹配）。
 3. **（可选）确认内容**：`preview <tool> <sessionId> --json` —— 有界决策摘要
    （`stats` 消息/轮次/工具调用数、`textChars` 体量、`firstUserMessages` ≤200 字
    摘录），够判断「是不是这条会话」且不撑上下文；多候选时列摘要让用户挑。
    `preview <tool> <sessionId>` 打印前 120 行离线文本（`--lines N` 调行数），
    仅在用户明确想看内容时用；`--full` 全文不要主动用。
 4. **迁移**：`migrate <tool> <sessionId> [--cwd <目标工作目录>] --json`。
+   - migrate 前会自动查**迁移日志**：该源会话迁过的话，stderr 提示此前的目标
+     会话（`--json` 在 `alreadyMigrated` 字段）——只是提示，**不阻止**再次迁移。
+   - 用户问「这条迁过了吗」：`log check <tool> <sessionId> --json` 看 `migrated`
+     字段；`log list` 回顾最近迁移。
    - `--cwd` 是新 DSH 会话的工作目录，**默认沿用源会话的 cwd** —— 用户想把会话
      落到别的项目时才需要传。
    - 成功输出新 `sessionId` 与写入文件路径。报告给用户：在 DSH 会话列表里直接
@@ -66,12 +73,15 @@ node "{{CLI_PATH}}" <command> [args] [flags]
 
 ```
 tools                                    # 列出源工具 id
-list <tool> [--root <dir>] [--cwd <dir>] [--limit N] [--json]   # 新到旧；默认 50 条封顶，N=0 不限
+list <tool> [--root <dir>] [--cwd <dir>] [--search <kw|id>] [--since <7d|ISO>] [--before <...>] [--limit N] [--json]
+                                         # 新到旧；默认 50 条封顶，N=0 不限
 preview <tool> <sessionId> [--root <dir>] [--json] [--messages K] [--lines N] [--full]
 migrate <tool> <sessionId> [--src-root <dir>] [--cwd <dir>] [--root <dstRoot>]
         [--session-id <id>] [--flatten | --no-flatten] [--keep-runtime-context] [--json]
 skill install [--agent <id,id>|--all] [--dir <path>] [--json]   # 把通用 cc-migrate skill 装进本机其他 agent 框架
 skill status [--json]                    # 各框架 skill 安装状态
+log check <tool> <sessionId> [--json]    # 「这条迁过了吗」——迁移日志查重
+log list [--limit N] [--json]            # 最近迁移记录（默认 20 条，新到旧）
 ```
 
 - `--json` 时整段 stdout 是合法 JSON；`list --json` 的标题截 120 字符，更完整的

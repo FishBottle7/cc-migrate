@@ -243,7 +243,13 @@ export function apply(ctx: PluginContext, config: SessionMigrateConfig = {}): vo
       root: flagString(flags, 'root') ?? flagString(flags, 'dst-root') ?? defaultRoot,
     });
     if (res.ok) {
-      return { ...res, ok: true as const, summary: `imported ${res.source.tool}:${res.source.sessionId} -> dsh:${res.target.sessionId}\n  ${res.target.paths.join('\n  ')}` };
+      const lines = [`imported ${res.source.tool}:${res.source.sessionId} -> dsh:${res.target.sessionId}`];
+      if (res.alreadyMigrated?.length) {
+        lines.push(`注意：该源会话此前已迁移过 ${res.alreadyMigrated.length} 次（最近 -> dsh:${res.alreadyMigrated[res.alreadyMigrated.length - 1].target.sessionId}）；本次再写全新副本，不覆盖`);
+      }
+      if (res.logWarning) lines.push(`警告：${res.logWarning}`);
+      lines.push(`  ${res.target.paths.join('\n  ')}`);
+      return { ...res, ok: true as const, summary: lines.join('\n') };
     }
     return res;
   });

@@ -23,7 +23,7 @@ import { copyFileSync, existsSync, mkdirSync } from 'node:fs';
 import { dirname, isAbsolute, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { builtinRegistry, readSource, summarizeIr } from '@cc-migrate/core';
+import { builtinRegistry, readSource, summarizeIr, findMigrationsBySource, readMigrationLog } from '@cc-migrate/core';
 
 import { formatSessionLine, importSession, listSources, parseArgs, preview, SOURCE_TOOLS } from './index.js';
 
@@ -33,8 +33,8 @@ usage: node cli.js <command> [args] [flags]
 
 commands:
   tools                                  list source tool ids (one per line)
-  list <tool> [--root <dir>] [--cwd <dir>] [--limit N] [--json]
-                                         list a source tool's sessions (newest first; default cap 50, --limit 0 unlimited, titles capped at 120 chars)
+  list <tool> [--root <dir>] [--cwd <dir>] [--search <kw|id>] [--since <7d|ISO>] [--before <...>] [--limit N] [--json]
+                                         list a source tool's sessions (newest first; default cap 50, --limit 0 unlimited, titles capped at 120 chars; --cwd matches the same project = equal or ancestor/descendant; --search matches title substring or session-id fragment)
   preview <tool> <sessionId> [--root <dir>] [--json] [--messages K] [--lines N] [--full]
                                          --json: bounded decision digest (~1-2KB: counts + <=200-char excerpts)
                                          text: offline preview, first 120 lines (--lines N) unless --full
@@ -44,6 +44,8 @@ commands:
   skill install [--agent <id,id>|--all] [--dir <path>] [--json]
                                          install the UNIVERSAL cc-migrate skill (standalone-CLI flavor) into agent frameworks' skill dirs
   skill status [--json]                  show per-framework install status
+  log list [--limit N] [--json]          recent migrations (~/.cc-migrate/migrations.jsonl; CC_MIGRATE_LOG overrides)
+  log check <tool> <sessionId> [--json]  has this source session been migrated? (JSON: migrated field)
 
 tools: ${SOURCE_TOOLS.join(', ')}
 target is always dsh; every migrate mints a fresh session id — nothing is ever overwritten or deleted.
@@ -93,6 +95,35 @@ function capTitle(title: string | undefined): string | undefined {
 
 /** list 默认条数上限（--limit 0 解除）。 */
 const LIST_DEFAULT_LIMIT = 50;
+
+/**
+ * 「同一项目」判定（与独立 CLI 同语义）：归一化后相等或互为祖先/后代
+ * （带路径边界，防 D:\demo 误命中 D:\demoX）。
+ */
+function sameProject(sessionCwd: string, queryCwd: string): boolean {
+  const a = normPath(sessionCwd);
+  const b = normPath(queryCwd);
+  return a === b || a.startsWith(b + '/') || b.startsWith(a + '/');
+}
+
+/** --search：标题子串或 sessionId 片段（含尾 8 位这类形态），大小写不敏感。 */
+function matchSearch(m: { title?: string; sessionId: string }, query: string): boolean {
+  const q = query.toLowerCase();
+  return (m.title !== undefined && m.title.toLowerCase().includes(q)) || m.sessionId.toLowerCase().includes(q);
+}
+
+/** --since/--before 时间表达式（12h / 7d / 2w 或 ISO 日期），epoch ms。 */
+function parseTimeExpr(raw: string, flag: string): number {
+  const rel = /^(\d+)(h|d|w)$/i.exec(raw);
+  if (rel) {
+    const n = Number.parseInt(rel[1], 10);
+    const unitMs = { h: 3_600_000, d: 86_400_000, w: 604_800_000 }[rel[2].toLowerCase() as 'h' | 'd' | 'w'];
+    return Date.now() - n * unitMs;
+  }
+  const abs = Date.parse(raw);
+  if (Number.isFinite(abs)) return abs;
+  fail(`${flag} expects a relative time (12h / 7d / 2w) or an ISO date (2026-08-01), got "${raw}"`);
+}
 
 /* ── skill install：通用 skill 安装器（与独立 CLI 同表，插件内也可用）────────
  * DSH 用户通常不需要（插件已注册运行时 skill），但保留同一入口让「插件 CLI」
@@ -184,7 +215,7 @@ function runSkillInstall(flags: Record<string, string | true>): void {
 
 async function main(argv: string[]): Promise<void> {
   const { positionals, flags } = parseArgs(argv);
-  const [cmd, a, b] = positionals;
+  const [cmd, a, b, c] = positionals;
 
   switch (cmd) {
     case 'tools': {
@@ -197,11 +228,16 @@ async function main(argv: string[]): Promise<void> {
       const res = await listSources(a, flagString(flags, 'root') ?? flagString(flags, 'src-root'));
       if (!res.ok) fail(res.error);
       let sessions = res.sessions;
+      const search = flagString(flags, 'search');
+      if (search) sessions = sessions.filter((m) => matchSearch(m, search));
       const cwd = flagString(flags, 'cwd');
-      if (cwd) {
-        const needle = normPath(cwd);
-        sessions = sessions.filter((m) => m.cwd !== undefined && normPath(m.cwd) === needle);
-      }
+      if (cwd) sessions = sessions.filter((m) => m.cwd !== undefined && sameProject(m.cwd, cwd));
+      const sinceRaw = flagString(flags, 'since');
+      const since = sinceRaw === undefined ? undefined : parseTimeExpr(sinceRaw, '--since');
+      if (since !== undefined) sessions = sessions.filter((m) => (m.createdAt ?? 0) >= since);
+      const beforeRaw = flagString(flags, 'before');
+      const before = beforeRaw === undefined ? undefined : parseTimeExpr(beforeRaw, '--before');
+      if (before !== undefined) sessions = sessions.filter((m) => (m.createdAt ?? 0) < before);
       sessions = [...sessions].sort((x, y) => (y.createdAt ?? 0) - (x.createdAt ?? 0));
       // 上下文体量预算（与独立 CLI 同款）：默认 50 条封顶（--limit 0 解除），标题 ≤120 字符
       const total = sessions.length;
@@ -209,12 +245,12 @@ async function main(argv: string[]): Promise<void> {
       if (limit > 0) sessions = sessions.slice(0, limit);
       const capped = sessions.map((m) => ({ ...m, ...(m.title !== undefined ? { title: capTitle(m.title) } : {}) }));
       if (flags.json) {
-        console.log(JSON.stringify({ ok: true, tool: res.tool, count: capped.length, sessions: capped }, null, 2));
+        console.log(JSON.stringify({ ok: true, tool: res.tool, count: capped.length, total, sessions: capped }, null, 2));
         return;
       }
       for (const [i, m] of capped.entries()) console.log(formatSessionLine(i, m));
       if (limit > 0 && total > capped.length) {
-        console.error(`[list] 共 ${total} 条，已按默认上限显示 ${capped.length} 条 —— 用 --cwd 缩小范围或 --limit 0 看全部`);
+        console.error(`[list] 共 ${total} 条命中，已按默认上限显示 ${capped.length} 条 —— 收紧 --search/--cwd/--since 或 --limit 0 看全部`);
       }
       return;
     }
@@ -307,6 +343,40 @@ async function main(argv: string[]): Promise<void> {
       console.log(`migrated ${res.source.tool}:${res.source.sessionId} -> dsh:${res.target.sessionId}`);
       for (const p of res.target.paths) console.log(`  ${p}`);
       return;
+    }
+
+    case 'log': {
+      // 迁移日志查询（与独立 CLI 同一份 ~/.cc-migrate/migrations.jsonl）
+      if (a === 'list') {
+        const records = await readMigrationLog();
+        records.sort((x, y) => y.ts - x.ts);
+        const limit = parseLimit(flags) ?? 20;
+        const rows = limit > 0 ? records.slice(0, limit) : records;
+        if (flags.json) {
+          console.log(JSON.stringify({ ok: true, count: rows.length, total: records.length, records: rows }, null, 2));
+          return;
+        }
+        for (const r of rows) {
+          console.log(`${new Date(r.ts).toISOString()}\t${r.source.tool}:${r.source.sessionId} -> ${r.target.tool}:${r.target.sessionId}\t(via ${r.via})`);
+        }
+        if (limit > 0 && records.length > rows.length) console.error(`[log] 共 ${records.length} 条，已显示最近 ${rows.length} 条 —— --limit 0 看全部`);
+        return;
+      }
+      if (a === 'check' && b && c) {
+        const records = await findMigrationsBySource(b, c);
+        if (flags.json) {
+          console.log(JSON.stringify({ ok: true, migrated: records.length > 0, source: { tool: b, sessionId: c }, records }, null, 2));
+          return;
+        }
+        if (records.length === 0) {
+          console.log(`not migrated: ${b}:${c}（迁移日志无记录；桌面 App 迁移暂不进日志）`);
+          return;
+        }
+        console.log(`migrated ${records.length} time(s):`);
+        for (const r of records) console.log(`  -> ${r.target.tool}:${r.target.sessionId} @ ${new Date(r.ts).toISOString()} (via ${r.via})`);
+        return;
+      }
+      fail('usage: log <list|check> [--limit N] [--json]\n  log check <srcTool> <srcSessionId> — "has this been migrated?" (--json: migrated field)');
     }
 
     case '--help':
