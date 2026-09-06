@@ -144,12 +144,15 @@ node lib/cli.js skill status [--json]
   不会覆盖已有会话」；参数 = 工作目录（留空沿用源会话）+ 拍平子代理旁链
   （flatten）+ 保留 harness 注入行（keepSynthetic）。结果页给新 session
   id + 落盘路径 + 「在 DSH 会话列表选中即可 resume」提示。
-- **导入成功自动跳转**（v0.3.3）：结果页出现后自动调宿主 client runtime
-  的 `ctx.sessions.open(新会话 id)`（ISessions，better-sidebar 同款 inject
-  声明），DSH 主界面即切到新会话可直接续聊。open 对「还没进客户端会话
-  列表」的 id 会同步 throw（宿主源码锚定语义），所以带退避重试（~4.5s
-  窗口）等列表刷新；始终失败回落结果页提示行（手动在会话列表选择）。
-  sessions 服务探测失败（老宿主）时功能静默关闭，其余不受影响。
+- **导入成功自动跳转**（v0.3.3/v0.3.4）：结果页出现后自动调宿主 client
+  runtime 的 `ctx.sessions.open(新会话 id)`（ISessions，better-sidebar 同款
+  inject 声明），DSH 主界面即切到新会话可直接续聊。两个宿主语义（源码
+  锚定）：open 对「还没进客户端会话列表」的 id 会同步 throw；而导入是
+  宿主半直接写盘，客户端列表**不会自动更新**（不手动刷新就永远失败）。
+  因此每拍先经运行时桥（`SessionRuntime.manager.refreshList`——TS private
+  仅编译期，运行时普通属性）主动重拉 `session.list` 再 open，退避节拍
+  ~4.5s；桥缺席（宿主更名）优雅退化回被动重试，始终失败回落结果页提示
+  行。sessions 服务探测失败（老宿主）时功能静默关闭，其余不受影响。
 - **浅色/暗色自适应**：颜色全部走宿主 `--dsw-alias-*` 设计系统 token
   （`src/client/theme.ts`，与 better-sidebar 同一套），随宿主主题翻转；
   拿不到变量（老宿主/无头冒烟）时回退内联暗色兜底，观感不变。
@@ -201,7 +204,7 @@ DSH 插件官方双半规范（与 dsh-better-sidebar 自身同构）：
 ### 安装与使用
 
 ```bash
-dsh plugin --profile web add ./cc-migrate-dsh-plugin-0.3.3.tgz   # 宿主半 + client 半一起装
+dsh plugin --profile web add ./cc-migrate-dsh-plugin-0.3.4.tgz   # 宿主半 + client 半一起装
 # 重装同版本前先清安装位（pnpm integrity 命中不重解压的 stale 坑）：
 #   rm -rf ~/.dsh/profiles/web/node_modules/@cc-migrate/dsh-plugin
 # 重启 dsh web 后：右侧边栏 + 菜单 → 「会话迁移」tab

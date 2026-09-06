@@ -23,7 +23,9 @@
  *         落根/徽章计数/14px 缩进/受控折叠）、折叠记忆（cc-migrate: key
  *         回环 + 坏存储降级）、富预览流（思考/工具/注入块、截断角标；
  *         v0.3.1 起旁链 = desktop 同款切换器 + 整区切换：主视图无内联
- *         旁链、菜单树节点/准星、旁链整区视图主流换出）。
+ *         旁链、菜单树节点/准星、旁链整区视图主流换出）；自动跳转
+ *         openSessionWithRetry（每拍先经运行时桥 manager.refreshList 主动
+ *         重拉 session.list 再 open；桥缺席退化被动重试，耗尽回落 fail）。
  *
  *   B. 宿主半 fenced 路由（src/routes.ts，宿主同形 mock 纪律）：
  *      7. buildMigrateApi 产出恰好 4 个 method（list-sources/preview/import
@@ -300,19 +302,34 @@ assert.ok(agentHtml.includes('子代理 · explorer'), 'switcher button shows th
 assert.ok(!agentHtml.includes('pnpm build'), 'main flow content absent in agent view (whole-area switch)');
 console.log('[A8c] agent whole-area view: sidechain flow only, main flow swapped out');
 
-// ── A9. 自动跳转重试（v0.3.3：导入成功 → ctx.sessions.open 切到新会话）────
-// open 的失败语义（宿主 dsh-client-runtime SessionManager.select 源码锚定）：
-// id 不在客户端会话列表里就同步 throw——刚导入的会话要等列表刷新，重试
-// 节拍覆盖该窗口；port 缺席时功能整体关闭（结果页不渲染跳转行）。
+// ── A9. 自动跳转重试（v0.3.3/0.3.4：导入成功 → ctx.sessions.open 切新会话）──
+// 宿主语义锚定（dsh-client-runtime 源码）：open 对不在列表的 id 同步 throw；
+// 导入是宿主半直接写盘、客户端列表不会自动更新（真机反馈：不手动刷新
+// open 永远失败）——每拍先经运行时桥 manager.refreshList() 主动重拉
+// session.list 再 open；桥缺席/拉取失败时退化为被动重试，节拍耗尽回落 fail。
 {
   let calls = 0;
   const flaky = { open: () => { calls += 1; if (calls < 3) throw new Error('sessions.select: unknown session x'); } };
-  assert.equal(await views.openSessionWithRetry(flaky, 'x', [0, 1, 1, 1]), 'ok', 'retry lands once the session is listed');
+  assert.equal(await views.openSessionWithRetry(flaky, 'x', [0, 1, 1, 1]), 'ok', 'passive retry (no bridge) lands once the session is listed');
   assert.equal(calls, 3, 'open called exactly until success');
   const dead = { open: () => { throw new Error('sessions.select: unknown session x'); } };
   assert.equal(await views.openSessionWithRetry(dead, 'x', [0, 1, 1]), 'fail', 'exhausted retries -> fail (done page shows the manual-select hint)');
+  // 运行时桥：每拍先 pull 再 open——新会话随拉取进列表，open 当拍落地
+  let pulls = 0;
+  const listed = { manager: { refreshList: () => { pulls += 1; } }, open: () => {} };
+  assert.equal(await views.openSessionWithRetry(listed, 'x', [0, 1, 1]), 'ok', 'bridge pull then open');
+  assert.equal(pulls, 1, 'first-beat pull makes open land (no wasted beats)');
+  let pulls2 = 0;
+  const late = {
+    manager: { refreshList: () => { pulls2 += 1; } },
+    open: () => { if (pulls2 < 2) throw new Error('sessions.select: unknown session x'); },
+  };
+  assert.equal(await views.openSessionWithRetry(late, 'x', [0, 1, 1]), 'ok', 'second-beat pull lands the late-listed session');
+  assert.equal(pulls2, 2, 'pull runs on every beat until open succeeds');
+  const brokenPull = { manager: { refreshList: () => { throw new Error('transport down'); } }, open: () => {} };
+  assert.equal(await views.openSessionWithRetry(brokenPull, 'x', [0]), 'ok', 'broken refreshList does not block the open attempt');
 }
-console.log('[A9] auto-jump: open-with-retry rides the list refresh, exhausts to an honest fail');
+console.log('[A9] auto-jump: active session.list re-pull via runtime bridge + passive retry fallback + honest fail');
 
 /* ══════════════ B. 宿主半 fenced 路由（src/routes.ts） ══════════════ */
 

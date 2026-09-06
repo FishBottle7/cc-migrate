@@ -159,10 +159,14 @@ const fmtTime = (ts?: number): string =>
 const truncate = (s: string, n: number): string => (s.length > n ? `${s.slice(0, n - 1)}…` : s);
 
 /* ── 自动跳转（导入成功 → DSH 主界面切到新会话）──────────────────────────
- * 宿主 ctx.sessions.open 的失败语义是「列表里没有就同步 throw」——刚写入
- * 的会话要等客户端会话列表刷新（host pull/帧）才可见，所以立即 open 可能
- * 撞上竞态。退避重试覆盖 ~4.5s 的刷新窗口；全部失败回落 done 页的提示行
- * （用户手动在会话列表选）。port 缺席（老宿主/探测失败）整个功能静默关闭。
+ * 两个宿主语义（dsh-client-runtime 源码锚定）：
+ *  1. ctx.sessions.open 对「不在客户端会话列表」的 id 同步 throw（SessionManager.select）；
+ *  2. 新会话不会自动进列表——导入是宿主半直接写盘，客户端列表只靠
+ *     session.list 重拉（reconnect）或 host 变更帧更新，ISessions 公开面
+ *     没有刷新入口（真机反馈：不手动刷新列表，open 永远撞 throw）。
+ * 因此每拍先走运行时桥主动重拉：SessionRuntime.manager 是 TS private 但
+ * 运行时是普通属性，manager.refreshList() 即全量重拉（单飞）。字段更名时
+ * 链式探测得 undefined → 优雅退化回被动重试，节拍耗尽回落 done 页提示行。
  */
 
 /** 重试节拍（ms）：立即 + 3 次退避，总窗口 ~4.5s。 */
@@ -170,14 +174,35 @@ const JUMP_DELAYS_MS = [0, 600, 1400, 2500];
 
 const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 
+/** 宿主 SessionRuntime 的运行时桥（仅探测，不做硬依赖）。 */
+interface SessionsRefreshBridge {
+  manager?: {
+    refreshList?: () => unknown;
+  };
+}
+
+/** 主动重拉 session.list（失败静默——拉不动时仍有 open 的被动重试兜着）。 */
+async function pullSessionList(port: MigrateSessionsPort): Promise<void> {
+  const manager = (port as unknown as SessionsRefreshBridge).manager;
+  const refreshList = manager?.refreshList;
+  if (typeof refreshList !== 'function') return;
+  try {
+    await Promise.resolve(refreshList.call(manager)).catch(() => { /* 传输失败——下一拍再试 */ });
+  } catch {
+    /* 同步抛同样吞掉：刷新是尽力而为，不能阻塞 open 尝试 */
+  }
+}
+
 /**
- * open-with-retry：撞上「会话未进列表」的 throw 就按节拍重试。
+ * open-with-retry：每拍先重拉列表再尝试 open（撞上「会话未进列表」的
+ * throw 就按节拍重来）。
  * @returns 'ok'（某次 open 未抛）| 'fail'（节拍内始终抛）。只吃 open 的
  * 同步异常；port 本身缺席由调用方判空。
  */
 export async function openSessionWithRetry(port: MigrateSessionsPort, sessionId: string, delays: readonly number[] = JUMP_DELAYS_MS): Promise<'ok' | 'fail'> {
   for (let i = 0; i < delays.length; i++) {
     if (delays[i] > 0) await sleep(delays[i]);
+    await pullSessionList(port);
     try {
       port.open(sessionId);
       return 'ok';
