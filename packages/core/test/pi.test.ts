@@ -745,3 +745,64 @@ test('P1-C: synthesized entry timestamps derive from the session, never the migr
   // also derives: check the simplest invariant — every row is 2024-dated
   assert.ok(rows.every((r) => !r.timestamp || r.timestamp.startsWith('2024-')), 'no wall-clock now anywhere in the file');
 });
+
+test('write: foreign synthetic rows land as pi custom injections, never as plain user speech', async () => {
+  const adapter = new PiAdapter();
+  const root = await tempRoot();
+  const ir: MigratedSession = {
+    schemaVersion: 2,
+    originTool: 'claude',
+    originSessionId: 'src-1',
+    cwd: '/tmp/proj',
+    messages: [
+      // real human prompt — the only row allowed to look human
+      { role: 'user', content: [{ type: 'text', text: '帮我看看这个' }], timestamp: 1733270000000 },
+      // agent-authored interrupt marker (claude round-2 classification)
+      { role: 'user', content: [{ type: 'text', text: '[Request interrupted by user]' }], synthetic: true, timestamp: 1733270001000 },
+      { role: 'assistant', content: [{ type: 'text', text: 'working' }], timestamp: 1733270001500 },
+      // DSH-style runtime context injection
+      { role: 'user', content: [{ type: 'text', text: '<runtime-context>env</runtime-context>' }], synthetic: true, timestamp: 1733270002000 },
+    ],
+  };
+  const res = await adapter.write(ir, { root, targetCwd: '/tmp/proj' });
+  const rows = (await fs.readFile(res.paths[0]!, 'utf8')).split('\n').filter((l) => l.trim()).map((l) => JSON.parse(l)) as Array<{ type: string; message?: Record<string, unknown> }>;
+  const msgs = rows.filter((r) => r.type === 'message').map((r) => r.message!);
+  const humans = msgs.filter((m) => m.role === 'user');
+  assert.equal(humans.length, 1, 'only the real prompt writes as a user row');
+  assert.equal(humans[0]!.content, '帮我看看这个');
+  const customs = msgs.filter((m) => m.role === 'custom');
+  assert.equal(customs.length, 2, 'both synthetic rows ride pi native injection channel');
+  for (const c of customs) {
+    assert.equal(c.customType, 'migrated');
+    assert.equal(c.display, true, 'injections stay visible (as injections), never silently dropped');
+  }
+  assert.deepEqual(customs[0]!.content, [{ type: 'text', text: '[Request interrupted by user]' }]);
+
+  // read back: pi's own reader re-marks custom rows synthetic — the
+  // misclassification never re-enters the IR
+  const back = await adapter.parse(res.sessionId, root);
+  assert.equal(back.messages.filter((m) => m.role === 'user' && m.synthetic === true).length, 2);
+  assert.equal(back.messages.filter((m) => m.role === 'user' && !m.synthetic).length, 1);
+  assert.equal(
+    (back.messages.find((m) => m.role === 'user' && m.synthetic === true)?.meta as { pi?: { customMessage?: { customType?: string } } })?.pi?.customMessage?.customType,
+    'migrated',
+  );
+
+  // native restores keep priority: a pi-sourced custom row carries
+  // meta.pi.customMessage AND synthetic — it must keep its ORIGINAL customType
+  const ir2: MigratedSession = {
+    schemaVersion: 2,
+    originTool: 'pi',
+    originSessionId: 'src-2',
+    cwd: '/tmp/proj',
+    messages: [
+      { role: 'user', content: [{ type: 'text', text: 'ext note' }], synthetic: true, timestamp: 1733270100000, meta: { pi: { customMessage: { customType: 'my-extension', display: false } } } },
+    ],
+  };
+  const res2 = await adapter.write(ir2, { root, targetCwd: '/tmp/proj' });
+  const rows2 = (await fs.readFile(res2.paths[0]!, 'utf8')).split('\n').filter((l) => l.trim()).map((l) => JSON.parse(l)) as Array<{ type: string; message?: Record<string, unknown> }>;
+  const msg2 = rows2.find((r) => r.type === 'message')!.message!;
+  assert.equal(msg2.role, 'custom');
+  assert.equal(msg2.customType, 'my-extension', 'meta.pi.customMessage wins over the migrated fallback');
+  assert.equal(msg2.display, false, 'native display flag restored, not forced visible');
+});

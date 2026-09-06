@@ -147,6 +147,7 @@ pi 的 compaction/branch_summary 在**原生 context 里是 user 消息**（`con
 - **写回 pi**：桶 → 原生 entry（不写渲染文本进 entry 的 summary 字段——summary 字段存纯摘要；渲染是 pi 运行时行为）；messages[] 里那条 anchor 消息**跳过**（防双写）
 - **写回其他工具**（dsh/claude/zcode…）：只消费 anchor 消息（它们不认识 pi 桶），文本已在 messages[] 里流动——与其他工具的 compaction 契约天然兼容
 - 活跃面折叠语义（§4）：pi 的旧段在原生是「留在文件但不进 context」。跨工具写 pi 时按「压缩折叠坑」契约三选一并在本文档登记选择：**选 3**（完整归档——IR messages[] 全量进 pi 文件；被折叠段进 pi 文件但不挂 compaction 的 firstKept 区间即恢复原状；代价是 pi resume 后上下文变大，但语义诚实且无损）。理由：pi 的 compaction 锚定 `firstKeptEntryId` 是 pi 运行时算出来的 cut point，迁移侧伪造一个 cut 只会破坏摘要与保留段的对应关系
+- **外来注入行落 pi 的通道（2026-09-06）**：IR `synthetic` 且无 pi 原生载荷（`meta.pi.bash`/`meta.pi.customMessage`）的消息行——claude 打断标记 / teammate 信封 / DSH runtime 注入等——写端一律落 pi 原生注入通道 `role:'custom'`（`customType:'migrated'`，`display:true`），绝不写裸 user 行（pi UI 会读成真人发言，正是本适配器读端为 bashExecution/custom 防掉的误读）；pi 读端把 custom 行还原成 `synthetic:true` + `meta.pi.customMessage`，误分类不回灌 IR。assistant 角色除外（custom 是 user 族载体）；pi→pi 的原生载荷逐字还原优先于本规则，customType/display 不被覆盖。
 
 ## 9. 系统提示词（迁移必须明确的语义）
 

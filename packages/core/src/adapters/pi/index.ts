@@ -1427,19 +1427,31 @@ function piMessageFromMigrated(msg: MigratedMessage): Record<string, unknown> {
     const out: Record<string, unknown> = {
       role: 'custom',
       customType: typeof cm.customType === 'string' ? cm.customType : 'unknown',
-      content: msg.content.map((b) => {
-        if (b.type === 'file') {
-          if (b.data) return { type: 'image', data: b.data, mimeType: b.mediaType ?? 'image/png' };
-          return { type: 'text', text: `[file: ${b.filename ?? b.url ?? 'attachment'}]` };
-        }
-        if (b.type === 'text') return { type: 'text', text: b.text };
-        return { type: 'text', text: b.type === 'thinking' ? b.thinking : (b.type === 'tool_use' ? `[tool_use: ${b.name}]` : b.content) };
-      }),
+      content: piCustomContentOf(msg.content),
       display: cm.display !== false,
       timestamp: msg.timestamp ?? Date.now(),
     };
     if (cm.details !== undefined) out.details = cm.details;
     return out;
+  }
+
+  // Foreign harness injections (IR `synthetic` with no native pi payload —
+  // claude interrupt markers / teammate envelopes / DSH runtime context / …)
+  // must not land as plain user rows: pi's UI would read them as human speech,
+  // the exact misread this adapter's own read side prevents (bashExecution and
+  // custom messages re-mark synthetic). pi's native injection channel is the
+  // custom message role — LLM-visible as a user row, displayed as an extension
+  // card, and the read side restores the synthetic marking on re-parse, so the
+  // misclassification never re-enters the IR. Assistant rows are excluded
+  // (custom is a user-family carrier); the native restores above keep priority.
+  if (msg.role !== 'assistant' && msg.synthetic === true) {
+    return {
+      role: 'custom',
+      customType: 'migrated',
+      content: piCustomContentOf(msg.content),
+      display: true,
+      timestamp: msg.timestamp ?? Date.now(),
+    };
   }
 
   // v3.1 developer-role rule: pi's native vocabulary is only
@@ -1483,6 +1495,18 @@ function piMessageFromMigrated(msg: MigratedMessage): Record<string, unknown> {
     }
   }
   return out;
+}
+
+/** IR blocks → pi custom-message content items (native restore + foreign injection projection share one mapping). */
+function piCustomContentOf(content: ContentBlock[]): unknown[] {
+  return content.map((b) => {
+    if (b.type === 'file') {
+      if (b.data) return { type: 'image', data: b.data, mimeType: b.mediaType ?? 'image/png' };
+      return { type: 'text', text: `[file: ${b.filename ?? b.url ?? 'attachment'}]` };
+    }
+    if (b.type === 'text') return { type: 'text', text: b.text };
+    return { type: 'text', text: b.type === 'thinking' ? b.thinking : (b.type === 'tool_use' ? `[tool_use: ${b.name}]` : b.content) };
+  });
 }
 
 export { piProjectKey, defaultPiSessionsDir };
