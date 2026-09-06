@@ -995,6 +995,10 @@ const SYNTHETIC_KINDS = new Set([
 
 function isSyntheticContentKind(kind: string): boolean {
   if (NON_HARNESS_KINDS.has(kind) || kind.startsWith('user.')) return false;
+  // AGENTS.md rows are the documented non-synthetic injection (docs/agents/
+  // codex.md §8/§11.2: 随历史保真迁移) — exempt them from the `.instructions`
+  // prefix so the official channel agrees with the legacy marker table.
+  if (kind === 'agents_md.instructions') return false;
   if (SYNTHETIC_KINDS.has(kind)) return true;
   return SYNTHETIC_KIND_PREFIXES.some((p) => kind.endsWith(p));
 }
@@ -1014,15 +1018,23 @@ function passthroughKinds(passthrough: unknown): string[] | undefined {
  * Legacy text-marker tables — mirrors codex-rs thread-store/src/local/
  * rollout_migration/rollback.rs (frozen "alongside the legacy migration
  * adapter"). [start, end | null, kind, synthetic]; end=null means prefix-only.
+ * The synthetic column must agree with isSyntheticContentKind for the same
+ * content on the official channel (subagent_notification /
+ * plugins.recommendations are runtime-relayed harness rows there;
+ * skills.instructions hits the `.instructions` prefix) — rollouts without
+ * kinds must not classify differently from rollouts with them. AGENTS.md is
+ * the documented NON-synthetic injection (docs/agents/codex.md §8: 随历史保真
+ * 迁移), non-synthetic on BOTH channels; `<user_shell_command>` and
+ * `<external_*>` are user-initiated, hence non-synthetic on both.
  */
 const LEGACY_USER_MARKERS: Array<[string, string | null, string, boolean]> = [
   ['# AGENTS.md instructions', '</INSTRUCTIONS>', 'agents_md.instructions', false],
   ['<environment_context>', '</environment_context>', 'environments.environment_context', true],
   ['<user_shell_command>', '</user_shell_command>', 'shell.user_command', false],
   ['<turn_aborted>', '</turn_aborted>', 'generic.turn_aborted', true],
-  ['<subagent_notification>', '</subagent_notification>', 'multi_agent.subagent_notification', false],
-  ['<recommended_plugins>', '</recommended_plugins>', 'plugins.recommendations', false],
-  ['<skill>', '</skill>', 'skills.instructions', false],
+  ['<subagent_notification>', '</subagent_notification>', 'multi_agent.subagent_notification', true],
+  ['<recommended_plugins>', '</recommended_plugins>', 'plugins.recommendations', true],
+  ['<skill>', '</skill>', 'skills.instructions', true],
   ['<goal_context>', '</goal_context>', 'goal.internal_context', true],
   ['Warning: The maximum number of unified exec processes', null, 'unified_exec.legacy_process_limit_warning', true],
   ['Warning: apply_patch was requested via ', null, 'apply_patch.legacy_exec_command_warning', true],

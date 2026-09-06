@@ -518,3 +518,61 @@ test('OpenCode DB session.path is worktree-relative, never the absolute director
   assert.equal(row3.path, 'sub', 'cwd nested under a .git root writes the repo-relative subpath');
   db3.close();
 });
+
+test('OpenCode parse consumes native part-level synthetic/ignored flags — injections never read back as human turns', async () => {
+  const adapter = new OpenCodeAdapter();
+  const root = await tempRoot();
+  const dbPath = join(root, 'opencode.db');
+  createTestDb(dbPath);
+  const db = new DatabaseSync(dbPath);
+  db.prepare('INSERT INTO project (id, worktree) VALUES (?, ?)').run('proj_flag', '/tmp/proj');
+  db.prepare('INSERT INTO session (id, project_id, directory, title, time_created) VALUES (?, ?, ?, ?, ?)')
+    .run('ses_flag', 'proj_flag', '/tmp/proj', 'flag test', T0);
+  const insMsg = db.prepare('INSERT INTO message (id, session_id, time_created, data) VALUES (?, ?, ?, ?)');
+  const insPart = db.prepare('INSERT INTO part (id, message_id, session_id, time_created, data) VALUES (?, ?, ?, ?, ?)');
+  // msg_mixed: real text + flagged steering sibling (real corpus: 12 such rows)
+  insMsg.run('msg_mixed', 'ses_flag', T0, JSON.stringify({ role: 'user' }));
+  insPart.run('p_m1', 'msg_mixed', 'ses_flag', T0, JSON.stringify({ type: 'text', text: 'my real question' }));
+  insPart.run('p_m2', 'msg_mixed', 'ses_flag', T0, JSON.stringify({ type: 'text', text: 'Called the Read tool with the following', synthetic: true }));
+  // msg_pure: every text part synthetic — the message IS an injection
+  insMsg.run('msg_pure', 'ses_flag', T0 + 1, JSON.stringify({ role: 'user' }));
+  insPart.run('p_p1', 'msg_pure', 'ses_flag', T0 + 1, JSON.stringify({ type: 'text', text: '[search-mode]\nMAXIMIZE SEARCH EFFORT.', synthetic: true }));
+  // msg_ignored: ignored flag counts the same
+  insMsg.run('msg_ignored', 'ses_flag', T0 + 2, JSON.stringify({ role: 'user' }));
+  insPart.run('p_i1', 'msg_ignored', 'ses_flag', T0 + 2, JSON.stringify({ type: 'text', text: '[user interrupted]', ignored: true }));
+  db.close();
+
+  const back = await adapter.parse('ses_flag', dbPath);
+  const users = back.messages.filter((m) => m.role === 'user');
+  assert.equal(users.length, 3, 'all three rows project — nothing evaporates');
+  const mixed = users.find((m) => (m.content[0] as { text?: string }).text === 'my real question');
+  assert.ok(mixed, 'mixed message keeps the real part');
+  assert.equal(mixed!.synthetic, undefined, 'mixed message stays a human turn');
+  assert.equal((mixed!.content as Array<{ text?: string }>).length, 1, 'flagged sibling part is not projected as user text');
+  const pure = users.find((m) => (m.content[0] as { text?: string }).text?.startsWith('[search-mode]'));
+  assert.ok(pure, 'pure-synthetic message is preserved');
+  assert.equal(pure!.synthetic, true, 'pure-synthetic message is marked as injection, not a human turn');
+  const ignored = users.find((m) => (m.content[0] as { text?: string }).text === '[user interrupted]');
+  assert.ok(ignored, 'ignored-flag message is preserved');
+  assert.equal(ignored!.synthetic, true, 'ignored flag marks the message synthetic');
+});
+
+test('OpenCode write(keepSynthetic) -> parse round-trip keeps synthetic marking stable', async () => {
+  const adapter = new OpenCodeAdapter();
+  const root = await tempRoot();
+  const ir: MigratedSession = {
+    ...fallbackIr(),
+    messages: [
+      { role: 'user', content: [{ type: 'text', text: 'real human turn' }], timestamp: T0 },
+      { role: 'user', content: [{ type: 'text', text: '[search-mode]\nMAXIMIZE SEARCH EFFORT.' }], timestamp: T0 + 1, synthetic: true },
+      { role: 'assistant', content: [{ type: 'text', text: 'ok' }], timestamp: T0 + 2 },
+    ],
+  };
+  const res = await adapter.write(ir, { root, targetCwd: '/tmp/proj', keepSynthetic: true });
+  const back = await adapter.parse(res.sessionId, root);
+  const users = back.messages.filter((m) => m.role === 'user');
+  assert.equal(users.length, 2);
+  assert.equal(users[0].synthetic, undefined);
+  assert.equal(users[1].synthetic, true, 'synthetic message round-trips marked');
+  assert.equal((users[1].content[0] as { text: string }).text, '[search-mode]\nMAXIMIZE SEARCH EFFORT.');
+});

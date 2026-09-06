@@ -1154,14 +1154,26 @@ function eventToMessage(type: string, data: DshEvent['data']): MigratedMessage |
       // 'compact', @deepseek-ai/dsh-compaction/checkpoint) are CONVERSATION
       // CONTENT — the in-stream summary travels as a message (IR gap #3) and
       // must survive migration, so they are NOT synthetic. Unknown kinds and
-      // missing sources stay non-synthetic: never drop what cannot be
+      // missing sources stay non-synthetic — never drop what cannot be
       // classified (new harness kinds keep appearing; human turns are always
-      // stamped kind:'user').
+      // stamped kind:'user') — EXCEPT rows whose text hits a known injection
+      // marker (isMarkerInjection): DSH's own harness stamps several injection
+      // families as kind:'user' (真机样本 52be3474), so the kind cannot be
+      // trusted alone for those.
       const sourceKind = typeof source?.kind === 'string' ? source.kind : undefined;
       const isCompactionCheckpoint = sourceKind === 'plugin' && source?.plugin === 'compact';
       const synthetic = sourceKind !== undefined && sourceKind !== 'user' && !isCompactionCheckpoint;
       if (isToolBridged) return withDshNative({ ...msg, role: 'tool' as const }, native);
-      if (synthetic) return withDshNative({ ...msg, synthetic: true }, native);
+      // kind:'user' (and missing-source) rows can still be injections — DSH's
+      // own harness stamps permissions / AGENTS.md / environment-context /
+      // team-preamble / multi-agent-mode rows as ordinary kind:'user' messages
+      // (真机样本 52be3474 锚定；2026-09 现网复验：2600 条 kind:'user' 中 46 条
+      // 命中已知注入前缀). The marker list is the same one the title fallback
+      // uses — a text hit classifies what the kind cannot, so it marks
+      // synthetic instead of riding as a human turn. Delegation task prompts
+      // (the child session's FIRST kind:'user' row) carry none of the prefixes
+      // and stay user info.
+      if (synthetic || isMarkerInjection(msg)) return withDshNative({ ...msg, synthetic: true }, native);
       return withDshNative(msg, native);
     }
     case 'assistant/message': {
@@ -1452,58 +1464,78 @@ export function irToEvents(ir: MigratedSession, baseTime: number, opts?: IrToEve
       // Rebuild DSH tool/result shape: {turn,step,message:{source,role,content}}
       // preserve the nested tool-result interior expected by DSH surface.
       const toolBlocks = msg.content.filter((b) => b.type === 'tool_result');
-      // Resolve the pairing callId: native source first (byte-faithful
-      // dsh→dsh), then the block's toolUseId — both are SOURCE ids; the
-      // written id comes out of the seat queue so the pairing survives
-      // duplicate-id remapping. A result whose call has no planned tool/call
-      // row (or no callId at all) can never pair and would render as a ghost
-      // card — skip it; the content stays in the IR.
+      // DSH's assertMessageEventShape demands a tool/result message carry
+      // EXACTLY ONE tool-result block whose toolCallId equals source.callId.
+      // Parallel tool calls arrive here as ONE carrier message with N blocks
+      // (claude user tool_result rows, zcode fused tool parts), so the carrier
+      // fans out into one event per block — each pairing through its own
+      // toolUseId. Collapsing them into a single event (all blocks remapped to
+      // the first block's seat id) aborts the whole session at load time with
+      // "message must contain one tool-result block" and misattributes the
+      // remaining results to the first call.
+      // Resolve the pairing callId per block: native source first (byte-
+      // faithful dsh→dsh), then the dsh-native block's toolCallId, then the
+      // block's toolUseId — all SOURCE ids; the written id comes out of the
+      // seat queue so the pairing survives duplicate-id remapping. A result
+      // whose call has no planned tool/call row (or no callId at all) can
+      // never pair and would render as a ghost card — skip that block; the
+      // content stays in the IR.
       const nativeSrc = native.source as { callId?: unknown } | undefined;
       const nativeCallId = typeof nativeSrc?.callId === 'string' && nativeSrc.callId ? nativeSrc.callId : undefined;
-      const blockCallId = (toolBlocks[0] as { toolUseId?: string } | undefined)?.toolUseId;
-      const sourceCallId = nativeCallId ?? (blockCallId || undefined);
-      if (!sourceCallId || !plannedCallIds.has(sourceCallId)) continue;
-      const pairedWrittenId = seatForPairing(sourceCallId);
-      if (pairedWrittenId === undefined) continue;
-      const toolData: Record<string, unknown> = {
-        ...(native.turn !== undefined || native.step !== undefined
-          ? { turn: native.turn ?? 1, step: native.step ?? 1 }
-          : { turn: 1, step: 1 }),
-        // Event-level error identity + tool-private meta were stashed on the
-        // message native at read time — re-emit or DSH loses the diff card.
-        ...(native.resultError !== undefined ? { error: native.resultError } : {}),
-        ...(native.resultMeta !== undefined ? { meta: native.resultMeta } : {}),
-        message: {
-          ...(native.id ? { id: native.id } : { id: `msg_${randomUUID()}` }),
-          role: 'user',
-          // 配对引用一律用席位解析出的写端 id。source 里若带着源 callId
-          // （native.source 整体保留时）必须改写成写端 id——tool/result 的
-          // 配对契约在 message.source.callId 上，源 id 在这里可能已被
-          // tool/call 侧的席位重映射换掉，裸写源值会配对断裂。
-          source: { ...(native.source as Record<string, unknown> ?? { kind: 'tool' }), kind: 'tool', callId: pairedWrittenId },
-          ...(native.rawContent ? { content: (native.rawContent as unknown[]).map((b) =>
-            b && typeof b === 'object' && !Array.isArray(b) &&
-            (b as Record<string, unknown>).type === 'tool-result' &&
-            (b as Record<string, unknown>).toolCallId === sourceCallId
-              ? { ...(b as Record<string, unknown>), toolCallId: pairedWrittenId }
-              : b) } : {
-            content: msg.content.map((b) => {
-              if (b.type === 'tool_result') {
-                const inner: unknown[] = [{ type: 'text', text: b.content }];
-                for (const att of b.attachments ?? []) {
-                  const nativeImage = dshImageFromBlock(att);
-                  if (nativeImage) inner.push(nativeImage);
-                  else inner.push({ type: 'text', text: `[file: ${att.filename ?? att.url ?? 'attachment'}]` });
-                }
-                return { type: 'tool-result', toolCallId: pairedWrittenId, content: inner, isError: !!b.isError };
-              }
-              if (b.type === 'text') return { type: 'text', text: b.text };
-              return { type: 'text', text: (b as { thinking?: string }).thinking ?? '' };
-            }),
-          }),
-        },
-      };
-      raw.push({ time, type: 'tool/result', ...(surfaceOf(msg) as { surfaceOp: string; sourceEventSeqs?: number[] }), data: toolData as unknown as DshEvent['data'], _msg: msg, _seq: seq });
+      const rawToolBlocks = Array.isArray(native.rawContent)
+        ? (native.rawContent as unknown[]).filter((b): b is Record<string, unknown> =>
+            b !== null && typeof b === 'object' && !Array.isArray(b) && (b as Record<string, unknown>).type === 'tool-result')
+        : [];
+      const rawBlockOf = (i: number): Record<string, unknown> | undefined =>
+        rawToolBlocks.length === toolBlocks.length ? rawToolBlocks[i] : undefined;
+      let emitted = 0;
+      for (let bi = 0; bi < toolBlocks.length; bi++) {
+        const blk = toolBlocks[bi];
+        if (blk.type !== 'tool_result') continue;
+        const rawBlk = rawBlockOf(bi);
+        const rawBlockCallId = typeof rawBlk?.toolCallId === 'string' && rawBlk.toolCallId ? rawBlk.toolCallId : undefined;
+        const sourceCallId = nativeCallId ?? rawBlockCallId ?? (blk.toolUseId || undefined);
+        if (!sourceCallId || !plannedCallIds.has(sourceCallId)) continue;
+        const pairedWrittenId = seatForPairing(sourceCallId);
+        if (pairedWrittenId === undefined) continue;
+        const toolData: Record<string, unknown> = {
+          ...(native.turn !== undefined || native.step !== undefined
+            ? { turn: native.turn ?? 1, step: native.step ?? 1 }
+            : { turn: 1, step: 1 }),
+          // Event-level error identity + tool-private meta were stashed on the
+          // message native at read time — re-emit or DSH loses the diff card.
+          // (Native only, i.e. single-block carriers; foreign rows never set it.)
+          ...(native.resultError !== undefined ? { error: native.resultError } : {}),
+          ...(native.resultMeta !== undefined ? { meta: native.resultMeta } : {}),
+          message: {
+            // 多 block 拆分时只有首条沿用 native.id——消息 id 在会话内须唯一。
+            id: native.id && emitted === 0 ? native.id : `msg_${randomUUID()}`,
+            role: 'user',
+            // 配对引用一律用席位解析出的写端 id。source 里若带着源 callId
+            // （native.source 整体保留时）必须改写成写端 id——tool/result 的
+            // 配对契约在 message.source.callId 上，源 id 在这里可能已被
+            // tool/call 侧的席位重映射换掉，裸写源值会配对断裂。
+            source: { ...(native.source as Record<string, unknown> ?? { kind: 'tool' }), kind: 'tool', callId: pairedWrittenId },
+            content: [
+              rawBlk
+                ? { ...rawBlk, toolCallId: pairedWrittenId }
+                : (() => {
+                    const inner: unknown[] = [{ type: 'text', text: blk.content }];
+                    for (const att of blk.attachments ?? []) {
+                      const nativeImage = dshImageFromBlock(att);
+                      if (nativeImage) inner.push(nativeImage);
+                      else inner.push({ type: 'text', text: `[file: ${att.filename ?? att.url ?? 'attachment'}]` });
+                    }
+                    return { type: 'tool-result', toolCallId: pairedWrittenId, content: inner, isError: !!blk.isError };
+                  })(),
+            ],
+          },
+        };
+        // 同 (time, _seq) 的多条事件由稳定排序保持 push 序（= 源 block 序），
+        // 最终 seq 由连续重排统一赋值。
+        raw.push({ time, type: 'tool/result', ...(surfaceOf(msg) as { surfaceOp: string; sourceEventSeqs?: number[] }), data: toolData as unknown as DshEvent['data'], _msg: msg, _seq: seq });
+        emitted++;
+      }
       continue;
     }
     if (msg.role === 'user' || msg.role === 'system' || msg.role === 'developer') {
@@ -2174,22 +2206,8 @@ function scanTitleFromLog(buf: Buffer): string | undefined {
 /** First human-turn text from one `user/message` log line, whitespace
  * flattened and excerpted (display-title budget, same 120 cap the CLI list
  * applies). Returns undefined for anything not unmistakably a human turn —
- * notably the harness's own runtime-context rows: DSH stamps permissions /
- * team-preamble / AGENTS.md injections as ordinary `kind:"user"` messages
- * (真机样本 52be3474 锚定), and migrated sessions land SOURCE-injected rows
- * the same way, so kind alone cannot separate them. The marker list is a
- * DISPLAY-fallback heuristic only — parse()/write-side contracts untouched. */
-const TITLE_FALLBACK_INJECTED_PREFIXES = [
-  '<permissions instructions>',
-  '<environment_context>',
-  '<user_instructions>',
-  '<multi_agent_mode>',
-  '<system-reminder',
-  '<turn-aborted>',
-  '# AGENTS.md instructions',
-  'You are `', // agent-teams preamble ("You are `/root`, the primary agent…")
-];
-
+ * notably the harness's own runtime-context rows, which INJECTION_TEXT_PREFIXES
+ * classifies (parse() marks them synthetic on the same list). */
 function scanFirstHumanUserText(line: string): string | undefined {
   let ev: DshEvent;
   try {
@@ -2210,7 +2228,41 @@ function scanFirstHumanUserText(line: string): string | undefined {
     .join('\n')
     .trim();
   if (!text) return undefined;
-  if (TITLE_FALLBACK_INJECTED_PREFIXES.some((p) => text.startsWith(p))) return undefined;
+  if (INJECTION_TEXT_PREFIXES.some((p) => text.startsWith(p))) return undefined;
   const flat = text.replace(/\s+/g, ' ');
   return flat.length > 120 ? `${flat.slice(0, 119)}…` : flat;
+}
+
+/** Injection text prefixes for user/message rows the source kind cannot
+ * classify: DSH's own harness stamps permissions / team-preamble / AGENTS.md /
+ * environment-context / multi-agent-mode rows as ordinary `kind:"user"`
+ * messages (真机样本 52be3474 锚定), and migrated sessions land SOURCE-injected
+ * rows the same way, so kind alone cannot separate them. Consumed twice —
+ * parse() (`isMarkerInjection`) marks prefix hits `synthetic:true`, and the
+ * title fallback skips them so an injected row never becomes a display title.
+ * Delegation task prompts (a child session's first kind:'user' row) carry none
+ * of these prefixes and stay human turns; the team-preamble marker is pinned
+ * to the backtick ("You are `/root`, the primary agent…") so plain "You are …"
+ * task text cannot false-positive. */
+const INJECTION_TEXT_PREFIXES = [
+  '<permissions instructions>',
+  '<environment_context>',
+  '<user_instructions>',
+  '<multi_agent_mode>',
+  '<system-reminder',
+  '<turn-aborted>',
+  '# AGENTS.md instructions',
+  'You are `', // agent-teams preamble ("You are `/root`, the primary agent…")
+];
+
+/** Injection-marker sniff for a normalized user message: the first non-empty
+ * text block decides (harness fragments are single-purpose rows). */
+function isMarkerInjection(msg: MigratedMessage): boolean {
+  for (const b of msg.content) {
+    if (b.type !== 'text') continue;
+    const text = b.text.trimStart();
+    if (!text) continue;
+    return INJECTION_TEXT_PREFIXES.some((p) => text.startsWith(p));
+  }
+  return false;
 }

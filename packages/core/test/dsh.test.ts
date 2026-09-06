@@ -18,7 +18,7 @@ import {
 import { blocksToNative, normalizeContent } from '../src/content.js';
 import type { ContentBlock } from '../src/ir.js';
 import { fallbackIr } from '../src/demo.js';
-import { decompressSessionBuffer } from '../src/adapters/dsh/format.js';
+import { compressFrame, decompressSessionBuffer } from '../src/adapters/dsh/format.js';
 import { verifySessionLog } from '../src/adapters/dsh/verify.js';
 import { readDshAttachment } from '../src/adapters/dsh/attachments.js';
 
@@ -1105,6 +1105,77 @@ test('foreign-origin message shapes: tool_use pairs a tool/call, injections go p
   assert.ok(verdict.ok, `verifySessionLog passes: ${JSON.stringify(verdict.issues ?? []).slice(0, 200)}`);
 });
 
+test('parallel tool results: one carrier message fans out into one tool/result event per block', async () => {
+  const adapter = new DshAdapter();
+  const root = await tempRoot();
+  const ir = {
+    schemaVersion: 2 as const,
+    originTool: 'zcode' as const,
+    createdAt: 1000,
+    messages: [
+      { role: 'user' as const, content: [{ type: 'text' as const, text: 'q' }] },
+      // one assistant response with TWO parallel tool calls
+      { role: 'assistant' as const, content: [
+        { type: 'tool_use' as const, id: 'call_a', name: 'Bash', input: 'ls' },
+        { type: 'tool_use' as const, id: 'call_b', name: 'Bash', input: 'wc' },
+      ] },
+      // the fused carrier message both harnesses produce: N results in ONE row
+      { role: 'tool' as const, content: [
+        { type: 'tool_result' as const, toolUseId: 'call_a', content: 'a-output' },
+        { type: 'tool_result' as const, toolUseId: 'call_b', content: 'b-output' },
+      ] },
+    ],
+  };
+  const res = await adapter.write(ir as never, { root, sessionId: 'fanout-1', targetCwd: 'D:\\proj' });
+  const events = decompressSessionBuffer(await fs.readFile(res.paths[0]!)).split('\n').filter((l) => l.trim()).slice(1).map((l) => JSON.parse(l)) as Array<{ type: string; data: Record<string, unknown> }>;
+
+  // assertMessageEventShape (dsh-session): each tool/result message carries
+  // EXACTLY one tool-result block whose toolCallId equals source.callId —
+  // collapsing N results into one event aborts the whole session at load.
+  const results = events.filter((e) => e.type === 'tool/result');
+  assert.equal(results.length, 2, 'one tool/result event per result block');
+  const resultRows = results.map((e) => {
+    const m = (e.data as Record<string, unknown>).message as Record<string, unknown>;
+    const src = m.source as Record<string, unknown>;
+    const content = m.content as Array<Record<string, unknown>>;
+    assert.equal(content.length, 1, 'each message carries exactly one tool-result block');
+    assert.equal(content[0].type, 'tool-result');
+    assert.equal(content[0].toolCallId, src.callId, 'block toolCallId matches source.callId');
+    const inner = content[0].content as Array<Record<string, unknown>>;
+    return { callId: src.callId as string, text: inner[0].text as string };
+  });
+  // per-block pairing survives: each result lands on ITS OWN call, in order
+  assert.deepEqual(resultRows.map((r) => r.text), ['a-output', 'b-output']);
+  const calls = events.filter((e) => e.type === 'tool/call');
+  assert.equal(calls.length, 2, 'one tool/call row per tool_use block');
+  const callSet = new Set(calls.map((e) => (e.data as Record<string, unknown>).callId));
+  assert.deepEqual([...callSet].sort(), ['call_a', 'call_b']);
+  for (const r of resultRows) assert.ok(callSet.has(r.callId), `result callId ${r.callId} has a tool/call row`);
+  // and the result order matches its call rows: result k pairs call k
+  assert.deepEqual(resultRows.map((r) => r.callId), calls.map((e) => (e.data as Record<string, unknown>).callId));
+  const verdict = verifySessionLog(decompressSessionBuffer(await fs.readFile(res.paths[0]!)), 'fanout-1', res.paths[0]!);
+  assert.ok(verdict.ok, `verifySessionLog passes: ${JSON.stringify(verdict.issues ?? []).slice(0, 300)}`);
+});
+
+test('verifySessionLog rejects multi-block and mismatched-id tool/result messages (DSH load contract)', () => {
+  const hdr = (id: string): string => JSON.stringify({ type: 'session', version: 0, id, createdAt: 0, cwd: 'D:\\proj' });
+  const call = JSON.stringify({ seq: 0, time: 0, type: 'tool/call', data: { turn: 1, step: 1, callId: 'call_a', name: 'Bash', arguments: '{}' } });
+  const mk = (content: unknown[]): string => JSON.stringify({
+    seq: 1, time: 0, surfaceOp: 'append', type: 'tool/result',
+    data: { turn: 1, step: 1, message: { id: 'msg_x', role: 'user', source: { kind: 'tool', callId: 'call_a' }, content } },
+  });
+  const block = (id: string): unknown => ({ type: 'tool-result', toolCallId: id, content: [{ type: 'text', text: 'out' }], isError: false });
+  // two blocks in one message → "must contain one tool-result block"
+  const two = verifySessionLog([hdr('v2'), call, mk([block('call_a'), block('call_a')])].join('\n'), 'v2', 'v2');
+  assert.ok(!two.ok && two.issues.some((i) => i.message.includes('exactly one tool-result block')), JSON.stringify(two.issues));
+  // single block but mismatched toolCallId → "mismatched tool call ids"
+  const mismatch = verifySessionLog([hdr('v3'), call, mk([block('call_other')])].join('\n'), 'v3', 'v3');
+  assert.ok(!mismatch.ok && mismatch.issues.some((i) => i.message.includes('does not match source.callId')), JSON.stringify(mismatch.issues));
+  // well-formed row still passes
+  const good = verifySessionLog([hdr('v4'), call, mk([block('call_a')])].join('\n'), 'v4', 'v4');
+  assert.ok(good.ok, JSON.stringify(good.issues));
+});
+
 test('dsh->dsh: unknown-to-DSH source types are dropped, known types replay verbatim', async () => {
   const adapter = new DshAdapter();
   const root = await tempRoot();
@@ -1420,4 +1491,44 @@ test('teammate sidechain round-trip: kind + agentType survive a second full writ
     (sc2.messages[0].content[0] as { text: string }).text === 'teammate roundtrip body',
     'content survives the second cycle',
   );
+});
+
+test('DSH parse: kind:"user" rows hitting known injection markers are synthetic; delegation task text stays human', async () => {
+  const adapter = new DshAdapter();
+  const root = await tempRoot();
+  const sid = 'session-marker-test';
+  const dir = join(root, '--D-proj--', sid);
+  await fs.mkdir(dir, { recursive: true });
+  const header = JSON.stringify({ id: sid, version: 0, createdAt: 1784252446000, cwd: 'D:\proj' });
+  const row = (seq: number, text: string): string =>
+    JSON.stringify({
+      seq,
+      time: 1784252446000 + seq,
+      type: 'user/message',
+      surfaceOp: 'append',
+      data: {
+        id: `m${seq}`,
+        role: 'user',
+        source: { kind: 'user', rpcId: `r${seq}`, clientTimeZone: 'Asia/Shanghai' },
+        content: [{ type: 'text', text }],
+      },
+    });
+  const lines = [
+    header,
+    row(1, '# AGENTS.md instructions for D:\proj\n\n<INSTRUCTIONS>\nbe nice\n</INSTRUCTIONS>'),
+    row(2, '帮我看看这个仓库的结构'),
+    row(3, '<environment_context>\n<cwd>D:\proj</cwd>\n</environment_context>'),
+    row(4, 'You are `/root`, the primary agent…'),
+    row(5, 'You are reverse-engineering the session format, find the task dispatch message'),
+  ];
+  // one frame carrying the whole plaintext is a valid DSH artifact (single-frame zstd)
+  await fs.writeFile(join(dir, 'session.jsonl.zstd'), compressFrame(lines.join('\n') + '\n'));
+
+  const ir = await adapter.parse(sid, root);
+  assert.equal(ir.messages.length, 5);
+  assert.equal(ir.messages[0].synthetic, true, 'AGENTS.md injection row stamped kind:"user" is synthetic');
+  assert.equal(ir.messages[1].synthetic, undefined, 'plain human turn stays user info');
+  assert.equal(ir.messages[2].synthetic, true, 'environment_context row stamped kind:"user" is synthetic');
+  assert.equal(ir.messages[3].synthetic, true, 'team preamble (backtick marker) is synthetic');
+  assert.equal(ir.messages[4].synthetic, undefined, '"You are …" task text without the backtick stays a human turn');
 });

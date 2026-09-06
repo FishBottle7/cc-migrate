@@ -256,6 +256,19 @@ export function verifySessionLog(plain: string, sessionId: string, path: string)
       if (typeof src?.callId === 'string' && src.callId && !seenCallIds.has(src.callId)) {
         fail('tool-pairing', `tool/result references callId ${src.callId} with no earlier tool/call — the GUI renders a ghost "Tool call <callId>" fallback card`);
       }
+      // assertMessageEventShape (dsh-session ≈ line 1262): exactly one
+      // tool-result block whose toolCallId matches source.callId. Either
+      // violation aborts the whole load ("must contain one tool-result
+      // block" / "has mismatched tool call ids").
+      if (Array.isArray(m?.content)) {
+        const content = m.content as unknown[];
+        const block = content[0] as Record<string, unknown> | undefined;
+        if (content.length !== 1 || typeof block !== 'object' || block === null || block.type !== 'tool-result' || !Array.isArray(block.content)) {
+          fail('message-shape', `tool/result must contain exactly one tool-result block with a content array (got ${content.length} blocks) — DSH aborts the whole load`);
+        } else if (typeof src?.callId === 'string' && src.callId && block.toolCallId !== src.callId) {
+          fail('message-shape', `tool-result block toolCallId ${JSON.stringify(block.toolCallId)} does not match source.callId ${JSON.stringify(src.callId)} — DSH aborts the whole load`);
+        }
+      }
     }
 
     // turn-tail ordering (exact GUI matcher semantics):

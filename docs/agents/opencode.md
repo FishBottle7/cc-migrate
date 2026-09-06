@@ -81,6 +81,7 @@ SessionHistory.load(db, sessionID)
 - `listSessions` 只列顶层（`parent_id IS NULL`，孤儿 parent 保留可见）——对齐 TUI 按 parentID 归组的行为
 - compaction：边界 = 唯一 part 为 `{type:'compaction',auto,tail_start_id?}` 的 user 行 + summary assistant（`summary:true,mode:'compaction',agent:'compaction',parentID=边界`）⇄ IR `compaction[]`（summary 文本投影为锚点 user 消息；`meta.opencode.auto` 往返；无 summary 配对的边界只留类型化记录、写端不落行）。`tail_start_id` 读端保留在 meta、写端不重建（msg id 会重生成，写回必成悬空）
 - `cwd` ↔ `session.directory`；`model` ↔ `session.model:{id,providerID,variant?}`；`file` part（mime/filename/url，data URL 图片）⇄ IR `FileBlock`
+- **part 级注入标记消费（2026-09-06）**：text part 的 `synthetic:true`（模式引导词 / tool-call 上下文 / `[user interrupted]` 标记）与 `ignored:true`（排除回放）读端一律消费——带标记的 part 绝不投影为用户文本。整条消息全部 text part 带标记 → 该消息按 `IR synthetic:true` 投影（内容保留、身份纠正；实库采样 152 条纯注入），混合消息只保留未标记 part（实库 12 条混合里未标记的半边也是 `[analyze-mode]` 类引导词）。写端 keepSynthetic 落盘的 `ignored+synthetic` part 经此读回仍标 synthetic，round-trip 对称；mirror 路径同步携带 `synthetic`（此前两方向都丢）。未带任何标记的 `<system-reminder`/`[search-mode]` 开头 part（实库 406/218 条）是旧版存储的漏标，读端不做文本嗅探——它们按用户文本迁移，抓取属可选增强。
 - ~~未确定项（待一次真实写采样锁定）~~ → 已由 2026-09-02 真实库写采样复核关闭，见下节「真实写采样复核（2026-09-02）」
 
 ## 真实写采样复核（2026-09-02，只读核查 `~/.local/share/opencode/opencode.db` 实库）

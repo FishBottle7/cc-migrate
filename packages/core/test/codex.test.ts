@@ -1366,3 +1366,41 @@ test('write: archived rows without time fall back to the stream chronology, neve
   const earlyRow = outEarly.find((r) => r.type === 'event_msg')!;
   assert.equal(earlyRow.timestamp, TS, 'pre-message row falls back to createdAt, still not epoch-0');
 });
+
+test('read: classification channels agree — legacy markers match official kinds for the same content', () => {
+  const session = rolloutRecordsToIr(lines([
+    metaLine({ session_id: '019bb246-e05f-7f71-8d59-115a91aa293b', id: '019bb246-e05f-7f71-8d59-115a91aa293b', timestamp: '2026-01-12T12:55:47.732Z', cwd: 'D:\proj', originator: 'codex_cli_rs', cli_version: '0.146.0', source: 'cli' }),
+    // legacy channel (no kinds): runtime-relayed harness rows must be synthetic
+    item({ type: 'message', role: 'user', content: [{ type: 'input_text', text: '<subagent_notification>\nworker done\n</subagent_notification>' }] }),
+    item({ type: 'message', role: 'user', content: [{ type: 'input_text', text: '<recommended_plugins>\n<plugin>one</plugin>\n</recommended_plugins>' }] }),
+    item({ type: 'message', role: 'user', content: [{ type: 'input_text', text: '<skill>\nskill body\n</skill>' }] }),
+    // legacy AGENTS.md — the documented non-synthetic injection
+    item({ type: 'message', role: 'user', content: [{ type: 'input_text', text: '# AGENTS.md instructions for D:\proj\n\n<INSTRUCTIONS>\nbe nice\n</INSTRUCTIONS>' }] }),
+    item({ type: 'message', role: 'user', content: [{ type: 'input_text', text: 'real prompt' }] }),
+    // official channel: same kinds, same verdicts
+    item({ type: 'message', role: 'user', internal_chat_message_metadata_passthrough: { content_item_kinds: ['multi_agent.subagent_notification'] }, content: [{ type: 'input_text', text: '<subagent_notification>\nworker done\n</subagent_notification>' }] }),
+    item({ type: 'message', role: 'user', internal_chat_message_metadata_passthrough: { content_item_kinds: ['agents_md.instructions', 'environments.environment_context'] }, content: [{ type: 'input_text', text: '# AGENTS.md instructions for D:\proj\n\n<INSTRUCTIONS>\nbe nice\n</INSTRUCTIONS>' }] }),
+  ]), {});
+
+  const metaOf = (m: MigratedMessage) => (m.meta as Record<string, unknown>).codex as Record<string, unknown>;
+  const byKind = (k: string) => session.messages.filter((m) => metaOf(m).contentKind === k);
+
+  const subNotes = byKind('multi_agent.subagent_notification');
+  assert.equal(subNotes.length, 2, 'legacy + official subagent_notification rows both classified');
+  for (const m of subNotes) assert.equal(m.synthetic, true, 'subagent_notification is synthetic on BOTH channels');
+  const recs = byKind('plugins.recommendations');
+  assert.equal(recs.length, 1);
+  assert.equal(recs[0].synthetic, true, 'recommended_plugins is synthetic on the legacy channel');
+  const skills = byKind('skills.instructions');
+  assert.equal(skills.length, 1);
+  assert.equal(skills[0].synthetic, true, 'skill instructions are synthetic on the legacy channel');
+
+  const agentsRows = byKind('agents_md.instructions');
+  assert.equal(agentsRows.length, 2, 'legacy + official AGENTS.md rows both classified');
+  for (const m of agentsRows) {
+    assert.equal(m.synthetic, undefined, 'AGENTS.md stays the documented non-synthetic injection on BOTH channels');
+  }
+  const fused = agentsRows.find((m) => Array.isArray(metaOf(m).contentItemKinds));
+  assert.ok(fused, 'official-channel AGENTS.md row present');
+  assert.deepEqual(metaOf(fused!).contentItemKinds, ['agents_md.instructions', 'environments.environment_context']);
+});

@@ -587,15 +587,36 @@ function walkSession(db: DbHandle, sessionId: string, seen: Set<string>): WalkRe
           compactions.push({ summary: '', meta: { opencode: ocMeta } });
         }
       }
+      // Native harness-injected text parts carry `synthetic: true` (mode
+      // steering prompts, tool-call context, `[user interrupted]` markers) or
+      // `ignored: true` (excluded from LLM replay) — opencode's own injection
+      // marking, the same flags this adapter's write side sets (insertPart in
+      // writeToDb). Consume them: flagged parts never project as user text.
+      // When EVERY text part is flagged the message IS an injection — project
+      // it marked (content preserved; targets apply their own synthetic
+      // policy) instead of letting it pass as a human turn. Mixed messages
+      // keep only the unflagged parts; the flagged siblings are
+      // runtime-regenerated steering the target harness re-injects itself.
       const content: ContentBlock[] = [];
+      const injectedTexts: string[] = [];
       for (const p of parts) {
-        if (p.type === 'text' && typeof p.text === 'string') content.push({ type: 'text', text: p.text });
-        else if (p.type === 'file') {
+        if (p.type === 'text' && typeof p.text === 'string') {
+          if (p.synthetic === true || p.ignored === true) injectedTexts.push(p.text);
+          else content.push({ type: 'text', text: p.text });
+        } else if (p.type === 'file') {
           const f = fileFromPart(p);
           if (f) content.push(f);
         }
       }
       if (content.length) messages.push({ role: 'user', content, timestamp: ts });
+      else if (injectedTexts.length) {
+        messages.push({
+          role: 'user',
+          content: injectedTexts.map((t) => ({ type: 'text' as const, text: t })),
+          timestamp: ts,
+          synthetic: true,
+        });
+      }
       continue;
     }
 
@@ -1282,7 +1303,14 @@ const MIRROR_MESSAGE_ROLES = new Set(['user', 'assistant', 'tool', 'system', 'de
 function opencodeMessageFromMigrated(msg: MigratedMessage): Record<string, unknown> {
   // keep tool/developer roles verbatim so a mirror round-trip stays lossless
   // (older mirrors folded tool into system — new mirrors no longer do).
-  return { type: MIRROR_MESSAGE_ROLES.has(msg.role) ? msg.role : 'system', content: msg.content, timestamp: msg.timestamp };
+  // `synthetic` rides too: the mirror is the lossless IR dump, and a dropped
+  // flag would read an injection back as a human turn.
+  return {
+    type: MIRROR_MESSAGE_ROLES.has(msg.role) ? msg.role : 'system',
+    content: msg.content,
+    timestamp: msg.timestamp,
+    ...(msg.synthetic === true ? { synthetic: true } : {}),
+  };
 }
 
 async function parseFromMirror(mirrorPath: string): Promise<MigratedSession> {
@@ -1294,7 +1322,12 @@ async function parseFromMirror(mirrorPath: string): Promise<MigratedSession> {
     const role = (MIRROR_MESSAGE_ROLES.has(String(r.type)) ? String(r.type) : 'system') as MigratedMessage['role'];
     const content = normalizeContent((Array.isArray(r.content) ? r.content : []) as unknown[]);
     const ts = typeof r.timestamp === 'number' ? r.timestamp : undefined;
-    return { role, content, timestamp: ts } as MigratedMessage;
+    return {
+      role,
+      content,
+      ...(ts !== undefined ? { timestamp: ts } : {}),
+      ...(r.synthetic === true ? { synthetic: true as const } : {}),
+    } as MigratedMessage;
   });
 
   // sidechains are encoded as records with type 'mirror-sidechain'
