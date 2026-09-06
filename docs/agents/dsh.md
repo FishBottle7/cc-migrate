@@ -70,6 +70,7 @@
   - 助手 source 身份按真值提升：claude 源会话写 `provider:'claude', model:<meta.claude.message.model>`（此前误标为引擎默认 `abrdns/GLM-5.3-Flash`）。
 - **外来工具转译（2026-09-06，`transpile.ts`）**：GUI 冷会话的工具卡片渲染**纯按 wire 工具名分发**（client bundle `dsh-client-ui-tool` 的 `classifyTool → TOOL_VARIANTS`：bash/pwsh→bash、read/web_fetch→read、web_search/grep/glob→search、write→write、edit→edit、run_code→code，**未知名一律落 "others" 通用卡片**；参数从 `tool/call` 的 `arguments` JSON 里按 `FILE_PATH_KEYS ["path","file_path"]` 取）。外来会话（claude/zcode/opencode…）带着源 harness 名（`Read`/`Edit`/…）落盘，全部渲染成匿名 others 卡片，resume 回放时模型看到的调用形状也与 DSH 实际工具集不符。写端（`irToEvents` 三个发射点：assistant 内容 `tool-call` 块、块派生 `tool/call` 行、toolCalls 桶重发行）按下方转译表改名 + 归参。纪律与边界：
   - **目标 schema 全部读自安装产物**（`~/.dsh/profiles/node_modules/@deepseek-ai/dsh-tool-fs/-bash/-fs-search/-web/-todo` 的 `defineTool` 定义），不靠猜；
+  - **规则键大小写归一（只归在写端）**：规则查找按小写键匹配，`Read`/`READ`/`read` 任意拼法同归原生 `read`——归一发生在写端落盘那一刻，IR 里的名字永远是源值（不透明字符串 = 源出处，IR 不内置任何一家的规范词汇表）；
   - **形状门控**：每条规则先验外来方言签名、必填原生键可全部映射才改写；不自信的形状（如 `Read {path}`）原样透传——宁缺勿错；
   - **幂等 + 字节保真**：native 形状的行原样返回（同一对象引用），桶行带 `metadata.dsh.arguments` 原始字符串时原串透传——dsh→dsh 往返逐字节不变（回归测试钉死）；
   - **只改写不伪造**：native `description` 缺失就缺失，不从命令编造；外来专属键（`output_mode`/`active_form`/`prompt`…）native 无槽位，落盘时丢弃、**IR 保留源值**（写端按能力丢弃是既有模式）；

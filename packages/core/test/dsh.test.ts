@@ -1549,6 +1549,16 @@ test('transpileCall: foreign names transpile with native arg shapes; unconfident
     name: 'read',
     arguments: '{"file_path":"/x/a.ts","offset":2}',
   });
+  // case-insensitive keys: any spelling of a foreign name normalizes to the
+  // same native name ('READ'/'Read'/'read' → read)
+  assert.deepEqual(transpileCall('READ', { file_path: '/x/a.ts' }), {
+    name: 'read',
+    arguments: '{"file_path":"/x/a.ts"}',
+  });
+  assert.deepEqual(transpileCall('BASH', { command: 'ls' }), {
+    name: 'bash',
+    arguments: '{"command":"ls"}',
+  });
   // opencode filePath dialect → file_path
   assert.deepEqual(transpileCall('read', { filePath: '/x/b.ts' }), {
     name: 'read',

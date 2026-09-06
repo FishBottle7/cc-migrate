@@ -19,6 +19,10 @@
  * 纪律（对齐 team/* 裁决「没有 payload 契约就没有转译」）：
  *  - every rule's target schema was read from the INSTALLED packages
  *    (~/.dsh/profiles/node_modules/@deepseek-ai/dsh-tool-*), not guessed;
+ *  - rule keys are CASE-INSENSITIVE: any spelling of a foreign name
+ *    ('Read'/'READ'/'read') normalizes to the same native name — the name
+ *    is normalized at the write side, never inside the IR (the IR keeps
+ *    source identity verbatim);
  *  - rules are SHAPE-GATED: a call only transpiles when its arguments carry
  *    the foreign dialect's signature (and every required native key maps);
  *    otherwise the call passes through untouched — 宁缺勿错;
@@ -45,7 +49,8 @@
 
 /** One foreign→native rule. `normalize` contract: see module header. */
 interface TranspileRule {
-  /** Foreign wire names routed through this rule (case-sensitive). */
+  /** Foreign wire names routed through this rule (documentation of the known
+   * spellings; MATCHING itself is case-insensitive — see RULES_BY_NAME). */
   from: readonly string[];
   /** Native DSH tool name. */
   to: string;
@@ -219,7 +224,18 @@ const RULES: TranspileRule[] = [
   },
 ];
 
-const RULES_BY_NAME = new Map<string, TranspileRule>(RULES.flatMap((r) => r.from.map((n) => [n, r])));
+/**
+ * Rule lookup keys are LOWERCASED: matching is case-insensitive, so the
+ * same foreign tool normalizes to one native name regardless of the wire
+ * spelling ('Read'/'READ'/'read' → read). The from-lists above remain as
+ * documentation of the spellings seen in the wild. Native dsh rows that
+ * share a spelling with a rule (native 'read' etc.) are safe by the same
+ * idempotency contract: native-shaped inputs return the same reference and
+ * keep their raw arguments byte-exact.
+ */
+const RULES_BY_NAME = new Map<string, TranspileRule>(
+  RULES.flatMap((r) => r.from.map((n) => [n.toLowerCase(), r] as const)),
+);
 
 function tryParseJson(v: unknown): unknown {
   if (typeof v !== 'string') return v;
@@ -248,7 +264,7 @@ export interface TranspiledCall {
  */
 export function transpileCall(name: unknown, input: unknown, rawArguments?: string): TranspiledCall | null {
   if (typeof name !== 'string' || !name) return null;
-  const rule = RULES_BY_NAME.get(name);
+  const rule = RULES_BY_NAME.get(name.toLowerCase());
   if (!rule) return null;
   const obj = (typeof input === 'object' && input !== null && !Array.isArray(input) ? input : tryParseJson(input)) as Record<string, unknown> | null;
   if (typeof obj !== 'object' || obj === null || Array.isArray(obj)) return null;
@@ -271,7 +287,7 @@ export function countTranspilableToolCalls(ir: MigratedSessionLike): { count: nu
   const seen = new Set<unknown>();
   const count = (name: unknown, input: unknown): void => {
     if (typeof name !== 'string' || !name) return;
-    const rule = RULES_BY_NAME.get(name);
+    const rule = RULES_BY_NAME.get(name.toLowerCase());
     if (!rule) return;
     const obj = (typeof input === 'object' && input !== null && !Array.isArray(input) ? input : tryParseJson(input)) as Record<string, unknown> | null;
     if (typeof obj !== 'object' || obj === null) return;
