@@ -68,6 +68,19 @@ export interface WriteOptions {
    *  - `'target'`: write nothing — the target opens with its own prompt.
    */
   systemPromptSource?: 'source' | 'target';
+  /**
+   * Foreign tool-call transpilation at the DSH write side (docs/agents/dsh.md
+   * 「外来工具转译」): rename source-harness tool calls (claude/zcode
+   * Read/Edit/Write/Bash/Glob/Grep/WebFetch/WebSearch/TodoWrite, opencode
+   * lowercase/filePath dialects) to the DSH-native vocabulary with
+   * shape-gated argument rewriting, so the DSH GUI classifies them onto the
+   * native card variants and resume replay shows calls shaped like its real
+   * tools. Shape-gated + idempotent (packages/core/src/adapters/dsh/
+   * transpile.ts) — dsh→dsh native rows stay byte-identical; unconfident
+   * shapes pass through verbatim; the IR keeps source values. Default
+   * `true`; `false` keeps every call byte-faithful to the source.
+   */
+  transpileTools?: boolean;
 }
 
 export interface WriteResult {

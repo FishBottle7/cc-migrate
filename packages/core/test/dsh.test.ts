@@ -21,6 +21,7 @@ import { fallbackIr } from '../src/demo.js';
 import { compressFrame, decompressSessionBuffer } from '../src/adapters/dsh/format.js';
 import { verifySessionLog } from '../src/adapters/dsh/verify.js';
 import { readDshAttachment } from '../src/adapters/dsh/attachments.js';
+import { transpileCall, countTranspilableToolCalls } from '../src/adapters/dsh/transpile.js';
 
 /** Minimal loose shape for test fixture events. */
 interface DshEventLike {
@@ -1390,20 +1391,24 @@ test('teammate sidechains: written as standalone child sessions (parentSession l
       },
     ],
   };
-  // 一次性说明（info 级 console.log，非警告——承载可见性契约）：数量 + 独立子
-  // 会话形态 + team/* 不发的理由必须出现；不得再出现任何「dropped」措辞。
+  // 一次性说明（info 级 console.error——stderr 不污染 CLI --json 的 stdout 纯
+  // JSON 契约，非警告——承载可见性契约）：数量 + 独立子会话形态 + team/* 不发
+  // 的理由必须出现；不得再出现任何「dropped」措辞。
   const logs: string[] = [];
   const warnings: string[] = [];
   const origLog = console.log;
   const origWarn = console.warn;
+  const origError = console.error;
   console.log = (...args: unknown[]) => { logs.push(args.map(String).join(' ')); };
   console.warn = (...args: unknown[]) => { warnings.push(args.map(String).join(' ')); };
+  console.error = (...args: unknown[]) => { logs.push(args.map(String).join(' ')); };
   let res: { sessionId: string; paths: string[] };
   try {
     res = await adapter.write(ir as never, { root, sessionId: 'tm-carry', targetCwd: 'D:\\proj' });
   } finally {
     console.log = origLog;
     console.warn = origWarn;
+    console.error = origError;
   }
   const info = logs.find((l) => l.includes('teammate sidechain'));
   assert.ok(info, `a one-time info line announces the teammate carry-over: ${JSON.stringify(logs)}`);
@@ -1531,4 +1536,189 @@ test('DSH parse: kind:"user" rows hitting known injection markers are synthetic;
   assert.equal(ir.messages[2].synthetic, true, 'environment_context row stamped kind:"user" is synthetic');
   assert.equal(ir.messages[3].synthetic, true, 'team preamble (backtick marker) is synthetic');
   assert.equal(ir.messages[4].synthetic, undefined, '"You are …" task text without the backtick stays a human turn');
+});
+
+/* ------------------------------------------------------------------ */
+/* 外来工具转译 (2026-09-06): shape-gated rename to the dsh-native      */
+/* vocabulary — docs/agents/dsh.md「外来工具转译」, transpile.ts         */
+/* ------------------------------------------------------------------ */
+
+test('transpileCall: foreign names transpile with native arg shapes; unconfident shapes pass through', () => {
+  // claude/zcode Read → read (exact parity)
+  assert.deepEqual(transpileCall('Read', { file_path: '/x/a.ts', offset: 2 }), {
+    name: 'read',
+    arguments: '{"file_path":"/x/a.ts","offset":2}',
+  });
+  // opencode filePath dialect → file_path
+  assert.deepEqual(transpileCall('read', { filePath: '/x/b.ts' }), {
+    name: 'read',
+    arguments: '{"file_path":"/x/b.ts"}',
+  });
+  // WebSearch {query} → web_search {queries:[query]}
+  assert.deepEqual(transpileCall('WebSearch', { query: 'cats' }), {
+    name: 'web_search',
+    arguments: '{"queries":["cats"]}',
+  });
+  // Bash timeout (ms) → timeoutMs; description passes; nothing invented
+  assert.deepEqual(transpileCall('Bash', { command: 'ls -la', timeout: 5000 }), {
+    name: 'bash',
+    arguments: '{"command":"ls -la","timeoutMs":5000}',
+  });
+  // TodoWrite item active_form has no native slot — dropped, core kept
+  assert.deepEqual(transpileCall('TodoWrite', { todos: [{ content: 'a', status: 'pending', active_form: 'doing a' }] }), {
+    name: 'todo_write',
+    arguments: '{"todos":[{"content":"a","status":"pending"}]}',
+  });
+  // codex update_plan: step→content rename, identical status vocabulary
+  assert.deepEqual(transpileCall('update_plan', { plan: [{ step: '扫描项目结构', status: 'in_progress' }, { step: '定位热点', status: 'pending' }] }), {
+    name: 'todo_write',
+    arguments: '{"todos":[{"content":"扫描项目结构","status":"in_progress"},{"content":"定位热点","status":"pending"}]}',
+  });
+  // codex web_search {type, query} folds into the native queries array
+  assert.deepEqual(transpileCall('web_search', { type: 'search', query: 'flutter impeller' }), {
+    name: 'web_search',
+    arguments: '{"queries":["flutter impeller"]}',
+  });
+  // codex shell_command (PowerShell string on Windows hosts) and apply_patch
+  // (whole patch document) stay verbatim — no confident mapping
+  assert.equal(transpileCall('shell_command', { command: 'Get-ChildItem -Force' }), null);
+  assert.equal(transpileCall('apply_patch', { patch: '*** Begin Patch\n*** Update File: a.h' }), null);
+  // Grep foreign-only flags (output_mode) drop; pattern/path stay
+  assert.deepEqual(transpileCall('Grep', { pattern: 'x', path: '/r', output_mode: 'content' }), {
+    name: 'grep',
+    arguments: '{"pattern":"x","path":"/r"}',
+  });
+  // native-shaped input returns the SAME semantics — with a raw arguments
+  // string the string survives byte-exact (dsh→dsh fidelity)
+  assert.deepEqual(transpileCall('read', { file_path: '/x', offset: 2, limit: 10 }, '{"file_path":"/x","offset":2,"limit":10}'), {
+    name: 'read',
+    arguments: '{"file_path":"/x","offset":2,"limit":10}',
+  });
+  // shape gate: no file_path/filePath → not confident → null (verbatim path)
+  assert.equal(transpileCall('Read', { path: '/x' }), null);
+  // unknown names and codex shell (argv array, no lossless join) → null
+  assert.equal(transpileCall('Task', { prompt: 'x' }), null);
+  assert.equal(transpileCall('shell', { command: ['ls', '-la'] }), null);
+  // malformed input → null
+  assert.equal(transpileCall('Read', 'not-json{'), null);
+  assert.equal(transpileCall(undefined, {}), null);
+});
+
+test('countTranspilableToolCalls: dedupes by callId, walks sidechains, skips unknown', () => {
+  const ir = {
+    messages: [
+      { role: 'assistant', content: [
+        { type: 'tool_use', id: 'c1', name: 'Read', input: { file_path: '/x' } },
+        { type: 'tool_use', id: 'c2', name: 'Task', input: { prompt: 'x' } },
+      ] },
+    ],
+    toolCalls: [{ callId: 'c3', tool: 'Bash', status: 'completed', input: { command: 'ls' } }],
+    sidechains: [{
+      agentId: 'child', kind: 'subagent' as const,
+      messages: [{ role: 'assistant', content: [{ type: 'tool_use', id: 'c4', name: 'Glob', input: { pattern: '*' } }] }],
+    }],
+  };
+  const stats = countTranspilableToolCalls(ir as never);
+  assert.equal(stats.count, 3);
+  assert.ok(stats.breakdown.includes('Read×1'), `breakdown=${stats.breakdown}`);
+  assert.ok(stats.breakdown.includes('Bash×1'), `breakdown=${stats.breakdown}`);
+  assert.ok(stats.breakdown.includes('Glob×1'), `breakdown=${stats.breakdown}`);
+  assert.ok(!stats.breakdown.includes('Task'), 'unknown names never counted');
+});
+
+test('foreign write: tool calls transpile to dsh-native names on the wire AND in assistant content; unknown shapes pass through', async () => {
+  const adapter = new DshAdapter();
+  const root = await tempRoot();
+  const ir = {
+    schemaVersion: 2 as const,
+    originTool: 'claude' as const,
+    messages: [
+      { role: 'user' as const, content: [{ type: 'text' as const, text: 'go' }], timestamp: 10 },
+      { role: 'assistant' as const, timestamp: 11, content: [
+        { type: 'text' as const, text: 'working' },
+        { type: 'tool_use' as const, id: 'c1', name: 'Read', input: { file_path: '/x/a.ts', offset: 2 } },
+        { type: 'tool_use' as const, id: 'c2', name: 'Bash', input: { command: 'ls', timeout: 5000 } },
+        { type: 'tool_use' as const, id: 'c3', name: 'Task', input: { prompt: 'mystery' } },
+        { type: 'tool_use' as const, id: 'c4', name: 'Edit', input: { path: '/nope' } },
+      ] },
+      { role: 'user' as const, timestamp: 12, content: [
+        { type: 'tool_result' as const, toolUseId: 'c1', content: 'file body' },
+      ] },
+      { role: 'assistant' as const, timestamp: 13, content: [{ type: 'text' as const, text: 'done' }] },
+    ],
+  };
+  const res = await adapter.write(ir as never, { root, targetCwd: 'D:\\proj-tr' });
+  const buf = await fs.readFile(res.paths[0]);
+  const plain = decompressSessionBuffer(buf);
+  const events = plain.split('\n').filter((l) => l.trim()).slice(1).map((l) => JSON.parse(l)) as DshEventLike[];
+  const calls = events.filter((e) => e.type === 'tool/call') as Array<{ data: Record<string, unknown> }>;
+  const byCallId = new Map(calls.map((c) => [c.data.callId as string, c.data]));
+  // transpiled: native name + native arg shape
+  assert.equal(byCallId.get('c1')!.name, 'read');
+  assert.equal(byCallId.get('c1')!.arguments, '{"file_path":"/x/a.ts","offset":2}');
+  assert.equal(byCallId.get('c2')!.name, 'bash');
+  assert.equal(byCallId.get('c2')!.arguments, '{"command":"ls","timeoutMs":5000}');
+  // unconfident shapes and unknown names ride verbatim
+  assert.equal(byCallId.get('c3')!.name, 'Task');
+  assert.equal(byCallId.get('c3')!.arguments, '{"prompt":"mystery"}');
+  assert.equal(byCallId.get('c4')!.name, 'Edit');
+  assert.equal(byCallId.get('c4')!.arguments, '{"path":"/nope"}');
+  // assistant content tool-call blocks carry the SAME transpiled identity
+  const assistants = events.filter((e) => e.type === 'assistant/message') as unknown as Array<{ data: { message: { content: Array<Record<string, unknown>> } } }>;
+  const firstBlocks = assistants[0].data.message.content;
+  const blockById = new Map(firstBlocks.filter((b) => b.type === 'tool-call').map((b) => [b.id as string, b]));
+  assert.equal(blockById.get('c1')!.name, 'read');
+  assert.equal(blockById.get('c1')!.arguments, '{"file_path":"/x/a.ts","offset":2}');
+  assert.equal(blockById.get('c3')!.name, 'Task');
+  // pairing intact: result references c1, physical contract holds
+  const results = events.filter((e) => e.type === 'tool/result') as unknown as Array<{ data: { message: { source: { callId: string } } } }>;
+  assert.equal(results.length, 1);
+  assert.equal(results[0].data.message.source.callId, 'c1');
+  assert.equal(verifySessionLog(plain, res.sessionId, res.paths[0]).ok, true);
+  // re-parse: the WRITTEN artifact now carries the transpiled identity (the
+  // source-IR values above were never mutated — this parses the dsh log)
+  const back = await adapter.parse(res.sessionId, root);
+  const blocks = back.messages.flatMap((m) => m.content).filter((b) => b.type === 'tool_use') as Array<{ id: string; name: string }>;
+  assert.deepEqual(blocks.map((b) => [b.id, b.name]).sort(), [['c1', 'read'], ['c2', 'bash'], ['c3', 'Task'], ['c4', 'Edit']]);
+});
+
+test('foreign write with transpileTools:false stays byte-faithful; dsh-native read rows keep raw arguments', async () => {
+  const adapter = new DshAdapter();
+  const root = await tempRoot();
+  const ir = {
+    schemaVersion: 2 as const,
+    originTool: 'claude' as const,
+    messages: [
+      { role: 'user' as const, content: [{ type: 'text' as const, text: 'go' }], timestamp: 10 },
+      { role: 'assistant' as const, timestamp: 11, content: [
+        { type: 'tool_use' as const, id: 'c1', name: 'Read', input: { file_path: '/x/a.ts' } },
+      ] },
+    ],
+  };
+  const res = await adapter.write(ir as never, { root, targetCwd: 'D:\\proj-tf', transpileTools: false });
+  const plain = decompressSessionBuffer(await fs.readFile(res.paths[0]));
+  const events = plain.split('\n').filter((l) => l.trim()).slice(1).map((l) => JSON.parse(l)) as DshEventLike[];
+  const call = events.find((e) => e.type === 'tool/call') as { data: Record<string, unknown> };
+  assert.equal(call.data.name, 'Read', 'flag off: source name survives');
+  assert.equal(call.data.arguments, '{"file_path":"/x/a.ts"}');
+
+  // dsh→dsh: native read with offset/limit + raw arguments string survives byte-exact
+  const ir2 = {
+    schemaVersion: 2 as const,
+    originTool: 'zcode' as const,
+    messages: [{ role: 'user' as const, content: [{ type: 'text' as const, text: 'q' }], timestamp: 10 }],
+    toolCalls: [{
+      callId: 'call_r',
+      tool: 'read',
+      status: 'running' as const,
+      input: { file_path: '/x', offset: 2, limit: 10 },
+      metadata: { dsh: { turn: 1, step: 1, seq: 3, time: 11, arguments: '{"file_path":"/x","offset":2,"limit":10}' } },
+    }],
+  };
+  const res2 = await adapter.write(ir2 as never, { root, targetCwd: 'D:\\proj-tf' });
+  const plain2 = decompressSessionBuffer(await fs.readFile(res2.paths[0]));
+  const events2 = plain2.split('\n').filter((l) => l.trim()).slice(1).map((l) => JSON.parse(l)) as DshEventLike[];
+  const call2 = events2.find((e) => e.type === 'tool/call') as { data: Record<string, unknown> };
+  assert.equal(call2.data.name, 'read');
+  assert.equal(call2.data.arguments, '{"file_path":"/x","offset":2,"limit":10}');
 });

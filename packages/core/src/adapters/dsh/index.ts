@@ -133,6 +133,7 @@ import {
   projectKey,
   readFirstFrameLine,
 } from './format.js';
+import { transpileCall, countTranspilableToolCalls } from './transpile.js';
 
 interface DshHeader {
   id: string;
@@ -509,7 +510,21 @@ export class DshAdapter implements Adapter {
       // otherwise use the patched array.
       irForWrite = { ...ir, title: migratedTitle, ...(patchedUnmapped.length ? { unmappedEvents: patchedUnmapped } : {}) };
     }
-    const events = irToEvents(irForWrite, createdAt);
+    // 外来工具转译可见性（AGENT.md 纪律：语义改写绝不无声）：一次性统计本次
+    // 落盘会改写多少外来工具调用（含子会话树），改写规则见 transpile.ts 与
+    // docs/agents/dsh.md「外来工具转译」。IR 本身保持源值——这只是写端适配。
+    if (opts?.transpileTools !== false) {
+      const tstats = countTranspilableToolCalls(ir);
+      if (tstats.count > 0) {
+        // stderr 不是 stdout：CLI --json 的 stdout 契约是纯 JSON（b36bcde 同款
+        // 纪律），adapter 内的信息行绝不能进 stdout。
+        // eslint-disable-next-line no-console -- migration-time visibility contract: semantic rewrites must be announced, not silent
+        console.error(
+          `[cc-migrate/dsh] transpiled ${tstats.count} foreign tool call(s) to dsh-native equivalents (${tstats.breakdown}; see docs/agents/dsh.md)`,
+        );
+      }
+    }
+    const events = irToEvents(irForWrite, createdAt, { transpileTools: opts?.transpileTools });
     const frame1 = buildSessionFrame(header);
     const frame2 = buildEventsFrame(events);
 
@@ -571,8 +586,10 @@ export class DshAdapter implements Adapter {
     if (teammateCount > 0) {
       // 内容承载说明（非警告——丢弃已成历史）：一次性告知用户 teammate 侧链的
       // 落盘形态与 team/* 不发的理由，语义边界保持可见，绝不无声改写。
+      // stderr 不是 stdout：CLI --json 的 stdout 契约是纯 JSON（b36bcde 同款
+      // 纪律，带 teammate 侧链的 --json 迁移曾会被此行炸掉 JSON.parse）。
       // eslint-disable-next-line no-console -- migration-time visibility contract: teammate carry-over must be announced, not silent
-      console.log(
+      console.error(
         `[cc-migrate/dsh] ${teammateCount} teammate sidechain(s) written as standalone child sessions (dsh team/* events are runtime-only state — content preserved, live-team semantics not translatable; see docs/agents/dsh.md)`,
       );
     }
@@ -662,8 +679,11 @@ export class DshAdapter implements Adapter {
       // establish 语义是「恰好一条」，重复行会让两次折叠结果取决于先后。
       const childLabel = (sc.title ?? sc.agentType ?? sc.agentId ?? childId).slice(0, 120);
       const hasNativeDescriptor = (sc.unmappedEvents ?? []).some((ev) => ev.type === 'subagent/descriptor');
-      const childEvents = irToEvents(childIr, childCreatedAt, hasNativeDescriptor ? undefined : {
-        subagentDescriptor: { version: 2, mode: 'one-shot', provider: 'migrated', label: childLabel },
+      const childEvents = irToEvents(childIr, childCreatedAt, {
+        transpileTools: opts?.transpileTools,
+        ...(hasNativeDescriptor ? {} : {
+          subagentDescriptor: { version: 2, mode: 'one-shot', provider: 'migrated', label: childLabel },
+        }),
       });
       const cFrame1 = buildSessionFrame(childHeader);
       const cFrame2 = buildEventsFrame(childEvents);
@@ -1305,11 +1325,20 @@ export interface IrToEventsOptions {
    * `values.subagent` 为 null 的子日志直接判「会话记录损坏」（identity 只能由
    * 合法 descriptor 事件建立），外来子会话必须补一条。 */
   subagentDescriptor?: Record<string, unknown>;
+  /**
+   * 外来工具转译（docs/agents/dsh.md「外来工具转译」）：把源 harness 的工具名
+   * （claude/zcode 的 Read/Edit/…、opencode 的 filePath 方言等）改写为 DSH 原生
+   * 词汇（read/edit/…），让 GUI 的 classifyTool 命中原生卡片变体、resume 回放
+   * 看到与实际工具集一致的调用形状。形状门控 + 幂等（transpile.ts），dsh→dsh
+   * 的原生行逐字节不受影响。默认 true；WriteOptions.transpileTools 透传。
+   */
+  transpileTools?: boolean;
 }
 
 export function irToEvents(ir: MigratedSession, baseTime: number, opts?: IrToEventsOptions): DshEvent[] {
   type Raw = { time: number; type: string; data: DshEvent['data']; surfaceOp?: string; sourceEventSeqs?: number[]; _msg?: MigratedMessage; _seq?: number; _blockCall?: boolean };
   const raw: Raw[] = [];
+  const transpileTools = opts?.transpileTools !== false;
   // Foreign-origin IRs (claude/codex/...) carry no per-message seq; park them
   // after every real source seq so ties keep insertion order without stealing
   // earlier positions from genuine stream events.
@@ -1559,11 +1588,11 @@ export function irToEvents(ir: MigratedSession, baseTime: number, opts?: IrToEve
           : injected
             ? { source: { kind: 'plugin', plugin: contentKind ?? 'external-harness' } }
             : { source: { kind: 'user', rpcId: randomUUID(), clientTimeZone: 'Asia/Shanghai' } }),
-        content: native.rawContent ?? dshContentFromBlocks(msg.content),
+        content: native.rawContent ?? dshContentFromBlocks(msg.content, transpileTools),
       } as unknown as DshEvent['data'];
       raw.push({ time, type: 'user/message', ...(surfaceOf(msg) as { surfaceOp: string; sourceEventSeqs?: number[] }), data, _msg: msg, _seq: seq });
     } else {
-      const content = native.rawContent ?? dshContentFromBlocks(msg.content);
+      const content = native.rawContent ?? dshContentFromBlocks(msg.content, transpileTools);
       // Reasoning-only foreign assistant rows carry no durable content (the
       // encrypted reasoning text was dropped at read time) — an empty
       // assistant/message would just render as a dead step in the GUI.
@@ -1609,11 +1638,20 @@ export function irToEvents(ir: MigratedSession, baseTime: number, opts?: IrToEve
         const seatQ = blockSeatQueues.get(b.id);
         if (!seatQ || seatQ.length === 0) continue;
         const writtenId = seatQ.shift()!;
-        const args = b.input === undefined ? '' : typeof b.input === 'string' ? b.input : JSON.stringify(b.input);
+        // 外来工具转译（形状门控，transpile.ts）：未命中规则时 t 为 null，
+        // 逐字节走源名 + 源 arguments 的原路径。
+        const t = transpileTools ? transpileCall(b.name, b.input) : null;
+        const args = t
+          ? t.arguments
+          : b.input === undefined
+            ? ''
+            : typeof b.input === 'string'
+              ? b.input
+              : JSON.stringify(b.input);
         raw.push({
           time,
           type: 'tool/call',
-          data: { turn: 1, step: 1, callId: writtenId, name: b.name ?? 'tool', arguments: args } as unknown as DshEvent['data'],
+          data: { turn: 1, step: 1, callId: writtenId, name: t ? t.name : (b.name ?? 'tool'), arguments: args } as unknown as DshEvent['data'],
           _seq: seq,
           // 块派生调用行的标记：turn/step 是占位值，骨架 pass 按游标 restamp；
           // toolCalls 桶重发行的行带保留原生坐标，绝不 restamp。
@@ -1640,6 +1678,10 @@ export function irToEvents(ir: MigratedSession, baseTime: number, opts?: IrToEve
     const writtenId = bucketSeatIds[i];
     const dsh = (tc.metadata as { dsh?: { turn?: number; step?: number; seq?: number; time?: number; arguments?: string } } | undefined)?.dsh;
     const time = typeof dsh?.time === 'number' && Number.isFinite(dsh.time) ? dsh.time : baseTime;
+    // 外来工具转译：native 形状的行幂等原样返回（保留 metadata.dsh.arguments
+    // 原始字符串，dsh→dsh 逐字节无损）；真正命中外来方言时才改写。
+    const rawArgs = typeof dsh?.arguments === 'string' ? dsh.arguments : undefined;
+    const t = transpileTools ? transpileCall(tc.tool, tc.input, rawArgs) : null;
     raw.push({
       time,
       type: 'tool/call',
@@ -1647,8 +1689,8 @@ export function irToEvents(ir: MigratedSession, baseTime: number, opts?: IrToEve
         turn: dsh?.turn ?? 1,
         step: dsh?.step ?? 1,
         callId: writtenId,
-        name: tc.tool,
-        arguments: typeof dsh?.arguments === 'string' ? dsh.arguments : JSON.stringify(tc.input ?? {}),
+        name: t ? t.name : tc.tool,
+        arguments: t ? t.arguments : (rawArgs ?? JSON.stringify(tc.input ?? {})),
       } as unknown as DshEvent['data'],
       _seq: isSafeSeq(dsh?.seq) ? dsh.seq : undefined,
     });
@@ -2073,7 +2115,7 @@ function dshImageFromBlock(b: FileBlock): Record<string, unknown> | undefined {
   return { type: 'image', attachment };
 }
 
-function dshContentFromBlocks(blocks: ContentBlock[]): unknown[] {
+function dshContentFromBlocks(blocks: ContentBlock[], transpileTools: boolean): unknown[] {
   return blocks.map((b) => {
     switch (b.type) {
       case 'text':
@@ -2081,9 +2123,22 @@ function dshContentFromBlocks(blocks: ContentBlock[]): unknown[] {
       case 'thinking':
         // DSH stores reasoning as {type:"reasoning", text}
         return { type: 'reasoning', text: b.thinking };
-      case 'tool_use':
-        // DSH tool-call block inside assistant content
-        return { type: 'tool-call', id: b.id, name: b.name, arguments: typeof b.input === 'string' ? b.input : JSON.stringify(b.input ?? {}) };
+      case 'tool_use': {
+        // 与块派生 tool/call 行同一 transpileCall（同参同结果，确定性一致）：
+        // assistant 内容里的 tool-call 块与事件行的 name/arguments 必须一致，
+        // 否则 GUI 折叠与 resume 回放看到两套工具名。
+        const t = transpileTools ? transpileCall(b.name, b.input) : null;
+        return {
+          type: 'tool-call',
+          id: b.id,
+          name: t ? t.name : b.name,
+          arguments: t
+            ? t.arguments
+            : typeof b.input === 'string'
+              ? b.input
+              : JSON.stringify(b.input ?? {}),
+        };
+      }
       case 'file': {
         // DSH ImageBlock projection (gap #4); non-mappable files degrade to text.
         const image = dshImageFromBlock(b);

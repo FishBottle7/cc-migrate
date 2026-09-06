@@ -68,3 +68,27 @@
   - **同响应合并**：claude 流式转写把一次 LLM 响应拆成共享 `message.id` 的多条 assistant 记录（reasoning/文本/tool_use 各一条）；不合并则同 step 整块替换照样吞内容。写端把**相邻且 `meta.claude.message.id` 相同**的外来 assistant 记录合并为一条 `assistant/message`（usage 取组内最后非空、interrupted 取或）；不相邻（并行 tool_use 与 result 交错）各自成 step，不强行拼接。
   - **子会话身份行**：子代理列表（`dsh-subagent resolveColdIdentity`）对 `values.subagent` 折叠为 null 的子日志返回 diagnostic `corrupt`（GUI 显示「会话记录损坏」），而 identity **只能由 `subagent/descriptor` 事件建立**（`foldSubagentDescriptor`，v2 契约；first-wins：establishing provider 恰好一条）。外来子会话（claude subagent/teammate）源里没有该事件 → 写端在子日志首行补 `{version:2, mode:'one-shot', provider:'migrated', label:<title ?? agentType ?? agentId 截 120>}`（one-shot=「归档记录、不支持续发」，GUI 明确支持查看 one-shot 执行记录）；dsh→dsh 子会话自带 descriptor（unmappedEvents 原样保留），绝不追加第二条。
   - 助手 source 身份按真值提升：claude 源会话写 `provider:'claude', model:<meta.claude.message.model>`（此前误标为引擎默认 `abrdns/GLM-5.3-Flash`）。
+- **外来工具转译（2026-09-06，`transpile.ts`）**：GUI 冷会话的工具卡片渲染**纯按 wire 工具名分发**（client bundle `dsh-client-ui-tool` 的 `classifyTool → TOOL_VARIANTS`：bash/pwsh→bash、read/web_fetch→read、web_search/grep/glob→search、write→write、edit→edit、run_code→code，**未知名一律落 "others" 通用卡片**；参数从 `tool/call` 的 `arguments` JSON 里按 `FILE_PATH_KEYS ["path","file_path"]` 取）。外来会话（claude/zcode/opencode…）带着源 harness 名（`Read`/`Edit`/…）落盘，全部渲染成匿名 others 卡片，resume 回放时模型看到的调用形状也与 DSH 实际工具集不符。写端（`irToEvents` 三个发射点：assistant 内容 `tool-call` 块、块派生 `tool/call` 行、toolCalls 桶重发行）按下方转译表改名 + 归参。纪律与边界：
+  - **目标 schema 全部读自安装产物**（`~/.dsh/profiles/node_modules/@deepseek-ai/dsh-tool-fs/-bash/-fs-search/-web/-todo` 的 `defineTool` 定义），不靠猜；
+  - **形状门控**：每条规则先验外来方言签名、必填原生键可全部映射才改写；不自信的形状（如 `Read {path}`）原样透传——宁缺勿错；
+  - **幂等 + 字节保真**：native 形状的行原样返回（同一对象引用），桶行带 `metadata.dsh.arguments` 原始字符串时原串透传——dsh→dsh 往返逐字节不变（回归测试钉死）；
+  - **只改写不伪造**：native `description` 缺失就缺失，不从命令编造；外来专属键（`output_mode`/`active_form`/`prompt`…）native 无槽位，落盘时丢弃、**IR 保留源值**（写端按能力丢弃是既有模式）；
+  - **结果不改写**：`tool/result` 不带工具名（按 callId 配对），客户端对无 meta 的结果文本做扁平渲染，外来结果文本在原生卡片内正常显示；
+  - **codex `shell_command`/`apply_patch` 不转译**：Windows 上命令串是 PowerShell，标成 `bash` 是冒充执行器（旧版 argv 数组 `shell` 拼串同样是猜测）；`apply_patch` 整份 patch 文档与 `old_string/new_string` 差一个格式层——均留在 others 卡片，对齐 team/* 裁决「没有无损契约就没有转译」；
+  - 可见性：write 端一次性 `console.error` 统计（stderr 不污染 CLI `--json` 的 stdout 纯 JSON 契约，`transpiled N foreign tool call(s) … (Read×3, …)`）；`WriteOptions.transpileTools` 默认 `true`，置 `false` 逐字节保真。
+  - 转译表（外来名 → 原生名，参数契约 → 原生 schema）：
+
+    | 外来 | 原生 | 参数处理 |
+    |------|------|----------|
+    | `Read`/`read`(opencode) | `read` | `filePath→file_path`（opencode 新方言），`offset/limit` 透传 |
+    | `Write`/`write` | `write` | `{file_path, content}`（`filePath` 归一） |
+    | `Edit`/`edit` | `edit` | `{file_path, old_string, new_string, replace_all?}`（同名同构） |
+    | `Bash`/`bash` | `bash` | `timeout→timeoutMs`（双方都是 ms）；`description/workdir/run_in_background` 透传 |
+    | `Glob`/`glob` | `glob` | `{pattern, path?}`（同名同构） |
+    | `Grep`/`grep` | `grep` | `{pattern, path?}`；`output_mode/-i/-n/head_limit` 等丢弃 |
+    | `WebFetch`/`webfetch` | `web_fetch` | `{url}`；`prompt` 丢弃 |
+    | `WebSearch`/`websearch`/`web_search`(codex) | `web_search` | `{query}→{queries:[query]}`（native 是 1..N 数组；codex 的 `type:'search'` 丢弃） |
+    | `TodoWrite`/`todowrite` | `todo_write` | `{todos:[{content,status}]}`；item `active_form` 丢弃，status 枚举同词汇 |
+    | `update_plan`(codex) | `todo_write` | `{plan:[{step,status}]}→{todos:[{content,status}]}`，`step→content` 改名，status 枚举（pending/in_progress/completed）**逐字相同**（真机形状核对） |
+
+    仍不转译（真机 720 调用会话核对）：`NotebookEdit`（无对应物）、`Task`/子代理类（dsh 走 subagent/descriptor 域事件，不是工具调用）、`AskUserQuestion`（dsh `ask_user_question` 的 questions schema 未核对，不冒充）、codex `shell_command`（**Windows 上命令串是 PowerShell**，标成 `bash` 是冒充执行器；旧版 argv 数组 `shell` 同理不拼串）、codex `apply_patch`（整份 `*** Begin Patch` 文档与 `old_string/new_string` 差一个格式层，解析有损）、opencode `task`/`question`/`invalid`（子代理语义走子会话承载 / 无契约）。反向（IR→claude/codex/opencode/… 各写端）工具名直写不转译：codex 词汇表没有文件读工具，dsh 的 `read/grep/glob` 在那边无等价物，透传是唯一诚实选项。
