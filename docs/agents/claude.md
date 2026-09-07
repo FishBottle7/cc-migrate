@@ -176,6 +176,12 @@ Attachment union（老源码 `attachments.ts:295-737`，**字段级形状已全�
 
 > attachment 在模型回放中经 `reorderAttachmentsForAPI` 重排（冒泡到 tool_result/assistant 前）后进 API——它们是**模型上下文的一部分**，迁移丢弃即丢上下文。
 
+**回放语义实测补正 + 纯状态提醒不投影（2026-09-07，mock 请求体捕获法）**：
+
+1. **`total_tokens_reminder` 是逐轮落盘、全量回放的**——每个 regular user prompt 写一条（门控 `isRegularUserPrompt && 设置≠off`），resume/继续时 24/24 全部回放进模型上下文（035064cf 真机会话实测，按数值逐一比对；合并内嵌进相邻 user/tool_result 文本，GUI 不可见）。**不是"只给最新一条"**。与不落盘的 per-request userContext（`# currentDate`/CLAUDE.md，每次请求现算、永远只有最新一份，§5.2）是两类机制。原生靠两点容忍堆积：每条仅 ~20 token；compaction 截断链时整段清掉（段内堆积、段间不叠加）。
+2. **迁移裁定（用户拍板"全部不投影"）**：`total_tokens_reminder` / `token_usage` / `budget_usd` / `output_token_usage` 四类**纯状态提醒**（过期计量快照，语义价值≈0）跨工具迁移**不再投影为 IR 消息**——读端（`parse.ts` `PURE_STATUS_ATTACHMENT_TYPES`）把原行整体进 `sessionEvents` 桶保真；claude→claude 走 `recordsRaw` 字节直通零影响；跨工具写端不再为它们生成注入行。动机：真机迁移产物实测注入比严重失衡（79492f69：444 条 user 行仅 13 条人话，提醒文本占 surface 18.7%），且 DSH 侧 `user/message` 无条件逐字回放进模型上下文（`surface.ts` deriveEventMessage），纯污染。有语义负载的 attachment（`skill_listing`/`deferred_tools_delta`/`file`/`task_reminder`/hook additional context 等）照旧投影——它们是模型上下文的真实组成部分。§2.4 顶部"迁移丢弃即丢上下文"的红线自此以"语义负载"划界：纯状态计量快照例外。
+3. 遗留观察（未处置）：claude 原生 compaction 截断语义（每段只回放本段）在 claude→DSH 写端尚无对应物——`irToEvents` 不消费 `ir.compaction`，迁移产物 resume 时全历史段复活。DSH 的原生对应机制是 `surfaceOp:'replace'` 检查点（+`shadowed`），可作为后续增强（P1）。
+
 ### 2.5 B/C 类元数据行全集（B=last-wins 等合并语义；含 2.1.251 reAppend 顺序逆向）
 
 老源码权威 union：`src/types/logs.ts:297-317`。2.1.251 二进制中的**完整合并语义表**（逆向）：

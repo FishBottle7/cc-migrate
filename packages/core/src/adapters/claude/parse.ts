@@ -233,6 +233,27 @@ export interface ClaudeMetadata {
 
 const TRANSCRIPT_TYPES = new Set(['user', 'assistant', 'attachment', 'system']);
 
+/**
+ * 纯状态提醒类 attachment（2026-09-07 真机裁定 + 用户拍板「全部不投影」）。
+ * 实测语义：claude 对每个 regular user prompt 落一条 token/budget 计量提醒
+ * （`<total_tokens>N tokens left</total_tokens>` 等），resume/继续时随消息
+ * 列表全量回放（mock 请求体捕获：24/24 存活，合并内嵌进相邻 user/tool_result
+ * 文本）——但内容只是「落盘那一刻」的过期快照，语义价值为零，claude 自己也
+ * 在下一次 compaction 时随链丢弃。跨工具迁移为它们生成对话消息只会污染目标
+ * 端上下文与 GUI（真机迁移产物 79492f69：444 条 user 行仅 13 条人话，提醒
+ * 占 surface 文本 18.7%）。故读端不为这四类生成 IR 消息；原行整体进
+ * sessionEvents 桶保真（claude→claude 走 recordsRaw 字节直通，零影响）。
+ * 有语义负载的 attachment（skill_listing/deferred_tools_delta/file/
+ * task_reminder/hook additional context 等）照旧投影——它们是模型上下文的
+ * 真实组成部分。
+ */
+const PURE_STATUS_ATTACHMENT_TYPES = new Set([
+  'total_tokens_reminder',
+  'token_usage',
+  'budget_usd',
+  'output_token_usage',
+]);
+
 function collectMetadata(records: ClaudeRawRecord[]): ClaudeMetadata {
   const meta: ClaudeMetadata = { legacySummaries: [], contentReplacements: [], rows: [] };
   for (const rec of records) {
@@ -969,6 +990,12 @@ export function projectChain(
 
     if (rec.type === 'attachment') {
       const att = (rec.attachment ?? {}) as Record<string, unknown>;
+      // 纯状态提醒不投影为对话消息（PURE_STATUS_ATTACHMENT_TYPES 注释）——
+      // 原行进 sessionEvents 桶，跨工具写端不再为它生成注入行。
+      if (typeof att.type === 'string' && PURE_STATUS_ATTACHMENT_TYPES.has(att.type)) {
+        sessionEvents.push({ seq: line, time: ts ?? 0, type: String(rec.type ?? 'attachment'), data: rec });
+        continue;
+      }
       const msg: MigratedMessage = {
         role: 'user',
         content: attachmentBlocks(att),

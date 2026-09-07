@@ -146,6 +146,54 @@ test('parse: transcript + metadata rows + system rows + isMeta + local_command',
   assert.ok(ir.sessionEvents?.some((e) => e.type === 'turn_duration'), '非对话 system 行 → sessionEvents');
 });
 
+/* ---------------- 纯状态提醒 attachment（2026-09-07 真机裁定） ---------------- */
+
+test('parse: token/budget 计量提醒不投影为消息，原行进 sessionEvents；语义 attachment 照旧', async () => {
+  // 真机实测（mock 请求体捕获）：total_tokens_reminder 每个用户 prompt 落一条、
+  // resume 时 24/24 全量回放——但内容是过期倒计时快照，语义价值为零。跨工具
+  // 迁移不再为它们生成对话消息（用户拍板「全部不投影」）；原行进 sessionEvents
+  // 保真，claude→claude 走 recordsRaw 字节直通不受影响。有语义负载的
+  // attachment（skill_listing 等）是模型上下文的真实组成部分，照旧投影。
+  const root = await tempRoot();
+  const dir = join(root, claudeProjectDirName('D:\\proj'));
+  await fs.mkdir(dir, { recursive: true });
+  const sid = randomUUID();
+  const attRow = (uuid: string, attachment: Record<string, unknown>): Record<string, unknown> => ({
+    type: 'attachment', uuid, parentUuid: 'a1', timestamp: TS0, isSidechain: false, sessionId: sid, attachment,
+  });
+  const records: Record<string, unknown>[] = [
+    userRec('u1', null, 'hello', { sessionId: sid, cwd: 'D:\\proj' }),
+    asstRec('a1', 'u1', 'msg_1', [{ type: 'text', text: 'ok' }], { sessionId: sid }),
+    attRow('at1', { type: 'total_tokens_reminder', text: '<total_tokens>15000000 tokens left</total_tokens>' }),
+    attRow('at2', { type: 'token_usage', used: 100, total: 200, remaining: 100 }),
+    attRow('at3', { type: 'budget_usd', used: 1, total: 10, remaining: 9 }),
+    attRow('at4', { type: 'output_token_usage', turn: 5, session: 50, budget: null }),
+    attRow('at5', { type: 'skill_listing', content: 'skill lines', skillCount: 1 }),
+    { type: 'last-prompt', lastPrompt: 'hello', leafUuid: 'a1', sessionId: sid },
+  ];
+  await fs.writeFile(join(dir, `${sid}.jsonl`), writeRecords(records));
+
+  const adapter = new ClaudeAdapter();
+  const ir = await adapter.parse(sid, root);
+
+  const attTypeOf = (m: (typeof ir.messages)[number]) =>
+    (m.meta?.claude as { attachment?: { type?: string } } | undefined)?.attachment?.type;
+  const PURE = ['total_tokens_reminder', 'token_usage', 'budget_usd', 'output_token_usage'];
+  assert.equal(
+    ir.messages.filter((m) => PURE.includes(String(attTypeOf(m)))).length, 0,
+    '纯状态提醒不投影为 IR 消息',
+  );
+  for (const t of PURE) {
+    const ev = ir.sessionEvents?.find((e) =>
+      (e.data as { attachment?: { type?: string } } | undefined)?.attachment?.type === t);
+    assert.ok(ev, `${t} 原行 → sessionEvents 保真`);
+    assert.equal(ev!.type, 'attachment');
+  }
+  const skillMsg = ir.messages.find((m) => attTypeOf(m) === 'skill_listing');
+  assert.ok(skillMsg, '有语义的 attachment 照旧投影');
+  assert.equal(skillMsg!.synthetic, true);
+});
+
 /* ---------------- agent-authored user rows（2026-09-05 真机裁定） ---------------- */
 
 test('agent-authored user rows: 打断标记/teammate 信封/侧链 prompt → synthetic；混装行按 run 拆分', () => {
