@@ -302,7 +302,11 @@ DSH 插件 = `core` 的薄消费者。命令示例：
 
 **Phase 5 —— 健壮性**
 19. ✅ 工具调用 id 重映射（2026-09-03，dsh 写端席位制：同会话重复 tool_use id 换 `call_<uuid>`、配对 result 同步 FIFO 重映射、乱序 IR 回退首席位无孤儿；IR 保持源值零丢弃——测试含乱序/交叉配对探针）+ ✅ 会话 id 碰撞防护（显式 `--session-id` 冲突即抛错拒绝（对齐 zcode UNIQUE 纪律），引擎自生成走 claim，`wx` 独占创建封 TOCTOU——AGENT.md「永不覆盖」铁律的写端卡点，5 项 `dsh-robustness.test`）；cwd 迁移、模型映射已随各适配器 resolveCwd/模型透传落地
-20. 测试矩阵 + 损坏文件容错 + 幂等（不重复导入）（幂等 = 写端碰撞防护：显式 id 冲突拒绝 + wx 兜底，2026-09-03 随第 19 项落地）+ ~~OpenCode 真实写采样复核~~（✅ 2026-09-02 完成）——残余：更广的损坏文件容错测试矩阵（claude 读端已容忍断行，其余各家按需补）
+20. 测试矩阵 + 损坏文件容错 + 幂等（不重复导入）（幂等 = 写端碰撞防护：显式 id 冲突拒绝 + wx 兜底，2026-09-03 随第 19 项落地）+ ~~OpenCode 真实写采样复核~~（✅ 2026-09-02 完成）+ ~~更广的损坏文件容错测试矩阵~~（✅ 2026-09-07 完成，`packages/core/test/read-tolerance.test.ts` 14 用例锚定六家读端损坏面：
+    - **dsh 读端行级容错**（此前一行坏 JSON 整份裸抛）：`decodeEventLines` 严格鸭子定性，坏行/非事件行归档为 `torn-line` unmappedEvents（零丢弃，写端按 unknown-type 闸门丢弃，往返 dsh 不拒载）；header 非对象/非 JSON、zstd 解压失败均改可读错误（带会话 id 与文件路径）；**尾帧截断抢救**——唯一帧损坏或末帧撕裂时保留前缀完整帧（copy-while-appending 形态），仅有的帧坏才报错；
+    - **codex listSessions per-file 容错**（此前单个损坏 .zst 炸全列表）：`scanRolloutHead` 外包 try/catch skip；`.zst` 解压失败错误带文件路径；`(unparseable)` 归档行 `time` 落 0 修复（此前缺失 `time` 键导致 validateSession 拒绝整个 parse——容错矩阵坐实的存量 bug）；
+    - **opencode mirror 断行容忍**（此前一条撕裂行裸抛 SyntaxError）：逐行 try/catch skip；
+    - 已有行为锚定：claude NUL 断行/坏行/非对象行 skip + 单损坏文件不炸列表、pi 断行 skip + 无 header 显式拒绝、opencode/zcode 损坏 data 行逐行降级 + 坏 store 显式报错、codex torn .zst 邻居会话全数列出、dsh torn-line 往返不拒载）
 
 ## 7. 诚实的边界与风险
 

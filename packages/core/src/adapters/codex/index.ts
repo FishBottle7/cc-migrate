@@ -103,7 +103,16 @@ export class CodexAdapter implements Adapter {
     // 再出现只会是主会话的「重复项」，用户拍板 codex 列表只显示主会话。
     const subagentIds = new Set<string>();
     for (const [threadId, f] of files) {
-      const head = await scanRolloutHead(f.path);
+      // One damaged file must not take the whole listing down (a torn .zst,
+      // EACCES, …): skip it and keep listing its neighbours. A silent-but-
+      // degraded row (empty head) is fine here — listSessions is browsing,
+      // and parse() still surfaces the real error when that file is picked.
+      let head;
+      try {
+        head = await scanRolloutHead(f.path);
+      } catch {
+        continue;
+      }
       if (head.parentThreadId) {
         subagentIds.add(threadId);
         continue;

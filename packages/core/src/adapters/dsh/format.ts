@@ -75,14 +75,36 @@ export function scanZstdFrameRanges(buf: Buffer): Array<{ start: number; end: nu
   return ranges;
 }
 
-/** Decompress a DSH session artifact into its plaintext JSONL (header + events). */
+/** Decompress a DSH session artifact into its plaintext JSONL (header + events).
+ *
+ * Frame-level salvage: a torn TRAILING frame (log file copied while DSH was
+ * still appending) is skipped, keeping every complete frame before it —
+ * matches the codex read side's tolerance of a torn trailing rollout line.
+ * A damaged NON-trailing frame still throws: the salvage heuristic trusts
+ * the next frame's magic as an end marker, so a mid-frame break cannot be
+ * distinguished from a legitimately rare in-frame magic collision. */
 export function decompressSessionBuffer(buf: Buffer): string {
   // O(n)：先把各帧解压结果收进数组，最后一次 concat。
   // （旧实现每帧 `Buffer.concat([累计, 新帧])`，几千帧的会话累计拷贝量是 O(n²)，
   //  实测一个 1900+ 消息会话仅 memcpy 就耗掉 ~85s。）
+  const ranges = scanZstdFrameRanges(buf);
   const chunks: Buffer[] = [];
-  for (const range of scanZstdFrameRanges(buf)) {
-    chunks.push(zstdDecompressSync(buf.subarray(range.start, range.end)));
+  let tornTail = false;
+  for (let i = 0; i < ranges.length; i++) {
+    const { start, end } = ranges[i];
+    try {
+      chunks.push(zstdDecompressSync(buf.subarray(start, end)));
+    } catch (e) {
+      if (i === ranges.length - 1) {
+        tornTail = true; // trailing partial frame — salvage the prefix
+        break;
+      }
+      throw new Error(`zstd frame #${i} at byte ${start} is damaged: ${(e as Error).message}`);
+    }
+  }
+  if (ranges.length > 0 && tornTail && chunks.length === 0) {
+    // The only frame is torn — nothing salvageable, this is not a session log.
+    throw new Error('the only zstd frame is damaged (torn artifact)');
   }
   return chunks.length === 1 ? chunks[0].toString('utf8') : Buffer.concat(chunks).toString('utf8');
 }

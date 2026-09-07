@@ -51,6 +51,14 @@
 
 - `listArtifacts:488` 仅读首 frame/header（`readFirstZstdLine/scanZstdFrames(...,1)`），校验 `header.id` 与路径一致性（含 `realpath` 大小写不敏感 `sameFile:854`），拒绝 `oppositeCompression` 与 `legacy flat-file`（`checkRootEncoding:894`）
 
+## 读端损坏容错（2026-09-07，read-tolerance 矩阵锚定）
+
+DSH 自家 loader 对损坏零容忍（一行坏 JSON 整份拒载），但**本引擎的读端**按「好行抢救、坏行归档」执行——copy-while-appending 的产物不该整份报废：
+
+- **行级分拣**（`decodeEventLines`）：事件行 =（`seq:number`+`time:number`，或 packed 行的 `seq0:number`）+ `type:string` + `data:object` 鸭子定性；坏 JSON / 非事件 JSON → `torn-line` unmappedEvents（`data.raw` 存原文，零丢弃），seq 编在既有 unmapped 最大 seq 之后。**写端按 unknown-type 闸门丢弃 torn-line**（DSH 不识此类型，保留即拒载）；IR 桶跨工具转移时其他目标可自行决定去留；
+- **header 门**：非 JSON / 非对象 → 显式可读错误（含会话 id 与文件路径），绝不进入半解析；
+- **zstd 物理层**（`decompressSessionBuffer`）：逐帧解压，**末帧撕裂跳过保前缀**（copy 途中截断的典型形态：帧尾以次帧 magic 为界）；中间帧损坏仍报错（无法与帧内 magic 碰撞区分，不猜）；唯一帧损坏 = 不是会话日志，报错。`verify.ts` 全量校验路径维持既有「转 issue 不炸扫描」。
+
 ## 可 resume 最小集合
 
 1. header frame（`type/version/id/createdAt/delegationDepth`）

@@ -93,3 +93,7 @@ SessionHistory.load(db, sessionID)
 3. **`event` / `event_sequence` 不是写端必需**：`event` 是投影流（`message.part.updated.1` 等 6 类，28 万行），`event_sequence` 每 aggregate 一行 seq 指针（`event/sql.ts`，写入在 `event.ts` append 时 `latest+1` 递增）。`SessionHistory.load` 不读 event 表；TUI 时间线走 `SessionProjector` 直写。适配器不写 event 行 = resume/正文无损；代价仅是 `history/events` API 与外部同步消费方看不到该会话的事件流——登记为已知取舍（原生事件流描述的是「app 自己正在运行」的实时状态，迁移会话没有这个状态可回放）。
 4. **其余写端形状逐列核对通过**（此前已按实库实现，本轮复核确认无漂移）：message/part 的 `time_created/time_updated` 毫秒整数；part 8 类型 `text/reasoning/tool/step-start/step-finish/patch/file/compaction` 的 data 形状；tool part 四态 `completed{status,input,output,metadata,title,time}/error{...,error}/pending{status,input,raw}/running`；`msg_`/`prt_`/`ses_` id 前缀；assistant `parentID` 回指轮首 user；user data `{role,time:{created},agent,model:{providerID,modelID},summary:{diffs:[]}}`。
 5. **`session.model` 形状补充采样**：非 NULL 的 274 行均为 `{"id","providerID","variant"?}` JSON 串（列是 TEXT）；适配器写 NULL 合法（实库 781 行也 NULL，多为 v1.1 年代），写端当前把 `ir.model` 投影进 assistant `modelID/providerID` 字段、`session.model` 写 NULL——维持现状（session.model 是冗余显示列，原生新会话才填）。
+
+## Mirror 断行容忍（2026-09-07，read-tolerance 矩阵锚定）
+
+`parseFromMirror` 逐行 try/catch：撕裂/坏 JSON 行 skip、好行照常解析（与 native JSONL 家族读端同纪律；mirror 是本引擎写的纯 JSONL 落盘，此前一条撕裂行会让整个 mirror parse 裸抛 SyntaxError）。DB 路径行为不变（坏 store 显式报错而非 `[]`，已有测试锚定）。

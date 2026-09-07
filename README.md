@@ -65,4 +65,4 @@ GUI 与 CLI 共用，不重复实现格式逻辑。详见 `docs/design.md`。
 - ✅ Phase 3：DSH 插件（`apps/dsh-plugin`：三命令 ✅ + GUI 向导挂载层 ✅ `GuiHost` 协议 + 无头冒烟；真机宿主联调待做）
 - ✅ Phase 3.5：对话式迁移（通用 agent skill：`@cc-migrate/cli` 内置 SKILL.md + `skill install` 一键装进各 agent 框架 skill 目录；CLI 输出全面有界化 —— `preview --json` 决策摘要 / `list` 默认 50 条封顶 + 标题截 120 字；DSH 插件额注册运行时 skill + 自带零依赖 agent CLI）
 - ✅ Phase 4：独立 Electron App（GUI 向导 ✅；Windows 打包 ✅ nsis+portable+图标 ✅+dist:win:check 一键校验；mac/linux 构建与签名待做）
-- 🔶 Phase 5：健壮性（写端碰撞防护 + callId 去重 ✅；残余：损坏文件容错矩阵补全）
+- 🔶 Phase 5：健壮性（写端碰撞防护 + callId 去重 ✅；损坏文件容错矩阵 ✅ 2026-09-07——六家读端断行/坏行/垃圾字节/单文件损坏全锚定，dsh 读端从零容忍改行级归档、codex 单坏 .zst 不再炸全列表、opencode mirror 断行容忍；详见 `docs/design.md` Phase 5 第 20 项）

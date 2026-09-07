@@ -1315,8 +1315,20 @@ function opencodeMessageFromMigrated(msg: MigratedMessage): Record<string, unkno
 
 async function parseFromMirror(mirrorPath: string): Promise<MigratedSession> {
   const text = await fs.readFile(mirrorPath, 'utf8');
-  const lines = text.split('\n').filter((l) => l.trim());
-  const records = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+  // Row-level tolerance: a torn trailing/middle row is skipped (mirrors are
+  // plain JSONL the same way native session stores are — every other JSONL
+  // reader in this repo tolerates torn rows). Dropped rows keep the mirror
+  // loadable instead of failing the whole parse with a bare SyntaxError.
+  const records: Array<Record<string, unknown>> = [];
+  for (const line of text.split('\n')) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    try {
+      records.push(JSON.parse(trimmed) as Record<string, unknown>);
+    } catch {
+      // torn/corrupt mirror row — skip
+    }
+  }
   const header = records.find((r) => r.type === 'mirror-header') as { id?: string; cwd?: string; title?: string; createdAt?: number; model?: unknown } | undefined;
   const msgs = records.filter((r) => r.type !== 'mirror-header' && r.type !== 'mirror-sidechain').map((r) => {
     const role = (MIRROR_MESSAGE_ROLES.has(String(r.type)) ? String(r.type) : 'system') as MigratedMessage['role'];

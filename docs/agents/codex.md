@@ -227,3 +227,9 @@
 - 注入行（dsh skill-catalog、claude system-reminder 等 `synthetic`）不切轮——轮边界只认人类发言，与官方对 turn 的语义一致。
 
 **已知残留**：合成事件未经真实 codex CLI resume 实测（反向扫描对合成 turn_id 的接受度与官方导入器同源，风险低但未闭环）；`thread_rolled_back` 的 num_turns 语义在外来源侧无对应记录，不合成。
+
+### 11.3 读端损坏容错（2026-09-07，read-tolerance 矩阵锚定）
+
+- **`(unparseable)` 归档行的 `time` 落 0**（存量 bug 修复）：撕裂行没有可解析 timestamp，此前 `unmappedEvent` 直接省略 `time` 键 → `validateSession` 要求 `time:number` 拒绝**整个 parse**——一条坏行把好行全拖死。现固定 `time:0`，撕裂行正常归档（`data.codexRolloutLine.payload.raw` 存原文）。
+- **`.zst` 解压失败包上下文**：`readRolloutText` 对非法 zstd 流抛 `Codex: rollout file <path> is not valid zstd (<原因>)`，不再裸冒 zlib stack。
+- **listSessions per-file 容错**：`scanRolloutHead` 逐文件 try/catch skip——单个损坏 `.zst`/EACCES 文件不再炸掉整个会话列表（邻居会话全数列出；被跳过的文件在用户真去选它时由 parse 抛真实错误）。注意 zstd 截断流仍可解压（流式容忍缺尾），损坏 fixture 需破坏帧描述符字节而非截尾。

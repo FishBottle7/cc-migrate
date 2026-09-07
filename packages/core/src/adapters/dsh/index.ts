@@ -159,6 +159,39 @@ interface DshEvent {
   } & Record<string, unknown>;
 }
 
+/** Split decoded JSONL lines into events + torn/corrupt line descriptions.
+ * Rows are classified by strict duck-typing: an event needs seq:number,
+ * type:string, data:object (packed storage rows — text-chunks and friends —
+ * carry the same trio as seq0/time0 instead). Anything else (bad JSON,
+ * missing keys, wrong types) is reported as torn instead of thrown — DSH's
+ * own loader refuses such logs, but a migrated copy can still salvage every
+ * parseable row around the damage. `time` falls back to 0 (seq-ordered). */
+function decodeEventLines(lines: string[]): { events: DshEvent[]; torn: Array<{ time: number; raw: string }> } {
+  const events: DshEvent[] = [];
+  const torn: Array<{ time: number; raw: string }> = [];
+  const isEventRow = (parsed: unknown): parsed is DshEvent => {
+    if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) return false;
+    const p = parsed as Record<string, unknown>;
+    const seqOk = (typeof p.seq === 'number' && typeof p.time === 'number') || typeof p.seq0 === 'number';
+    return seqOk && typeof p.type === 'string' && p.data !== null && typeof p.data === 'object';
+  };
+  for (const line of lines) {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(line);
+    } catch {
+      torn.push({ time: 0, raw: line });
+      continue;
+    }
+    if (isEventRow(parsed)) {
+      events.push(parsed as DshEvent);
+    } else {
+      torn.push({ time: 0, raw: line });
+    }
+  }
+  return { events, torn };
+}
+
 const SURFACE_TYPES = new Set(['user/message', 'assistant/message', 'tool/result']);
 const PACKED_CHUNK_TYPES = new Set(['reasoning-chunks', 'text-chunks', 'tool-call-chunks']);
 
@@ -275,12 +308,27 @@ export class DshAdapter implements Adapter {
     const path = await this.findLog(sessionsRoot, sessionId);
     if (!path) throw new Error(`DSH: session "${sessionId}" not found under ${sessionsRoot}`);
     const buf = await fs.readFile(path);
-    const plaintext = decompressSessionBuffer(buf);
+    let plaintext: string;
+    try {
+      plaintext = decompressSessionBuffer(buf);
+    } catch (e) {
+      throw new Error(`DSH: session "${sessionId}" failed to decompress (${path}): ${(e as Error).message}`);
+    }
     const lines = plaintext.split('\n').filter((l) => l.trim().length > 0);
     if (lines.length === 0) throw new Error(`DSH: session "${sessionId}" is empty`);
 
-    const header = JSON.parse(lines[0]) as DshHeader;
-    const events = lines.slice(1).map((l) => JSON.parse(l) as DshEvent);
+    // Header must parse and be an object: it anchors id/cwd/createdAt and
+    // DSH itself would refuse the whole log without a valid first frame.
+    let header: DshHeader;
+    try {
+      header = JSON.parse(lines[0]) as DshHeader;
+    } catch {
+      throw new Error(`DSH: session "${sessionId}" header line is not valid JSON (${path})`);
+    }
+    if (header === null || typeof header !== 'object' || Array.isArray(header)) {
+      throw new Error(`DSH: session "${sessionId}" header line is not a session header object (${path})`);
+    }
+    const { events, torn } = decodeEventLines(lines.slice(1));
     // events are stored in seq order; sort defensively
     events.sort((a, b) => (a.seq ?? 0) - (b.seq ?? 0));
 
@@ -298,6 +346,17 @@ export class DshAdapter implements Adapter {
       }
     } catch {
       // scanning is best-effort; keep main IR on failure
+    }
+    // Torn/corrupt rows ride unmappedEvents so a partially damaged log still
+    // migrates (zero-drop discipline — same shape the codex read side uses
+    // for `(unparseable)` rows). The write side drops them on dsh (unknown
+    // type) but other targets can keep the payload.
+    if (torn.length > 0) {
+      const base = Math.max(-1, ...ir.unmappedEvents?.map((e) => e.seq) ?? [-1]);
+      ir.unmappedEvents = [
+        ...(ir.unmappedEvents ?? []),
+        ...torn.map((t, i) => ({ seq: base + 1 + i, time: t.time, type: 'torn-line', data: { raw: t.raw } })),
+      ];
     }
     return validateSession(ir);
   }

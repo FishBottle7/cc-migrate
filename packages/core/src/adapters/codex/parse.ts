@@ -148,7 +148,12 @@ export async function readRolloutText(path: string): Promise<string> {
     if (typeof zstdDecompressSync !== 'function') {
       throw new Error(`Codex: cannot decompress ${path} — node:zlib zstdDecompressSync unavailable (needs Node >= 22.15)`);
     }
-    return zstdDecompressSync(buf).toString('utf8');
+    try {
+      return zstdDecompressSync(buf).toString('utf8');
+    } catch (e) {
+      // not a zstd stream / torn frame — name the file instead of a bare zlib error
+      throw new Error(`Codex: rollout file ${path} is not valid zstd (${(e as Error).message})`);
+    }
   }
   return fs.readFile(path, 'utf8');
 }
@@ -563,7 +568,10 @@ export function titleFromMessages(messages: MigratedMessage[]): string | undefin
 
 /** MigratedUnmappedEvent with optional time (spread keeps it absent, not undefined). */
 function unmappedEvent(seq: number, time: number | undefined, type: string, data: unknown): MigratedUnmappedEvent {
-  return { seq, ...(time !== undefined ? { time } : {}), type, data } as MigratedUnmappedEvent;
+  // `time` is required by the IR envelope (validateSession). A torn row has
+  // no parsable timestamp — fall back to 0 rather than omitting the key,
+  // which used to fail validation and take the whole parse down with it.
+  return { seq, time: time !== undefined && Number.isFinite(time) ? time : 0, type, data } as MigratedUnmappedEvent;
 }
 
 function orEpoch(ts: string): number {
