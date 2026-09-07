@@ -122,13 +122,14 @@ node lib/cli.js skill status [--json]
 `betterSidebar` 注册表服务与右侧边栏本体）——没装时 client 半不激活，
 命令层不受影响。
 
-### 侧边栏交互（v0.3.0）
+### 侧边栏交互（v0.3.5）
 
-- **工作区分组 + 子会话树**：会话按 `cwd` 分组（组头 = 路径短名 + 会话数
-  徽章，悬停显示全路径），组可折叠/展开，折叠状态 localStorage 记忆
-  （key 前缀 `cc-migrate:`）；组内 `parentSessionId` 的子会话缩进 14px/层
-  挂在父会话下（语义移植自桌面版 `sessionTree.ts` 的 buildNodes）。行内
-  搜索过滤标题 / 会话 id / 工作目录。
+- **工作区分组**：会话按 `cwd` 分组（组头 = 路径短名 + 会话数徽章，悬停
+  显示全路径），组可折叠/展开，折叠状态 localStorage 记忆（key 前缀
+  `cc-migrate:`）；组内会话平铺（v0.3.5 移除子会话树——用户拍板「codex
+  会话列表只显示主会话」：codex 适配器在 listSessions 源头过滤子代理
+  线程，其余工具列表本就只含主会话）。行内搜索过滤标题 / 会话 id /
+  工作目录。
 - **富预览**：消息流渲染 text / thinking（弱化斜体披露行）/ tool_use+
   tool_result（按 callId 融合成折叠卡：工具名 + 参数摘要，展开看输入输出，
   isErr 红标）/ harness 注入行；子代理旁链与独立程序同构——头部
@@ -157,7 +158,7 @@ node lib/cli.js skill status [--json]
   （`src/client/theme.ts`，与 better-sidebar 同一套），随宿主主题翻转；
   拿不到变量（老宿主/无头冒烟）时回退内联暗色兜底，观感不变。
 - **窄栏密度**：源工具切换为紧凑 chip 行；会话行单行高密度（标题截断 +
-  相对时间 + 归档/空/子标签）；消息块卡内边距 ≤8px。
+  相对时间 + 归档/空标签）；消息块卡内边距 ≤8px。
 
 ### 双半架构
 
@@ -191,7 +192,7 @@ DSH 插件官方双半规范（与 dsh-better-sidebar 自身同构）：
   UI 库。
 - **client 半文件结构**（`src/client/`，全部打进 lib/client.js）：`index.tsx`
   （tab 注册 + 原语/sessions 服务解析 + migrateViews 冒烟锚点导出）、`wizard.tsx`（四步
-  状态机 + 确认/结果页 + 导入后自动跳转）、`session-list.tsx`（分组 + 折叠记忆 + 树）、
+  状态机 + 确认/结果页 + 导入后自动跳转）、`session-list.tsx`（分组 + 折叠记忆）、
   `preview-flow.tsx`（computeFlow + 旁链切换器/整区视图 + 分页）、`theme.ts`（主题
   token）、`api.ts`（fetch 通道）。
 - **构建形态**：client 半由 tsdown 出 rolldown bundle，`scripts/wrap-client.mjs`
@@ -289,8 +290,8 @@ GUI 层（`src/gui.ts`）把这些桥接成 ui 组件的 `MigrationBackend` 契�
     TabDescriptor（better-sidebar service.d.ts 契约）；组件树经
     `react-dom/server` 无头渲染拉通；dispose 链注销。
   - **v0.3.0 新视图结构**（经工厂导出的 migrateViews 渲染 bundle 内的真
-    组件，非冒烟复刻）：工作区分组（cwd 分组/树挂接/孤儿落根/徽章计数/
-    14px 缩进）、受控折叠 + `cc-migrate:` 折叠记忆回环（坏存储降级）、
+    组件，非冒烟复刻）：工作区分组（cwd 分组/徽章计数/平铺行——v0.3.5
+    移除子会话树）、受控折叠 + `cc-migrate:` 折叠记忆回环（坏存储降级）、
     富预览（思考/工具/注入块、截断角标；旁链 = desktop 同款切换器 +
     整区切换：主视图无内联旁链、菜单树节点/召唤准星、旁链视图主流换出）；
     自动跳转重试（openSessionWithRetry：撞列表刷新竞态的重试落地 + 节拍

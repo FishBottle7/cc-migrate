@@ -919,7 +919,7 @@ test('read+write: paginated history_base chain stitches the prefix file into one
   assert.ok(texts.indexOf('prefix question') < texts.indexOf('suffix question'));
 });
 
-test('listSessions: subagent threads expose parentSessionId for the UI tree', async () => {
+test('listSessions: roots only — subagent threads are not listed', async () => {
   const adapter = new CodexAdapter();
   const root = await tempRoot();
   const dir = join(root, 'sessions', '2026', '01', '12');
@@ -934,10 +934,9 @@ test('listSessions: subagent threads expose parentSessionId for the UI tree', as
   await fs.writeFile(join(dir, `rollout-2026-01-12T20-55-48-${subId}.jsonl`), mk(subId, { source: { subagent: { thread_spawn: { parent_thread_id: mainId, depth: 1 } } } }), 'utf8');
 
   const metas = await adapter.listSessions(root);
-  const main = metas.find((m) => m.sessionId === mainId);
-  const sub = metas.find((m) => m.sessionId === subId);
-  assert.ok(main && !main.parentSessionId, 'main session unlinked');
-  assert.equal(sub?.parentSessionId, mainId);
+  assert.ok(metas.some((m) => m.sessionId === mainId), 'main session listed');
+  assert.ok(!metas.some((m) => m.sessionId === subId), 'subagent thread NOT listed (roots only — parse stitches it into sidechains)');
+  assert.ok(metas.every((m) => m.parentSessionId === undefined), 'no parentSessionId on listed metas');
 });
 
 test('listSessions: title = first real user prompt (injections skipped) + cwd from session_meta', async () => {
@@ -1037,10 +1036,9 @@ test('write: foreign sidechains expand to independent subagent rollout files (re
   assert.equal(idxIds.length, 3);
   assert.ok(idxIds.includes(mainId));
 
-  // and the tree reads back through listSessions: children hang off the parent
+  // and listSessions stays roots-only: written subagent threads are absent
   const metas = await adapter.listSessions(root);
-  const childMetaRow = metas.find((m) => m.sessionId === childThreadId);
-  assert.equal(childMetaRow?.parentSessionId, mainId);
+  assert.ok(!metas.some((m) => m.sessionId === childThreadId), 'written subagent thread NOT listed (roots only)');
 });
 
 test('write: unmapped event_msg replay gates on persisted EventMsg variants', async () => {

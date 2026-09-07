@@ -121,6 +121,8 @@ assert.ok(html.includes('该目录下没有找到会话'), 'initial empty state 
 console.log(`[5] tab.component renders headless via the matched renderer pair (${html.length} chars)`);
 
 // ── 6. 新视图结构（分组出现 + 折叠 + 富预览，与 client-smoke A6/A8 同断言集）──
+// v0.3.5：会话列表平铺（子会话树随「codex 列表只显示主会话」移除）——
+// 带 parentSessionId 的条目平铺渲染，无缩进、无「子」标签。
 const h = (tag, props) => react.createElement(tag, props);
 const now = Date.now();
 const groups = views.groupSessions([
@@ -133,8 +135,8 @@ const listHtml = reactDomServer.renderToStaticMarkup(h(views.SessionListView, {
   groups, collapsed: new Set(), onToggleGroup: () => {}, onOpen: () => {}, emptyHint: '无匹配结果。',
 }));
 assert.ok(listHtml.includes('>alpha<') && listHtml.includes('>beta<'), 'group headers rendered');
-assert.ok(listHtml.includes('父会话一') && listHtml.includes('子会话挂树'), 'session rows + tree attach rendered');
-assert.ok(listHtml.includes('padding-left:22px'), '14px/level sub-session indent rendered');
+assert.ok(listHtml.includes('父会话一') && listHtml.includes('子会话挂树'), 'session rows rendered flat (no tree attach)');
+assert.ok(!listHtml.includes('padding-left:22px'), 'NO per-level indent (sub-session tree removed)');
 const collapsedHtml = reactDomServer.renderToStaticMarkup(h(views.SessionListView, {
   groups, collapsed: new Set(['D:\\work\\alpha']), onToggleGroup: () => {}, onOpen: () => {}, emptyHint: '无匹配结果。',
 }));
@@ -165,7 +167,7 @@ const agentHtml = reactDomServer.renderToStaticMarkup(h(views.PreviewFlowView, {
 }));
 assert.ok(agentHtml.includes('旁链') && agentHtml.includes('子代理 · explorer'), 'agent whole-area view renders the sidechain flow');
 assert.ok(!agentHtml.includes('dsh --version'), 'main flow swapped out in agent view');
-console.log('[6] installed renderer: cwd grouping + controlled collapse + rich preview + sidechain switcher');
+console.log('[6] installed renderer: cwd grouping + flat session rows + controlled collapse + rich preview + sidechain switcher');
 
 console.log(`\nINSTALLED SMOKE OK — ${pkg.version} @ ${installRoot}`);
 console.log('(next: real-browser rendering inside the DSH sidebar — main-session joint-debug scope)');

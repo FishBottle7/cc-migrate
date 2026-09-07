@@ -19,7 +19,7 @@
 
 import { createElement } from 'react';
 import { MigrateWizardView, openSessionWithRetry, type HostPrimitives, type MigrateSessionsPort } from './wizard.js';
-import { SessionListView, buildSessionNodes, groupSessions, loadCollapsedCwds, saveCollapsedCwds } from './session-list.js';
+import { SessionListView, groupSessions, loadCollapsedCwds, saveCollapsedCwds } from './session-list.js';
 import { PreviewFlowView, computeFlow } from './preview-flow.js';
 
 /** Tab 图标：纯内联 SVG（14px 圆形循环箭头），不依赖宿主 icon 模块。 */
@@ -158,14 +158,13 @@ export const inject = ['betterSidebar', 'sessions'] as const;
  * 无头冒烟渲染锚点（host-inert）：宿主加载器只消费 exports.apply/inject，
  * 本表是惰性数据面——test/client-smoke.mjs 经工厂的 module.exports 拿到
  * 分组列表/预览流组件与纯函数，用 react-dom/server 拉树断言新视图结构
- * （分组渲染/折叠树/旁链挂载）。不放 wizard.tsx 内部私有：导出面稳定，
+ * （分组渲染/折叠/旁链挂载）。不放 wizard.tsx 内部私有：导出面稳定，
  * 冒烟不依赖 bundle 内部符号名。泄漏面为零：多余导出无人消费即死代码。
  */
 export const migrateViews = {
   SessionListView,
   PreviewFlowView,
   groupSessions,
-  buildSessionNodes,
   computeFlow,
   loadCollapsedCwds,
   saveCollapsedCwds,

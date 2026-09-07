@@ -98,11 +98,19 @@ export class CodexAdapter implements Adapter {
     await walkRollouts(archivedDir(codexHome), files, true);
     const titles = await loadSessionIndexTitles(codexHome);
     const items: SessionMeta[] = [];
+    // roots only (zcode listSessions 同款纪律)：子代理线程是独立 rollout
+    // 文件，parse() 会经 thread_spawn 链把它们缝进 ir.sidechains——列表里
+    // 再出现只会是主会话的「重复项」，用户拍板 codex 列表只显示主会话。
+    const subagentIds = new Set<string>();
     for (const [threadId, f] of files) {
-      // One cheap head scan per file: cwd + subagent parent + first real user
-      // prompt (codex naming convention). The index title, when present, wins
-      // — same priority the write side uses.
       const head = await scanRolloutHead(f.path);
+      if (head.parentThreadId) {
+        subagentIds.add(threadId);
+        continue;
+      }
+      // One cheap head scan per file: cwd + first real user prompt (codex
+      // naming convention). The index title, when present, wins — same
+      // priority the write side uses.
       const indexTitle = titles.get(threadId);
       items.push({
         tool: 'codex',
@@ -112,14 +120,13 @@ export class CodexAdapter implements Adapter {
         createdAt: f.createdAt ?? (f.mtime || undefined),
         sourcePath: f.path,
         ...(f.archived ? { archived: true } : {}),
-        ...(head.parentThreadId ? { parentSessionId: head.parentThreadId } : {}),
       });
     }
-    // Deferred-creation threads: registered in the append-only index but no
-    // rollout file on disk yet — nothing to migrate; listed so consumers can
-    // account for them (SessionMeta.deferredCreation) and filter in the UI.
+    // session_index 里登记但磁盘没有 rollout 的 deferred 线程：子代理线程
+    // 也可能在 index 里登记（其父线程缺文件时无法甄别）——主会话不存在
+    // 的 id 不应出现，一律跳过。
     for (const [threadId, title] of titles) {
-      if (files.has(threadId)) continue;
+      if (files.has(threadId) || subagentIds.has(threadId)) continue;
       items.push({ tool: 'codex', sessionId: threadId, ...(title ? { title } : {}), deferredCreation: true });
     }
     items.sort((a, b) => (a.deferredCreation ? Number.MAX_SAFE_INTEGER : a.createdAt ?? 0) - (b.deferredCreation ? Number.MAX_SAFE_INTEGER : b.createdAt ?? 0));

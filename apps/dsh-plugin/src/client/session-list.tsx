@@ -1,55 +1,28 @@
 /**
- * cc-migrate client 半 — 会话列表（工作区分组 + 子会话树，侧栏高密度版）。
+ * cc-migrate client 半 — 会话列表（工作区分组，侧栏高密度版）。
  *
  * 语义移植自 @cc-migrate/ui 的 Vue 实现（MIT，本仓库自有代码，允许语义
  * 移植）：
- *  - sessionTree.ts `buildNodes` —— 主会话在上、子会话挂父节点下、父不在
- *    列表/本组的子会话按根处理（React 重写，算法逐行同语义）。
  *  - SessionPicker.vue `groups` computed —— 按 cwd 字符串分组、组内
  *    createdAt 降序、组间按组内最新会话排序；desktop 用 projectKey(cwd)
  *    做 key，client 侧不需要那么重，直接 cwd 字符串分组（同 key 同组）。
  * 与桌面版的差异（侧栏适配，为什么）：
- *  - 行高密度：单行 = 缩进 + 标题（截断）+ 标签 + 相对时间；cwd 副行删掉
+ *  - 行高密度：单行 = 标题（截断）+ 标签 + 相对时间；cwd 副行删掉
  *    ——组头已表达 cwd（短名 + title 提示全路径），窄栏不再重复。
  *  - 组折叠是受控 props（collapsed/onToggleGroup）：折叠状态归 wizard 管
  *    （localStorage 记忆），本组件保持纯渲染，无头冒烟可直接断言折叠。
  *  - 桌面版的 0fr↔1fr grid clip 折叠动效不移植：内联样式没有 css-modules
  *    的 keyframes/transition 类，侧栏场景直接条件渲染（展开才进 DOM——
  *    大列表还省一层节点）。
- *  - 子会话不做逐节点折叠（desktop SpSessionRow 有）：实测数据嵌套一层且
- *    很少，侧栏保持「缩进树」一屏可见——组级折叠够用。
+ *  - 子会话树不移植（v0.3.5 移除，用户拍板「codex 会话列表只显示主
+ *    会话」）：codex 适配器已在 listSessions 源头过滤子代理线程，其余
+ *    工具的列表本来就不带 parentSessionId——平铺渲染，buildNodes/
+ *    depth 缩进/「子」标签一并删除，孤儿挂根的特例也随之消失。
  */
 
 import { createElement, type CSSProperties, type ReactNode } from 'react';
 import type { SessionMeta } from '../commands.js';
 import { T } from './theme.js';
-
-/* ── 树模型（sessionTree.ts buildNodes 的 React 同语义移植） ─────────── */
-
-export interface SessionNode {
-  meta: SessionMeta;
-  children: SessionNode[];
-}
-
-/** 主会话在下、子会话挂到父节点下；父不在列表/本组的子会话按根处理。 */
-export function buildSessionNodes(items: SessionMeta[]): SessionNode[] {
-  const byId = new Map<string, SessionNode>();
-  for (const m of items) byId.set(m.sessionId, { meta: m, children: [] });
-  const roots: SessionNode[] = [];
-  for (const node of byId.values()) {
-    const parent = node.meta.parentSessionId ? byId.get(node.meta.parentSessionId) : undefined;
-    if (parent && parent !== node) parent.children.push(node);
-    else roots.push(node);
-  }
-  return roots;
-}
-
-/** 展开数（与折叠状态无关，组头徽章计数稳定——桌面版 countNodes 同语义）。 */
-function countNodes(nodes: SessionNode[]): number {
-  let n = 0;
-  for (const node of nodes) n += 1 + countNodes(node.children);
-  return n;
-}
 
 /* ── 工作区分组（SessionPicker.vue groups computed 的同语义移植） ─────── */
 
@@ -59,8 +32,9 @@ export interface SessionGroup {
   /** 组头短名：路径最后一段（title 提示全路径）。 */
   label: string;
   path?: string;
-  nodes: SessionNode[];
-  /** 组内会话总数（含子会话——徽章显示的是可迁移数）。 */
+  /** 组内会话（createdAt 降序、平铺——树已在 v0.3.5 移除）。 */
+  items: SessionMeta[];
+  /** 组内会话总数（徽章显示的是可迁移数）。 */
   count: number;
 }
 
@@ -68,16 +42,6 @@ export interface SessionGroup {
 function baseName(p: string): string {
   const parts = p.split(/[\\/]/).filter(Boolean);
   return parts.length ? parts[parts.length - 1] : p;
-}
-
-function latestTs(nodes: SessionNode[]): number {
-  let max = 0;
-  for (const node of nodes) {
-    if ((node.meta.createdAt ?? 0) > max) max = node.meta.createdAt ?? 0;
-    const sub = latestTs(node.children);
-    if (sub > max) max = sub;
-  }
-  return max;
 }
 
 export function groupSessions(items: SessionMeta[]): SessionGroup[] {
@@ -91,18 +55,16 @@ export function groupSessions(items: SessionMeta[]): SessionGroup[] {
   const groups: SessionGroup[] = [];
   for (const [key, list] of map) {
     list.sort((a, b) => (b.createdAt ?? 0) - (a.createdAt ?? 0));
-    const nodes = buildSessionNodes(list);
     groups.push({
       key,
       label: key ? baseName(key) : '（无工作目录）',
       path: key || undefined,
-      nodes,
-      count: countNodes(nodes),
+      items: list,
+      count: list.length,
     });
   }
-  // 组间按组内最新会话降序（桌面版按 nodes[0].createdAt——root 顺序继承组内
-  // 降序，但 root 未必是组内最新的那条（子会话可能更新）；直接取全组最大值）
-  groups.sort((a, b) => latestTs(b.nodes) - latestTs(a.nodes));
+  // 组间按组内最新会话降序（root 顺序继承组内降序，第一项即最新）
+  groups.sort((a, b) => (b.items[0]?.createdAt ?? 0) - (a.items[0]?.createdAt ?? 0));
   return groups;
 }
 
@@ -157,7 +119,7 @@ export function relTime(ts?: number): string {
 
 const truncate = (s: string, n: number): string => (s.length > n ? `${s.slice(0, n - 1)}…` : s);
 
-/* ── 样式（窄栏高密度：行高 ~26px，对齐 better-sidebar 文件树密度） ────── */
+/* ── 样式（窄栏高密度：行高 ~26px，对齐 better-sidebar 文件树密度） ─────── */
 
 const L = {
   group: { marginBottom: 2 } as CSSProperties,
@@ -178,13 +140,7 @@ const L = {
     marginLeft: 'auto', flexShrink: 0, fontSize: 10, color: T.dim,
     background: T.bg3, borderRadius: 999, padding: '0 7px', lineHeight: '16px',
   } as CSSProperties,
-  row: (selected: boolean, depth: number): CSSProperties => ({
-    display: 'flex', alignItems: 'center', gap: 6,
-    padding: '3px 6px 3px 6px', paddingLeft: 8 + depth * 14,
-    cursor: 'pointer', borderRadius: 6,
-    background: selected ? T.accentBg : 'transparent',
-  }),
-  rowSub: { borderLeft: `2px solid ${T.businessBg}` } as CSSProperties,
+  row: { display: 'flex', alignItems: 'center', gap: 6, padding: '3px 6px 3px 8px', cursor: 'pointer', borderRadius: 6 } as CSSProperties,
   title: {
     flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
     fontSize: 12,
@@ -193,7 +149,6 @@ const L = {
     flexShrink: 0, fontSize: 9.5, color: T.dim, border: `1px solid ${T.line2}`,
     borderRadius: 4, padding: '0 3px', lineHeight: '13px',
   } as CSSProperties,
-  tagSub: { color: T.business, borderColor: T.businessBorder } as CSSProperties,
   time: { flexShrink: 0, fontSize: 10, color: T.dimmer, fontVariantNumeric: 'tabular-nums' } as CSSProperties,
   empty: { padding: '14px 8px', textAlign: 'center' as const, color: T.dim, fontSize: 12 } as CSSProperties,
 };
@@ -211,8 +166,8 @@ export interface SessionListViewProps {
 }
 
 /**
- * 分组列表视图。组头点击折叠；子会话随父缩进 14px/层。selectedId 没做
- * 高亮：列表选中即跳预览（不再回列表），高亮态没有消费方。
+ * 分组列表视图。组头点击折叠。selectedId 没做高亮：列表选中即跳预览
+ * （不再回列表），高亮态没有消费方。
  */
 export function SessionListView(props: SessionListViewProps): ReactNode {
   const { groups, collapsed, onToggleGroup, onOpen, emptyHint } = props;
@@ -235,7 +190,7 @@ export function SessionListView(props: SessionListViewProps): ReactNode {
               <span style={L.groupName}>{g.label}</span>
               <span style={L.count}>{g.count}</span>
             </button>
-            {isCollapsed ? null : g.nodes.map((n) => renderNode(n, 0, onOpen))}
+            {isCollapsed ? null : g.items.map((m) => renderRow(m, onOpen))}
           </div>
         );
       })}
@@ -243,25 +198,20 @@ export function SessionListView(props: SessionListViewProps): ReactNode {
   );
 }
 
-function renderNode(node: SessionNode, depth: number, onOpen: (m: SessionMeta) => void): ReactNode {
-  const m = node.meta;
-  const isSub = depth > 0;
+function renderRow(m: SessionMeta, onOpen: (m: SessionMeta) => void): ReactNode {
   return (
-    <div key={m.sessionId}>
-      <div
-        style={{ ...L.row(false, depth), ...(isSub ? L.rowSub : {}) }}
-        title={m.title ?? m.sessionId}
-        onClick={() => onOpen(m)}
-      >
-        <span style={L.title}>{m.title ? truncate(m.title, 40) : <span style={{ color: T.dim }}>（无标题）</span>}</span>
-        {m.deferredCreation === true ? <span style={L.tag} title="已登记但无会话文件（无可迁移内容）">空</span> : null}
-        {m.archived === true ? <span style={L.tag} title="位于归档目录">归档</span> : null}
-        {isSub ? <span style={{ ...L.tag, ...L.tagSub }} title="子代理会话">子</span> : null}
-        <span style={L.time} title={m.createdAt === undefined ? '' : new Date(m.createdAt).toISOString().slice(0, 16).replace('T', ' ')}>
-          {relTime(m.createdAt)}
-        </span>
-      </div>
-      {node.children.map((c) => renderNode(c, depth + 1, onOpen))}
+    <div
+      key={m.sessionId}
+      style={L.row}
+      title={m.title ?? m.sessionId}
+      onClick={() => onOpen(m)}
+    >
+      <span style={L.title}>{m.title ? truncate(m.title, 40) : <span style={{ color: T.dim }}>（无标题）</span>}</span>
+      {m.deferredCreation === true ? <span style={L.tag} title="已登记但无会话文件（无可迁移内容）">空</span> : null}
+      {m.archived === true ? <span style={L.tag} title="位于归档目录">归档</span> : null}
+      <span style={L.time} title={m.createdAt === undefined ? '' : new Date(m.createdAt).toISOString().slice(0, 16).replace('T', ' ')}>
+        {relTime(m.createdAt)}
+      </span>
     </div>
   );
 }

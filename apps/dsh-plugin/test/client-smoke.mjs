@@ -19,13 +19,14 @@
  *         react-dom/server 的 renderToStaticOutput 把组件树拉出来（无头
  *         SSR 渲染——比真 DOM 弱，但足以证明组件树不炸、可见文本在）。
  *      6. v0.3.0 新视图结构（经工厂导出的 migrateViews 渲染【真组件】——
- *         bundle 内那份，非 smoke 复刻）：分组列表（cwd 分组/树挂接/孤儿
- *         落根/徽章计数/14px 缩进/受控折叠）、折叠记忆（cc-migrate: key
- *         回环 + 坏存储降级）、富预览流（思考/工具/注入块、截断角标；
- *         v0.3.1 起旁链 = desktop 同款切换器 + 整区切换：主视图无内联
- *         旁链、菜单树节点/准星、旁链整区视图主流换出）；自动跳转
- *         openSessionWithRetry（每拍先经运行时桥 manager.refreshList 主动
- *         重拉 session.list 再 open；桥缺席退化被动重试，耗尽回落 fail）。
+ *         bundle 内那份，非 smoke 复刻）：分组列表（cwd 分组/徽章计数/
+ *         受控折叠；v0.3.5 起平铺——子会话树随「codex 列表只显示主会话」
+ *         一并移除）、折叠记忆（cc-migrate: key 回环 + 坏存储降级）、富
+ *         预览流（思考/工具/注入块、截断角标；v0.3.1 起旁链 = desktop
+ *         同款切换器 + 整区切换：主视图无内联旁链、菜单树节点/准星、
+ *         旁链整区视图主流换出）；自动跳转 openSessionWithRetry（每拍
+ *         先经运行时桥 manager.refreshList 主动重拉 session.list 再
+ *         open；桥缺席退化被动重试，耗尽回落 fail）。
  *
  *   B. 宿主半 fenced 路由（src/routes.ts，宿主同形 mock 纪律）：
  *      7. buildMigrateApi 产出恰好 4 个 method（list-sources/preview/import
@@ -111,11 +112,13 @@ const factory = eval(`(require, module, exports) => {${factoryBody}\n return mod
 const modExports = factory(hostRequire, m, m.exports);
 assert.equal(typeof modExports.apply, 'function', 'module.exports.apply is a function');
 assert.ok(Array.isArray(modExports.inject) && modExports.inject.includes('betterSidebar'), "module.exports.inject = ['betterSidebar']");
-// 冒烟渲染锚点：子视图组件与纯函数全员在表（host-inert——宿主只读 apply/inject）
+// 冒烟渲染锚点：子视图组件与纯函数全员在表（host-inert——宿主只读 apply/inject；
+// v0.3.5 移除 buildSessionNodes：会话列表平铺，子会话树不再存在）
 const views = modExports.migrateViews;
-for (const key of ['SessionListView', 'PreviewFlowView', 'groupSessions', 'buildSessionNodes', 'computeFlow', 'loadCollapsedCwds', 'saveCollapsedCwds', 'openSessionWithRetry']) {
+for (const key of ['SessionListView', 'PreviewFlowView', 'groupSessions', 'computeFlow', 'loadCollapsedCwds', 'saveCollapsedCwds', 'openSessionWithRetry']) {
   assert.equal(typeof views?.[key], 'function', `migrateViews.${key} is a function`);
 }
+assert.equal(views.buildSessionNodes, undefined, 'migrateViews no longer exports the tree builder (flattened list)');
 console.log(`[A3b] factory returns { apply, inject: ${JSON.stringify(modExports.inject)}, migrateViews{${Object.keys(views).length}} }`);
 
 // ── A4. apply(ctx)：registerTab 收到形状合法的 TabDescriptor ────────────
@@ -188,12 +191,13 @@ for (const { d } of effectDisposers) if (typeof d === 'function') d();
 assert.equal(registeredTabs.length, 0, 'disposers unregister the tab');
 console.log('[A5b] dispose chain unregisters the tab cleanly');
 
-// ── A6. 分组列表 + 折叠树（v0.3.0 新视图；语义移植 desktop sessionTree.ts） ──
+// ── A6. 分组列表（v0.3.5 起平铺——子会话树随「codex 列表只显示主会话」移除）──
 // 直接渲染 migrateViews 里的【真组件】（bundle 里那份，不是 smoke 复刻）——
 // 组件与断言同源，防「组件改了冒烟不知道」的漂移。
 const h = (tag, props) => react.createElement(tag, props);
 
-// fixtures：两个工作区 + 子会话挂树 + 孤儿（父不在列表 → 按根）
+// fixtures：两个工作区 + 带 parentSessionId 的条目（树已移除——平铺渲染，
+// 不缩进、不挂树；codex 适配器已在源头过滤子代理，这里验证列表层兜底行为）
 const now = Date.now();
 const META = (over) => ({ tool: 'claude', sessionId: '', createdAt: now, ...over });
 const fixtures = [
@@ -208,10 +212,10 @@ const alpha = groups.find((g) => g.key === 'D:\\work\\alpha');
 const beta = groups.find((g) => g.key === 'C:\\Users\\demo\\beta');
 assert.ok(alpha && beta, 'both cwd groups present');
 assert.equal(alpha.label, 'alpha', 'group label is the last path segment');
-assert.equal(alpha.nodes.length, 2, 'alpha roots = parent + orphan (ghost parent falls back to root)');
-const p1Node = alpha.nodes.find((n) => n.meta.sessionId === 'p1');
-assert.ok(p1Node.children.some((c) => c.meta.sessionId === 'c1'), 'child attached under its parent');
-assert.equal(alpha.count, 3, 'group badge counts the whole tree');
+// 平铺：groupSessions 不再消费 parentSessionId——组内条目全员平铺
+assert.equal(alpha.items.length, 3, 'alpha flattens ALL entries (no tree attach, orphans stay inline)');
+assert.equal(alpha.count, 3, 'group badge counts the flat list');
+assert.equal(alpha.items[0].sessionId, 'p1', 'items sorted by createdAt desc');
 assert.equal(groups[0].key, 'D:\\work\\alpha', 'groups sorted by latest session desc');
 
 const listProps = { groups, onToggleGroup: () => {}, onOpen: () => {}, emptyHint: '无匹配结果。' };
@@ -219,14 +223,16 @@ const listHtml = server.renderToStaticMarkup(h(views.SessionListView, { ...listP
 assert.ok(listHtml.includes('>alpha<') && listHtml.includes('>beta<'), 'group short-name headers rendered');
 assert.ok(listHtml.includes('>3</span>') && listHtml.includes('>1</span>'), 'group count badges rendered');
 assert.ok(listHtml.includes('父会话一') && listHtml.includes('子会话挂树'), 'session rows rendered');
-assert.ok(listHtml.includes('padding-left:22px'), 'sub-session rows indented one level (8+14px)');
+assert.ok(listHtml.includes('孤儿子会话'), 'orphaned child entry renders inline (no tree fallback needed)');
+assert.ok(!listHtml.includes('padding-left:22px'), 'NO per-level indent (sub-session tree removed)');
+assert.ok(!/>子</.test(listHtml), 'NO sub-agent「子」tag (tree removed)');
 assert.ok(listHtml.includes('刚刚'), 'relative time rendered');
 // 折叠断言（受控 collapsed）：alpha 折叠 → alpha 行消失、组头/他组不受影响
 const collapsedHtml = server.renderToStaticMarkup(h(views.SessionListView, { ...listProps, collapsed: new Set(['D:\\work\\alpha']) }));
 assert.ok(!collapsedHtml.includes('父会话一'), 'collapsed group hides its rows');
 assert.ok(collapsedHtml.includes('>alpha<'), 'collapsed group header still rendered');
 assert.ok(collapsedHtml.includes('另一工作区'), 'other group rows unaffected');
-console.log('[A6] grouped list: cwd grouping + tree attach + orphan-to-root + badge counts + 14px indent + controlled collapse');
+console.log('[A6] grouped list: cwd grouping + flat rows (tree removed) + badge counts + controlled collapse');
 
 // ── A7. 折叠记忆（localStorage，key 前缀 cc-migrate:）──────────────────
 // Node 默认没有 localStorage → 空集合（SSR 降级全展开，不炸）
@@ -535,5 +541,5 @@ disposer();
 assert.equal(unregisterCalls, 1, 'route disposer unregisters exactly once');
 console.log('[B11] route disposer unregisters the prefix route (fiber-clean)');
 
-console.log('\nCLIENT SMOKE OK — bundle shape + factory execution + tab registration + headless render of all views (grouped list / collapse tree / rich preview); fenced host routes verified in temp roots.');
+console.log('\nCLIENT SMOKE OK — bundle shape + factory execution + tab registration + headless render of all views (grouped flat list / collapse memory / rich preview); fenced host routes verified in temp roots.');
 console.log('(real-browser rendering inside the DSH sidebar is joint-debug scope — see README GUI section)');
