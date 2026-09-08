@@ -19,5 +19,10 @@ jobs:
           node-version: 24
           cache: pnpm
       - run: pnpm install --frozen-lockfile
+      # packages/* 的 exports 指向 dist 产物类型；CI 全新 checkout 必须先 build，
+      # 否则 cli/ui 用 NodeNext 解析 @cc-migrate/core 时报 TS2307（本地因残留 dist 侥幸通过）
+      - run: pnpm build
+      # dsh-plugin 的 client-smoke 依赖 bundle 产物 lib/client.js（tsdown + wrap-client）
+      - run: pnpm --filter @cc-migrate/dsh-plugin bundle
       - run: pnpm typecheck
       - run: pnpm test
