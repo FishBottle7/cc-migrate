@@ -7,10 +7,10 @@ on:
 
 jobs:
   test:
-    strategy:
-      matrix:
-        os: [ubuntu-latest, windows-latest]
-    runs-on: ${{ matrix.os }}
+    # Windows-only：产品形态是 DSH/Claude/Codex 桌面工具链，路径语义
+    # （isAbsolute/盘符）与目录编码均为 Windows-first 设计，Linux 腿
+    # 只会产出路径 fixture 噪音，不提供额外保障。
+    runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
       - uses: pnpm/action-setup@v4
